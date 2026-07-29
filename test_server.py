@@ -85,6 +85,60 @@ s2 = srv.draft_summary({"id": 7, "draft_slug": "my-post", "draft_title": "T",
                         "is_published": False})
 check("post_url from draft_slug", s2["post_url"], "https://iviq.substack.com/p/my-post")
 
+
+print("v0.2.0 — settings validation")
+caps_free = {"paid_enabled": False, "payments_state": "disabled", "existing_tags": [{"name": "debugging"}]}
+caps_paid = {"paid_enabled": True, "payments_state": "enabled", "existing_tags": []}
+def expect_raises(label, fn):
+    try:
+        fn(); check(label, "no error", "ValueError")
+    except ValueError as e:
+        check(label, True, True)
+srv.validate_settings("everyone", "everyone", caps_free)
+check("everyone/everyone allowed on free pub", True, True)
+expect_raises("only_paid audience rejected on free pub",
+              lambda: srv.validate_settings("only_paid", "everyone", caps_free))
+expect_raises("only_paid comments rejected on free pub",
+              lambda: srv.validate_settings("everyone", "only_paid", caps_free))
+expect_raises("bogus audience rejected",
+              lambda: srv.validate_settings("subscribers", "everyone", caps_free))
+srv.validate_settings("only_paid", "only_paid", caps_paid)
+check("paid values allowed when payments enabled", True, True)
+check("'none' disables comments and is valid", "none" in srv.COMMENT_VALUES, True)
+
+print("v0.2.0 — tag resolution (new vs existing, normalized)")
+plan = srv.resolve_tags(None, ["Debugging", "MCP tooling", "debugging", "  ", "a/b!"], caps_free)
+check("normalizes + dedupes", plan["normalized"], ["debugging", "mcp-tooling", "a-b"])
+check("existing detected", plan["existing"], ["debugging"])
+check("new detected", plan["new"], ["mcp-tooling", "a-b"])
+
+print("v0.2.0 — schedule/settings read from server state")
+sched = {"id": 9, "draft_title": "T", "is_published": False, "should_send_email": True,
+         "audience": "everyone", "write_comment_permissions": "none",
+         "postSchedules": [{"trigger_at": "2026-08-03T13:00:00.000Z"}],
+         "postTags": [{"name": "debugging"}]}
+s9 = srv.draft_summary(sched)
+check("scheduled_for from postSchedules", s9["scheduled_for"], "2026-08-03T13:00:00.000Z")
+check("audience surfaced", s9["audience"], "everyone")
+check("comments surfaced", s9["comment_permissions"], "none")
+check("send_email surfaced", s9["send_email"], True)
+check("tags surfaced", s9["tags"], ["debugging"])
+# The list payload has no postSchedules key at all — absence must not read as "not scheduled".
+s10 = srv.draft_summary({"id": 9, "draft_title": "T", "is_published": False})
+check("list payload flags unknown schedule", "scheduled_for" in s10, False)
+check("list payload explains why", "scheduled_for_note" in s10, True)
+
+print("v0.2.0 — irreversible-email gate")
+check("schedule_draft advertises confirm_send_email",
+      any(t["name"] == "schedule_draft" and "confirm_send_email" in t["inputSchema"]["properties"]
+          for t in srv.TOOLS), True)
+check("publish_draft advertises confirm_send_email",
+      any(t["name"] == "publish_draft" and "confirm_send_email" in t["inputSchema"]["properties"]
+          for t in srv.TOOLS), True)
+check("new tools registered",
+      all(n in srv.TOOL_HANDLERS for n in
+          ("get_publication_settings", "update_post_settings", "apply_tags")), True)
+
 print("\n%d failure(s)" % len(fails))
 for f in fails:
     print(" -", f)

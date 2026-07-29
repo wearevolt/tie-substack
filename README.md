@@ -70,22 +70,62 @@ Then: **quit Claude fully (Cmd-Q) and reopen**, ask it to run
 |---|---|
 | `substack_status` | Cookie configured/valid? Logged-in user, publication, deps. |
 | `refresh_cookie` | Pull session cookies from the local browser into the config (names-only output). |
-| `create_draft` | Draft from Markdown with **slug pinned** → `draft_id`, `slug`, `post_url`, `editor_url`. |
+| `get_publication_settings` | Paid subscriptions enabled?, sections, existing tags, and which audience/comment values are therefore unavailable. Call before offering choices. |
+| `create_draft` | Draft from Markdown with **slug pinned** + explicit settings → `draft_id`, `slug`, `post_url`, `editor_url` and the settings **as stored**. |
+| `update_post_settings` | Fix settings on an existing draft without recreating it. |
+| `apply_tags` | Attach tags, reporting existing vs new; refuses to create new ones without `allow_new`. |
 | `set_slug` | Change an existing draft's slug. |
-| `schedule_draft` | Schedule publication at an exact ISO instant (offset required — naive timestamps rejected). |
+| `schedule_draft` | Schedule publication at an exact ISO instant (offset required). Refuses without `confirm_send_email` when the post emails subscribers. |
 | `unschedule_draft` | Cancel a scheduled publication. |
-| `get_draft` / `list_drafts` | Inspect drafts (title, slug, post_url, scheduled_for). |
-| `publish_draft` | Publish **now** (optional email) — explicit user request only. |
+| `get_draft` / `list_drafts` | Inspect drafts (title, slug, post_url, settings, scheduled_for). |
+| `publish_draft` | Publish **now** — needs `confirm_send_email` when emailing; explicit user request only. |
 | `delete_draft` | Delete a draft. |
+
+## Settings, defaults, and the confirmation gate
+
+Substack's Publish dialog has more switches than a title and a slug, and **every
+one of them gets a value whether or not you choose it**. So the tools make them
+explicit rather than inheriting library defaults invisibly:
+
+| Setting | Default | Notes |
+|---|---|---|
+| `audience` | `everyone` | `only_free` / `only_paid` / `founding` need paid subscriptions — rejected with a reason otherwise. |
+| `comment_permissions` | `everyone` | `none` **is** "comments disabled". Always sent explicitly — see the trap below. |
+| `send_email` | `true` | Emails every subscriber on publish. **Cannot be unsent.** |
+| `send_free_preview` | `false` | Only meaningful for a paid audience. |
+| `section_id` | none | Validated against the publication's real sections. |
+| `seo_title` / `seo_description` | fall back to title / subtitle | |
+| `share_automatically` (publish only) | `false` | Posts publicly elsewhere; never enabled implicitly. |
+| tags | none | Publication-level objects — applying an unknown one **creates it permanently**. |
+
+**The `write_comment_permissions` trap.** `python-substack` copies `audience`
+into this field when it is omitted (its own source comment reads "this field is
+a mess"), so an `only_paid` audience would silently make comments paid-only.
+These tools always send it explicitly.
+
+**The irreversible bit is gated.** Scheduling is a time-triggered public action
+and the email cannot be recalled, so `schedule_draft` and `publish_draft`
+**refuse** when the post would email subscribers unless you pass
+`confirm_send_email: true`. Intended flow: read capabilities → propose settings
+→ show the user a summary → get a yes → schedule. `unschedule_draft` is the
+escape hatch while a schedule is still pending.
+
+**Results report server state, not your request.** After every mutation the
+tools re-read the draft and report what Substack stored (the schedule comes from
+`postSchedules`, which exists only on the single-draft payload). A requested
+value that differs from the stored one is surfaced as `settings_drift` instead of
+being reported as success.
 
 ## The intended flow (tie-social)
 
 1. At the campaign's strategy checkpoint the slug is decided.
-2. `create_draft` (title + slug + placeholder or full Markdown body) →
+2. `get_publication_settings` → what's actually available.
+3. `create_draft` (title + slug + settings + placeholder or full Markdown body) →
    `post_url` is now real.
-3. Human pastes/polishes the final text in the Substack editor (`editor_url`).
-4. `schedule_draft` for publish date D at the agreed time.
-5. Social posts scheduled in Zernio use `post_url` — no guessed links.
+4. Human pastes/polishes the final text in the Substack editor (`editor_url`).
+5. Show the settings + publish time; on an explicit yes, `schedule_draft(...,
+   confirm_send_email=true)` for publish date D.
+6. Social posts scheduled in Zernio use `post_url` — no guessed links.
 
 ## Env overrides
 

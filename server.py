@@ -37,7 +37,15 @@ import traceback
 from datetime import datetime, timezone
 
 SERVER_NAME = "tie-substack"
-SERVER_VERSION = "0.1.1"
+SERVER_VERSION = "0.2.0"
+
+# Substack's Publish-dialog settings. Every one of these gets a value whether or
+# not the caller picks it, so the tools always send them explicitly — see
+# AUDIENCE/COMMENT notes in create_draft.
+AUDIENCE_VALUES = ("everyone", "only_free", "only_paid", "founding")
+COMMENT_VALUES = ("none", "only_paid", "everyone")  # "none" == comments disabled
+# Meaningless (and rejected by the UI) unless the publication sells subscriptions.
+PAID_AUDIENCE_VALUES = ("only_free", "only_paid", "founding")
 FALLBACK_PROTOCOL = "2025-06-18"
 
 CONFIG_PATH = os.path.expanduser(
@@ -225,6 +233,108 @@ def reset_api():
 # ---------------------------------------------------------------- helpers
 
 
+def publication_capabilities(api):
+    """What this publication can actually do — so choices offered are real ones.
+
+    Verified against a live personal-mode publication: `payments_state` is the
+    paid-subscription signal, and get_sections() raises APIError(400) when the
+    publication has none rather than returning an empty list.
+    """
+    pub = api.get_user_primary_publication() or {}
+    state = pub.get("payments_state")
+    caps = {
+        "publication": pub.get("subdomain"),
+        "name": pub.get("name"),
+        "publication_url": pub.get("publication_url"),
+        "payments_state": state,
+        "paid_enabled": bool(state) and state != "disabled",
+        "pledges_enabled": pub.get("pledges_enabled"),
+        "personal_mode": pub.get("is_personal_mode"),
+    }
+    try:
+        sections = api.get_sections() or []
+        caps["sections"] = [
+            {"id": s.get("id"), "name": s.get("name")}
+            for s in sections
+            if isinstance(s, dict)
+        ]
+    except Exception as e:  # noqa: BLE001
+        caps["sections"] = []
+        caps["sections_note"] = "no sections on this publication (%s)" % str(e)[:120]
+    try:
+        tags = api.get_publication_post_tags() or []
+        caps["existing_tags"] = [
+            {"id": t.get("id"), "name": t.get("name")} for t in tags if isinstance(t, dict)
+        ]
+    except Exception as e:  # noqa: BLE001
+        caps["existing_tags"] = []
+        caps["tags_note"] = "could not list tags: %s" % str(e)[:120]
+    if not caps["paid_enabled"]:
+        caps["unavailable"] = {
+            "audience": list(PAID_AUDIENCE_VALUES),
+            "comment_permissions": ["only_paid"],
+            "reason": "publication has no paid subscriptions (payments_state=%r)" % state,
+        }
+    # Substack's publication payload carries no timezone, so every scheduling
+    # call must pass an explicit UTC offset (the tools enforce that).
+    caps["timezone"] = None
+    return caps
+
+
+def validate_settings(audience, comments, caps):
+    if audience not in AUDIENCE_VALUES:
+        raise ValueError(
+            "audience %r is invalid — choose one of %s" % (audience, list(AUDIENCE_VALUES))
+        )
+    if comments not in COMMENT_VALUES:
+        raise ValueError(
+            "comment_permissions %r is invalid — choose one of %s ('none' disables comments)"
+            % (comments, list(COMMENT_VALUES))
+        )
+    if not caps.get("paid_enabled"):
+        if audience in PAID_AUDIENCE_VALUES:
+            raise ValueError(
+                "audience %r needs paid subscriptions, which this publication does not have "
+                "(payments_state=%r) — use 'everyone'"
+                % (audience, caps.get("payments_state"))
+            )
+        if comments == "only_paid":
+            raise ValueError(
+                "comment_permissions 'only_paid' needs paid subscriptions, which this "
+                "publication does not have — use 'everyone' or 'none'"
+            )
+
+
+def resolve_tags(api, wanted, caps=None):
+    """Split requested tags into existing vs new. Tags are PUBLICATION-level
+    objects: applying an unknown one creates it permanently, so the caller must
+    opt in to that."""
+    existing = {
+        (t.get("name") or "").strip().lower(): t
+        for t in ((caps or {}).get("existing_tags") or [])
+    }
+    if caps is None:
+        try:
+            existing = {
+                (t.get("name") or "").strip().lower(): t
+                for t in (api.get_publication_post_tags() or [])
+                if isinstance(t, dict)
+            }
+        except Exception:  # noqa: BLE001
+            existing = {}
+    norm, seen = [], set()
+    for raw in wanted or []:
+        t = re.sub(r"[^a-z0-9]+", "-", (raw or "").strip().lower()).strip("-")
+        if t and t not in seen:
+            seen.add(t)
+            norm.append(t)
+    return {
+        "normalized": norm,
+        "existing": [t for t in norm if t in existing],
+        "new": [t for t in norm if t not in existing],
+    }
+
+
 def post_url_for_slug(slug):
     if not slug:
         return None
@@ -262,9 +372,38 @@ def draft_summary(draft):
         "slug": slug,
         "post_url": post_url_for_slug(slug),
         "is_published": bool(published),
-        "scheduled_for": draft.get("trigger_at"),
         "updated_at": draft.get("draft_updated_at") or draft.get("updated_at"),
+        # Settings as STORED by Substack (never as requested) — the caller shows
+        # these to the user, so an echo of our own payload would be misleading.
+        "audience": draft.get("audience"),
+        "comment_permissions": draft.get("write_comment_permissions"),
+        "send_email": draft.get("should_send_email"),
     }
+    for key, field in (
+        ("send_free_preview", "should_send_free_preview"),
+        ("section_id", "draft_section_id"),
+        ("seo_title", "search_engine_title"),
+        ("seo_description", "search_engine_description"),
+    ):
+        if field in draft:
+            summary[key] = draft.get(field)
+    tags = draft.get("postTags")
+    if isinstance(tags, list):
+        summary["tags"] = [t.get("name") for t in tags if isinstance(t, dict)]
+    if draft.get("email_sent_at"):
+        summary["email_already_sent_at"] = draft["email_sent_at"]
+    # trigger_at lives in postSchedules, and ONLY on the single-draft payload —
+    # the list payload omits the key entirely, so absence != "not scheduled".
+    if "postSchedules" in draft:
+        schedules = draft.get("postSchedules") or []
+        trigger = None
+        for s in schedules:
+            if isinstance(s, dict) and s.get("trigger_at"):
+                trigger = s["trigger_at"]
+                break
+        summary["scheduled_for"] = trigger
+    else:
+        summary["scheduled_for_note"] = "not in this payload — call get_draft to read it"
     try:
         summary["editor_url"] = "%s/publish/post/%s" % (publication_url(), draft_id)
     except RuntimeError:
@@ -344,12 +483,30 @@ TOOLS = [
         },
     },
     {
+        "name": "get_publication_settings",
+        "description": (
+            "Read what the publication can actually do, so you only offer valid choices: "
+            "paid subscriptions enabled?, available sections, existing publication tags, "
+            "and which audience/comment values are therefore unavailable. Call this BEFORE "
+            "assembling a settings proposal for the user."
+        ),
+        "inputSchema": {"type": "object", "properties": {}},
+    },
+    {
         "name": "create_draft",
         "description": (
             "Create a Substack draft from Markdown with the slug pinned, so the public URL "
             "(<publication>/p/<slug>) is known before publication. Returns draft_id, slug, "
-            "post_url, editor_url. Body images referenced as local paths/URLs are uploaded "
-            "by the library. Does NOT publish or schedule."
+            "post_url, editor_url and the settings AS STORED by Substack. Body images "
+            "referenced as local paths/URLs are uploaded by the library. Does NOT publish "
+            "or schedule.\n\n"
+            "Every Publish-dialog setting gets a value whether or not you pass one, so the "
+            "defaults here are explicit and visible. Show them to the user before "
+            "scheduling. Note: comment_permissions is ALWAYS sent explicitly, because the "
+            "underlying library silently copies `audience` into it when omitted (so an "
+            "only_paid audience would quietly make comments paid-only). Validate choices "
+            "against get_publication_settings first — paid-only values fail on a "
+            "publication without paid subscriptions."
         ),
         "inputSchema": {
             "type": "object",
@@ -368,9 +525,89 @@ TOOLS = [
                     "type": "string",
                     "description": "The post URL slug to pin (lowercase-hyphenated).",
                 },
-                "tags": {"type": "array", "items": {"type": "string"}},
+                "audience": {
+                    "type": "string",
+                    "enum": list(AUDIENCE_VALUES),
+                    "default": "everyone",
+                    "description": "Who can read it. Non-'everyone' values need paid subs.",
+                },
+                "comment_permissions": {
+                    "type": "string",
+                    "enum": list(COMMENT_VALUES),
+                    "default": "everyone",
+                    "description": "Who may comment; 'none' disables comments.",
+                },
+                "send_email": {
+                    "type": "boolean",
+                    "default": True,
+                    "description": (
+                        "Whether publishing emails subscribers. Sending is IRREVERSIBLE; "
+                        "schedule_draft/publish_draft additionally require an explicit "
+                        "confirm_send_email when this is true."
+                    ),
+                },
+                "tags": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "description": (
+                        "Publication-level tags. Applying an unknown tag CREATES it "
+                        "permanently, so new tags are refused unless allow_new_tags is true."
+                    ),
+                },
+                "allow_new_tags": {"type": "boolean", "default": False},
+                "section_id": {
+                    "type": ["integer", "string", "null"],
+                    "description": "Publication section id (see get_publication_settings).",
+                },
+                "seo_title": {"type": "string", "description": "Defaults to title."},
+                "seo_description": {
+                    "type": "string",
+                    "description": "Defaults to subtitle.",
+                },
             },
             "required": ["title", "body_markdown", "slug"],
+        },
+    },
+    {
+        "name": "update_post_settings",
+        "description": (
+            "Change settings on an existing draft without recreating it: audience, "
+            "comment_permissions, send_email, send_free_preview, section_id, seo_title, "
+            "seo_description, title, subtitle. Returns the settings as stored afterwards."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "draft_id": {"type": ["integer", "string"]},
+                "audience": {"type": "string", "enum": list(AUDIENCE_VALUES)},
+                "comment_permissions": {"type": "string", "enum": list(COMMENT_VALUES)},
+                "send_email": {"type": "boolean"},
+                "send_free_preview": {"type": "boolean"},
+                "section_id": {"type": ["integer", "string", "null"]},
+                "seo_title": {"type": "string"},
+                "seo_description": {"type": "string"},
+                "title": {"type": "string"},
+                "subtitle": {"type": "string"},
+            },
+            "required": ["draft_id"],
+        },
+    },
+    {
+        "name": "apply_tags",
+        "description": (
+            "Attach publication tags to a draft. Tags are publication-level objects: an "
+            "unknown tag is CREATED permanently and typos are durable, so this reports "
+            "which tags are existing vs new and refuses to create new ones unless "
+            "allow_new is true. Call it as its own confirmed step, not silently."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "draft_id": {"type": ["integer", "string"]},
+                "tags": {"type": "array", "items": {"type": "string"}},
+                "allow_new": {"type": "boolean", "default": False},
+            },
+            "required": ["draft_id", "tags"],
         },
     },
     {
@@ -392,14 +629,26 @@ TOOLS = [
         "name": "schedule_draft",
         "description": (
             "Schedule a draft to publish at an exact instant. datetime_iso MUST carry a "
-            "timezone offset (e.g. 2026-08-03T09:00:00-04:00); naive timestamps are "
-            "rejected. Returns the draft summary incl. post_url."
+            "timezone offset (e.g. 2026-08-03T09:00:00-04:00); naive timestamps and past "
+            "times are rejected. Returns the schedule AS STORED by Substack (read back "
+            "from postSchedules), never an echo of the request.\n\n"
+            "If the draft is set to email subscribers, this call REFUSES unless "
+            "confirm_send_email is true — scheduling is a time-triggered public action and "
+            "the email cannot be unsent. Show the user the full settings summary first."
         ),
         "inputSchema": {
             "type": "object",
             "properties": {
                 "draft_id": {"type": ["integer", "string"]},
                 "datetime_iso": {"type": "string"},
+                "confirm_send_email": {
+                    "type": "boolean",
+                    "default": False,
+                    "description": (
+                        "Set true ONLY after the user has confirmed that publishing will "
+                        "email subscribers. Ignored when the draft has send_email false."
+                    ),
+                },
             },
             "required": ["draft_id", "datetime_iso"],
         },
@@ -435,15 +684,29 @@ TOOLS = [
     {
         "name": "publish_draft",
         "description": (
-            "PUBLISH a draft immediately (optionally emailing subscribers). Irreversible in "
-            "the email sense — call ONLY on an explicit user instruction to publish now; "
-            "the normal flow is schedule_draft."
+            "PUBLISH a draft immediately, optionally emailing subscribers. The email cannot "
+            "be unsent, so send_email=true additionally requires confirm_send_email=true. "
+            "Call ONLY on an explicit user instruction to publish right now — the normal "
+            "flow is schedule_draft."
         ),
         "inputSchema": {
             "type": "object",
             "properties": {
                 "draft_id": {"type": ["integer", "string"]},
                 "send_email": {"type": "boolean", "default": True},
+                "confirm_send_email": {
+                    "type": "boolean",
+                    "default": False,
+                    "description": "Required when send_email is true; user must have agreed.",
+                },
+                "share_automatically": {
+                    "type": "boolean",
+                    "default": False,
+                    "description": (
+                        "Auto-share to connected social accounts. Posts publicly elsewhere — "
+                        "never enable without asking."
+                    ),
+                },
             },
             "required": ["draft_id"],
         },
@@ -616,6 +879,10 @@ def tool_refresh_cookie(args):
     return text_result(result)
 
 
+def tool_get_publication_settings(_args):
+    return text_result(publication_capabilities(get_api()))
+
+
 def tool_create_draft(args):
     title = (args.get("title") or "").strip()
     body = args.get("body_markdown") or ""
@@ -623,15 +890,72 @@ def tool_create_draft(args):
     if not title or not body:
         raise ValueError("title and body_markdown are required")
     api = get_api()
+    caps = publication_capabilities(api)
+    audience = args.get("audience") or "everyone"
+    # ALWAYS explicit: python-substack copies `audience` into this when it is None,
+    # which would silently restrict comments on a paid-audience post.
+    comments = args.get("comment_permissions") or "everyone"
+    validate_settings(audience, comments, caps)
+
+    section_id = args.get("section_id")
+    if section_id not in (None, ""):
+        known = {str(s.get("id")) for s in caps.get("sections") or []}
+        if known and str(section_id) not in known:
+            raise ValueError(
+                "section_id %r is not one of this publication's sections %s"
+                % (section_id, sorted(known))
+            )
+
+    tag_plan = resolve_tags(api, args.get("tags"), caps)
+    if tag_plan["new"] and not args.get("allow_new_tags"):
+        raise ValueError(
+            "these tags do not exist on the publication and would be created permanently: "
+            "%s (existing: %s). Confirm with the user, then retry with allow_new_tags=true "
+            "or reuse existing tags." % (tag_plan["new"], tag_plan["existing"])
+        )
+
+    subtitle = (args.get("subtitle") or "").strip()
     out = api.create_draft_from_markdown(
         title=title,
         markdown=body,
-        subtitle=(args.get("subtitle") or "").strip(),
+        subtitle=subtitle,
         slug=slug,
-        tags=args.get("tags"),
+        audience=audience,
+        write_comment_permissions=comments,
+        search_engine_title=args.get("seo_title") or title,
+        search_engine_description=args.get("seo_description") or subtitle or None,
+        draft_section_id=section_id if section_id not in (None, "") else None,
+        tags=None,  # applied below so new-tag creation stays opt-in
     )
     draft = out["draft"]
+    draft_id = draft.get("id")
+
+    # should_send_email isn't a create parameter — set it via put_draft.
+    send_email = args.get("send_email", True)
+    if send_email is not True:
+        api.put_draft(draft_id, should_send_email=bool(send_email))
+    if tag_plan["normalized"]:
+        api.add_tags_to_post(draft_id, tag_plan["normalized"])
+
+    # Report what Substack STORED, not what we asked for.
+    draft = api.get_draft(draft_id)
     summary = draft_summary(draft)
+    summary["tags_applied"] = tag_plan
+    requested = {
+        "audience": audience,
+        "comment_permissions": comments,
+        "send_email": bool(send_email),
+    }
+    drift = {
+        k: {"requested": v, "stored": summary.get(k)}
+        for k, v in requested.items()
+        if summary.get(k) is not None and summary.get(k) != v
+    }
+    if drift:
+        summary["settings_drift"] = drift
+        summary["settings_drift_note"] = (
+            "Substack stored different values than requested — report the STORED ones"
+        )
     got = summary.get("slug")
     if got and got != slug:
         summary["warning"] = (
@@ -658,15 +982,97 @@ def tool_set_slug(args):
     return text_result(summary)
 
 
+def tool_update_post_settings(args):
+    api = get_api()
+    draft_id = args["draft_id"]
+    caps = publication_capabilities(api)
+    current = api.get_draft(draft_id)
+    audience = args.get("audience") or current.get("audience") or "everyone"
+    comments = (
+        args.get("comment_permissions")
+        or current.get("write_comment_permissions")
+        or "everyone"
+    )
+    validate_settings(audience, comments, caps)
+
+    payload = {"audience": audience, "write_comment_permissions": comments}
+    for arg, field in (
+        ("send_email", "should_send_email"),
+        ("send_free_preview", "should_send_free_preview"),
+        ("seo_title", "search_engine_title"),
+        ("seo_description", "search_engine_description"),
+        ("title", "draft_title"),
+        ("subtitle", "draft_subtitle"),
+    ):
+        if arg in args and args[arg] is not None:
+            payload[field] = args[arg]
+    if "section_id" in args:
+        payload["draft_section_id"] = args["section_id"] or None
+    api.put_draft(draft_id, **payload)
+    return text_result(draft_summary(api.get_draft(draft_id)))
+
+
+def tool_apply_tags(args):
+    api = get_api()
+    draft_id = args["draft_id"]
+    plan = resolve_tags(api, args.get("tags"), publication_capabilities(api))
+    if not plan["normalized"]:
+        raise ValueError("no usable tags after normalization")
+    if plan["new"] and not args.get("allow_new"):
+        raise ValueError(
+            "these tags would be CREATED on the publication permanently: %s (existing: %s). "
+            "Confirm with the user, then retry with allow_new=true."
+            % (plan["new"], plan["existing"])
+        )
+    api.add_tags_to_post(draft_id, plan["normalized"])
+    summary = draft_summary(api.get_draft(draft_id))
+    summary["tags_applied"] = plan
+    return text_result(summary)
+
+
 def tool_schedule_draft(args):
     dt = parse_iso_aware(args.get("datetime_iso"))
     if dt <= datetime.now(timezone.utc):
-        raise ValueError("datetime_iso %s is in the past" % args.get("datetime_iso"))
+        raise ValueError(
+            "datetime_iso %s is in the past (now %s UTC)"
+            % (args.get("datetime_iso"), datetime.now(timezone.utc).isoformat(timespec="seconds"))
+        )
     api = get_api()
-    api.schedule_draft(args["draft_id"], dt)
-    draft = api.get_draft(args["draft_id"])
-    summary = draft_summary(draft)
-    summary["scheduled_for"] = summary.get("scheduled_for") or dt.isoformat()
+    draft_id = args["draft_id"]
+    before = api.get_draft(draft_id)
+    if before.get("is_published"):
+        raise ValueError("draft %s is already published — cannot schedule it" % draft_id)
+    # Scheduling is a time-triggered public action, and the email cannot be unsent.
+    if before.get("should_send_email") and not args.get("confirm_send_email"):
+        raise ValueError(
+            "this post is set to EMAIL SUBSCRIBERS when it publishes, which cannot be "
+            "undone. Show the user the settings summary (audience=%r, comments=%r, "
+            "send_email=True, publish at %s) and get an explicit yes, then retry with "
+            "confirm_send_email=true — or call update_post_settings(send_email=false) first."
+            % (
+                before.get("audience"),
+                before.get("write_comment_permissions"),
+                dt.isoformat(),
+            )
+        )
+    api.schedule_draft(draft_id, dt)
+    # Read the schedule back from the server — postSchedules is the only place it
+    # lives, and echoing the request would defeat the point of verifying.
+    summary = draft_summary(api.get_draft(draft_id))
+    stored = summary.get("scheduled_for")
+    summary["requested_for"] = dt.isoformat()
+    summary["utc_equivalent"] = dt.astimezone(timezone.utc).isoformat(timespec="seconds")
+    if not stored:
+        summary["warning"] = (
+            "Substack did not report a schedule after the call — verify in the editor "
+            "(%s) before relying on it" % summary.get("editor_url")
+        )
+    elif parse_iso_aware(stored) != dt:
+        summary["warning"] = (
+            "stored schedule %s differs from the requested %s — the STORED value is what "
+            "will fire" % (stored, dt.isoformat())
+        )
+    summary["undo"] = "call unschedule_draft to cancel while it is still pending"
     return text_result(summary)
 
 
@@ -690,10 +1096,21 @@ def tool_list_drafts(args):
 
 def tool_publish_draft(args):
     api = get_api()
-    api.prepublish_draft(args["draft_id"])
-    out = api.publish_draft(args["draft_id"], send=bool(args.get("send_email", True)))
-    summary = draft_summary(out if isinstance(out, dict) else api.get_draft(args["draft_id"]))
+    draft_id = args["draft_id"]
+    send = bool(args.get("send_email", True))
+    if send and not args.get("confirm_send_email"):
+        raise ValueError(
+            "publishing now with send_email=true emails every subscriber and cannot be "
+            "undone. Get an explicit yes from the user, then retry with "
+            "confirm_send_email=true — or pass send_email=false to publish without email."
+        )
+    share = bool(args.get("share_automatically", False))
+    api.prepublish_draft(draft_id)
+    api.publish_draft(draft_id, send=send, share_automatically=share)
+    summary = draft_summary(api.get_draft(draft_id))
     summary["published"] = True
+    summary["emailed_subscribers"] = send
+    summary["shared_automatically"] = share
     return text_result(summary)
 
 
@@ -706,7 +1123,10 @@ def tool_delete_draft(args):
 TOOL_HANDLERS = {
     "substack_status": tool_substack_status,
     "refresh_cookie": tool_refresh_cookie,
+    "get_publication_settings": tool_get_publication_settings,
     "create_draft": tool_create_draft,
+    "update_post_settings": tool_update_post_settings,
+    "apply_tags": tool_apply_tags,
     "set_slug": tool_set_slug,
     "schedule_draft": tool_schedule_draft,
     "unschedule_draft": tool_unschedule_draft,
