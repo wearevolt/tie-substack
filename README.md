@@ -34,15 +34,35 @@ detects a dead cookie and points at `refresh_cookie`.
 
 ## Install (macOS)
 
+One command, nothing to clone:
+
+```
+bash -c "$(curl -fsSL https://raw.githubusercontent.com/wearevolt/tie-substack/main/install.command)"
+```
+
+It asks for your publication URL (Enter accepts the default). To skip the
+prompt entirely — handy for onboarding a team:
+
+```
+TIE_SUBSTACK_PUB=https://yourpub.substack.com bash -c "$(curl -fsSL https://raw.githubusercontent.com/wearevolt/tie-substack/main/install.command)"
+```
+
+Or work from a clone (uses the adjacent `server.py`, so local edits install
+as-is; also works by double-clicking `install.command` in Finder):
+
 ```
 git clone https://github.com/wearevolt/tie-substack
 cd tie-substack && ./install.command
 ```
 
-The installer creates a venv in `~/.tie-substack/`, installs
-`python-substack` + `pycookiecheat`, asks for your publication URL, and
-registers the server in Claude Desktop's `claude_desktop_config.json`.
-Then: restart Claude, ask it to run `substack_status`, then `refresh_cookie`.
+Either way the installer creates a venv in `~/.tie-substack/`, installs
+`python-substack` + `pycookiecheat`, writes the publication into
+`~/.tie-substack/config.json` (0600), and registers the server in Claude
+Desktop's `claude_desktop_config.json`. Re-running it updates the server and
+keeps your settings, including a saved cookie.
+
+Then: **quit Claude fully (Cmd-Q) and reopen**, ask it to run
+`substack_status`, then `refresh_cookie`.
 
 ## Tools
 

@@ -1,11 +1,25 @@
 #!/bin/bash
-# tie-substack installer (macOS). Double-click to run.
-# Creates a venv in ~/.tie-substack/, installs deps, copies server.py, and
+# tie-substack installer (macOS). Two ways to run:
+#
+#   1. One-liner (no clone needed) — server.py is fetched from GitHub:
+#        bash -c "$(curl -fsSL https://raw.githubusercontent.com/wearevolt/tie-substack/main/install.command)"
+#      Skip the prompt by presetting the publication:
+#        TIE_SUBSTACK_PUB=https://yourpub.substack.com bash -c "$(curl -fsSL .../install.command)"
+#   2. Double-click it (or ./install.command) inside a clone — the adjacent
+#      server.py is used, so local edits install as-is.
+#
+# Creates a venv in ~/.tie-substack/, installs deps, installs server.py, and
 # registers the server in Claude Desktop's config. Re-running updates everything
 # and keeps existing settings (incl. a saved cookie).
 set -u
 
-SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+# In `bash -c "$(curl ...)"` mode $0 is "bash", not a file: there is no adjacent
+# server.py to prefer, and we must not pick up a stray one from the cwd.
+if [ -f "$0" ]; then
+  SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+else
+  SCRIPT_DIR=""
+fi
 INSTALL_DIR="$HOME/.tie-substack"
 VENV="$INSTALL_DIR/venv"
 CONFIG="$HOME/Library/Application Support/Claude/claude_desktop_config.json"
@@ -15,6 +29,15 @@ bold() { printf '\033[1m%s\033[0m\n' "$*"; }
 ok()   { printf '  \033[32m✓\033[0m %s\n' "$*"; }
 warn() { printf '  \033[33m!\033[0m %s\n' "$*"; }
 fail() { printf '  \033[31m✗\033[0m %s\n' "$*"; }
+# Only pause at the end when double-clicked (Terminal would close instantly).
+pause() { case "$0" in *.command) read -r -p "Press Enter to close..." _;; esac; }
+# Prompt only when there's a terminal to answer it; otherwise take the default,
+# so a piped/non-interactive run can't hang. Result lands in $ANSWER.
+ask() { # ask <prompt> <default>
+  ANSWER=""
+  if [ -t 0 ]; then read -r -p "$1" ANSWER; fi
+  ANSWER="${ANSWER:-$2}"
+}
 
 bold "tie-substack installer"
 echo
@@ -25,7 +48,7 @@ if command -v python3 >/dev/null 2>&1; then
 else
   fail "python3 not found. Install Xcode Command Line Tools first:"
   echo "      xcode-select --install"
-  read -r -p "Press Enter to close..." _; exit 1
+  pause; exit 1
 fi
 
 # --- 2. venv + dependencies ---------------------------------------------
@@ -48,7 +71,7 @@ elif curl -fsSL "$RAW_URL" -o "$INSTALL_DIR/server.py" 2>/dev/null; then
   ok "server.py downloaded from GitHub → $INSTALL_DIR/server.py"
 else
   fail "Could not find server.py next to this script nor download it."
-  read -r -p "Press Enter to close..." _; exit 1
+  pause; exit 1
 fi
 "$VENV/bin/python3" -c "import ast; ast.parse(open('$INSTALL_DIR/server.py').read())" 2>/dev/null \
   && ok "server.py syntax OK" \
@@ -66,8 +89,13 @@ EOF
 DEFAULT_PUB="${EXISTING_PUB:-https://thrivinginengineering.substack.com}"
 echo
 bold "Substack publication"
-read -r -p "  Publication URL [$DEFAULT_PUB]: " PUB
-PUB="${PUB:-$DEFAULT_PUB}"
+if [ -n "${TIE_SUBSTACK_PUB:-}" ]; then
+  PUB="$TIE_SUBSTACK_PUB"
+  ok "taken from TIE_SUBSTACK_PUB: $PUB"
+else
+  ask "  Publication URL [$DEFAULT_PUB]: " "$DEFAULT_PUB"
+  PUB="$ANSWER"
+fi
 PUB_URL="$PUB" INSTALL_DIR="$INSTALL_DIR" "$VENV/bin/python3" <<'EOF'
 import json, os, stat
 p = os.path.join(os.environ["INSTALL_DIR"], "config.json")
@@ -117,4 +145,4 @@ echo "  3. In a chat, ask Claude to run substack_status — then refresh_cookie"
 echo "     (macOS will ask for Keychain access; the cookie goes straight into"
 echo "      $INSTALL_DIR/config.json and is never shown)."
 echo
-read -r -p "Press Enter to close..." _
+pause
