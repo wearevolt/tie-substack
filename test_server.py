@@ -115,14 +115,15 @@ check("new detected", plan["new"], ["mcp-tooling", "a-b"])
 print("v0.2.0 — schedule/settings read from server state")
 sched = {"id": 9, "draft_title": "T", "is_published": False, "should_send_email": True,
          "audience": "everyone", "write_comment_permissions": "none",
-         "postSchedules": [{"trigger_at": "2026-08-03T13:00:00.000Z"}],
-         "postTags": [{"name": "debugging"}]}
+         "postSchedules": [{"trigger_at": "2026-08-03T13:00:00.000Z"}]}
 s9 = srv.draft_summary(sched)
 check("scheduled_for from postSchedules", s9["scheduled_for"], "2026-08-03T13:00:00.000Z")
 check("audience surfaced", s9["audience"], "everyone")
 check("comments surfaced", s9["comment_permissions"], "none")
 check("send_email surfaced", s9["send_email"], True)
-check("tags surfaced", s9["tags"], ["debugging"])
+# Real payloads have no postTags key at all, so the summary must not claim tags —
+# they come from the association endpoint (see read_post_tags below).
+check("summary claims no tags of its own", "tags" in s9, False)
 # The list payload has no postSchedules key at all — absence must not read as "not scheduled".
 s10 = srv.draft_summary({"id": 9, "draft_title": "T", "is_published": False})
 check("list payload flags unknown schedule", "scheduled_for" in s10, False)
@@ -138,6 +139,35 @@ check("publish_draft advertises confirm_send_email",
 check("new tools registered",
       all(n in srv.TOOL_HANDLERS for n in
           ("get_publication_settings", "update_post_settings", "apply_tags")), True)
+
+
+print("v0.2.1 — narrower list projection is not reported as empty")
+# Verified live: the list payload carries NEITHER subtitle nor draft_subtitle.
+list_row = {"id": 1, "draft_title": "T", "is_published": False, "audience": "everyone"}
+r = srv.draft_summary(list_row)
+check("no null subtitle from list payload", "subtitle" in r, False)
+check("explains absent subtitle", "get_draft" in r.get("subtitle_note", ""), True)
+single = {"id": 1, "draft_title": "T", "draft_subtitle": "A first post", "is_published": False}
+check("subtitle read when present", srv.draft_summary(single)["subtitle"], "A first post")
+check("empty subtitle stays reported", "subtitle" in srv.draft_summary(
+    {"id": 1, "draft_title": "T", "subtitle": None}), True)
+
+print("v0.2.1 — attached tags read from the association endpoint")
+class FakeApi:  # postTags is absent from real payloads, so this is the only truth
+    def __init__(self, rows): self.rows = rows; self.calls = []
+    def call(self, endpoint, method, **kw): self.calls.append((endpoint, method)); return self.rows
+    def get_publication_post_tags(self):
+        return [{"id": "65ac113b-uuid", "name": "debugging"},
+                {"id": "69c0ed7c-uuid", "name": "tooling"}]
+fake = FakeApi([{"post_id": 9, "post_tag_id": "65ac113b-uuid"},
+                {"post_id": 9, "post_tag_id": "69c0ed7c-uuid"}])
+got = srv.read_post_tags(fake, 9)
+check("uuid ids mapped to names", got["names"], ["debugging", "tooling"])
+check("hits the association endpoint", fake.calls, [("post/9/tag", "GET")])
+check("unknown id degrades visibly",
+      srv.read_post_tags(FakeApi([{"post_tag_id": "ghost-uuid"}]), 9)["names"], ["tag:ghost-uuid"])
+check("no attachments -> empty, not echo", srv.read_post_tags(FakeApi([]), 9)["names"], [])
+check("odd shape flagged", "note" in srv.read_post_tags(FakeApi({"x": 1}), 9), True)
 
 print("\n%d failure(s)" % len(fails))
 for f in fails:

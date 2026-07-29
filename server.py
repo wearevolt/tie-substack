@@ -37,7 +37,7 @@ import traceback
 from datetime import datetime, timezone
 
 SERVER_NAME = "tie-substack"
-SERVER_VERSION = "0.2.0"
+SERVER_VERSION = "0.2.1"
 
 # Substack's Publish-dialog settings. Every one of these gets a value whether or
 # not the caller picks it, so the tools always send them explicitly — see
@@ -335,6 +335,34 @@ def resolve_tags(api, wanted, caps=None):
     }
 
 
+def read_post_tags(api, post_id):
+    """Tags actually attached, read from the association endpoint.
+
+    The draft payload has NO postTags field (verified: the key is absent, not
+    null), so a request echo would be the only alternative — and this is the last
+    place where that would still be the case. `GET post/<id>/tag` returns
+    association rows carrying post_tag_id (a UUID string), which we map to names
+    via the publication's tag list.
+    """
+    rows = api.call("post/%s/tag" % post_id, "GET") or []
+    if not isinstance(rows, list):
+        return {"names": [], "note": "unexpected response shape from post/<id>/tag"}
+    names_by_id = {}
+    try:
+        for t in api.get_publication_post_tags() or []:
+            if isinstance(t, dict):
+                names_by_id[str(t.get("id"))] = t.get("name")
+    except Exception:  # noqa: BLE001
+        pass
+    names = []
+    for r in rows:
+        if not isinstance(r, dict):
+            continue
+        tid = str(r.get("post_tag_id") or r.get("id") or "")
+        names.append(names_by_id.get(tid) or ("tag:%s" % tid))
+    return {"names": names}
+
+
 def post_url_for_slug(slug):
     if not slug:
         return None
@@ -368,7 +396,6 @@ def draft_summary(draft):
         "draft_id": draft_id,
         # Unpublished drafts keep the working title in draft_title and leave title null.
         "title": draft.get("draft_title") or draft.get("title") or "(untitled draft)",
-        "subtitle": draft.get("draft_subtitle") or draft.get("subtitle"),
         "slug": slug,
         "post_url": post_url_for_slug(slug),
         "is_published": bool(published),
@@ -379,6 +406,14 @@ def draft_summary(draft):
         "comment_permissions": draft.get("write_comment_permissions"),
         "send_email": draft.get("should_send_email"),
     }
+    # The list payload is a narrower projection than get_draft: subtitle, SEO,
+    # section and free-preview keys are ABSENT there (not null). Reporting null
+    # for an absent key would read as "empty", so only report what the payload
+    # actually carries.
+    if "draft_subtitle" in draft or "subtitle" in draft:
+        summary["subtitle"] = draft.get("draft_subtitle") or draft.get("subtitle")
+    else:
+        summary["subtitle_note"] = "not in this payload — call get_draft to read it"
     for key, field in (
         ("send_free_preview", "should_send_free_preview"),
         ("section_id", "draft_section_id"),
@@ -387,9 +422,6 @@ def draft_summary(draft):
     ):
         if field in draft:
             summary[key] = draft.get(field)
-    tags = draft.get("postTags")
-    if isinstance(tags, list):
-        summary["tags"] = [t.get("name") for t in tags if isinstance(t, dict)]
     if draft.get("email_sent_at"):
         summary["email_already_sent_at"] = draft["email_sent_at"]
     # trigger_at lives in postSchedules, and ONLY on the single-draft payload —
@@ -665,7 +697,9 @@ TOOLS = [
     {
         "name": "get_draft",
         "description": (
-            "Fetch one draft/post by id: title, slug, post_url, scheduled_for, published?"
+            "Fetch one draft/post by id — the COMPLETE view: title, subtitle, slug, "
+            "post_url, settings, attached tags (read from the association endpoint) and "
+            "scheduled_for. Use this rather than list_drafts when the details matter."
         ),
         "inputSchema": {
             "type": "object",
@@ -675,7 +709,13 @@ TOOLS = [
     },
     {
         "name": "list_drafts",
-        "description": "List recent drafts (id, title, slug, post_url, scheduled_for).",
+        "description": (
+            "List recent drafts (id, title, slug, post_url, audience, comments, "
+            "send_email). Substack's list payload is a NARROWER projection than "
+            "get_draft: subtitle, SEO fields, section, tags and the schedule are not in "
+            "it, and the response says so per field instead of reporting null — call "
+            "get_draft for those."
+        ),
         "inputSchema": {
             "type": "object",
             "properties": {"limit": {"type": "integer", "default": 10}},
@@ -940,7 +980,13 @@ def tool_create_draft(args):
     # Report what Substack STORED, not what we asked for.
     draft = api.get_draft(draft_id)
     summary = draft_summary(draft)
-    summary["tags_applied"] = tag_plan
+    if tag_plan["normalized"]:
+        attached = read_post_tags(api, draft_id)
+        summary["tags"] = attached["names"]
+        summary["tags_requested"] = tag_plan["normalized"]
+        missing = [t for t in tag_plan["normalized"] if t not in attached["names"]]
+        if missing:
+            summary["tags_not_attached"] = missing
     requested = {
         "audience": audience,
         "comment_permissions": comments,
@@ -1026,7 +1072,19 @@ def tool_apply_tags(args):
         )
     api.add_tags_to_post(draft_id, plan["normalized"])
     summary = draft_summary(api.get_draft(draft_id))
-    summary["tags_applied"] = plan
+    # Report the attachments Substack stored, not the list we just sent.
+    attached = read_post_tags(api, draft_id)
+    summary["tags"] = attached["names"]
+    summary["tags_requested"] = plan["normalized"]
+    if attached.get("note"):
+        summary["tags_note"] = attached["note"]
+    missing = [t for t in plan["normalized"] if t not in attached["names"]]
+    if missing:
+        summary["tags_not_attached"] = missing
+        summary["warning"] = (
+            "these tags were requested but are not attached according to the server: %s"
+            % missing
+        )
     return text_result(summary)
 
 
@@ -1084,7 +1142,18 @@ def tool_unschedule_draft(args):
 
 def tool_get_draft(args):
     api = get_api()
-    return text_result(draft_summary(api.get_draft(args["draft_id"])))
+    draft_id = args["draft_id"]
+    summary = draft_summary(api.get_draft(draft_id))
+    # Tags live only in the association endpoint, so read them here (one extra
+    # call). list_drafts deliberately skips this to avoid N+1 requests.
+    try:
+        attached = read_post_tags(api, draft_id)
+        summary["tags"] = attached["names"]
+        if attached.get("note"):
+            summary["tags_note"] = attached["note"]
+    except Exception as e:  # noqa: BLE001
+        summary["tags_note"] = "could not read attached tags: %s" % str(e)[:150]
+    return text_result(summary)
 
 
 def tool_list_drafts(args):

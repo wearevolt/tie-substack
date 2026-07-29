@@ -111,10 +111,20 @@ and the email cannot be recalled, so `schedule_draft` and `publish_draft`
 escape hatch while a schedule is still pending.
 
 **Results report server state, not your request.** After every mutation the
-tools re-read the draft and report what Substack stored (the schedule comes from
-`postSchedules`, which exists only on the single-draft payload). A requested
-value that differs from the stored one is surfaced as `settings_drift` instead of
-being reported as success.
+tools re-read the draft and report what Substack stored. A requested value that
+differs from the stored one is surfaced as `settings_drift` / `tags_not_attached`
+instead of being reported as success. Two fields need their own endpoint, because
+the draft payload cannot answer for them:
+
+| Field | Where the truth lives |
+|---|---|
+| schedule | `postSchedules` — present only on the **single**-draft payload |
+| attached tags | `GET post/<id>/tag` association rows (`post_tag_id` is a UUID), mapped to names via the publication tag list. The draft payload has **no** `postTags` field at all. |
+
+**`list_drafts` is a narrower projection than `get_draft`.** Substack's list
+response omits subtitle, SEO fields, section, tags and the schedule *as keys* —
+so the tools report a per-field note there rather than `null`, which would read
+as "empty". Call `get_draft` when the details matter.
 
 ## The intended flow (tie-social)
 
