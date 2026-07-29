@@ -37,7 +37,7 @@ import traceback
 from datetime import datetime, timezone
 
 SERVER_NAME = "tie-substack"
-SERVER_VERSION = "0.1.0"
+SERVER_VERSION = "0.1.1"
 FALLBACK_PROTOCOL = "2025-06-18"
 
 CONFIG_PATH = os.path.expanduser(
@@ -90,14 +90,46 @@ def save_config(cfg):
     os.chmod(CONFIG_PATH, stat.S_IRUSR | stat.S_IWUSR)  # 0600 — it holds a session cookie
 
 
+def normalize_publication_url(url):
+    """Force the https://<name>.substack.com form python-substack's resolver requires.
+
+    Its Api.__init__ extracts the subdomain with a regex containing a literal
+    'https://', so a bare host or an http:// URL silently resolves to no
+    publication and later blows up as 'NoneType' is not subscriptable.
+    """
+    u = (url or "").strip().rstrip("/")
+    if not u:
+        return ""
+    if u.lower().startswith("http://"):
+        u = "https://" + u[len("http://"):]
+    elif not u.lower().startswith("https://"):
+        u = "https://" + u
+    return u
+
+
+def raw_publication_url():
+    return os.environ.get("SUBSTACK_PUBLICATION_URL") or load_config().get(
+        "publication_url"
+    ) or ""
+
+
 def publication_url():
-    url = os.environ.get("SUBSTACK_PUBLICATION_URL") or load_config().get("publication_url")
+    url = normalize_publication_url(raw_publication_url())
     if not url:
         raise RuntimeError(
             "publication_url is not configured — set SUBSTACK_PUBLICATION_URL or add "
             '"publication_url" to %s (e.g. via install.command)' % CONFIG_PATH
         )
-    return url.rstrip("/")
+    return url
+
+
+SUBDOMAIN_RE = re.compile(r"^https://([^./]+)\.substack\.com$", re.I)
+
+
+def configured_subdomain():
+    """The publication subdomain, or None if the URL isn't a *.substack.com one."""
+    m = SUBDOMAIN_RE.match(publication_url())
+    return m.group(1).lower() if m else None
 
 
 def current_cookies():
@@ -110,6 +142,35 @@ def current_cookies():
 
 def cookies_string(cookies):
     return "; ".join("%s=%s" % (k, v) for k, v in cookies.items())
+
+
+def probe_session(cookies):
+    """Check the session WITHOUT depending on publication resolution.
+
+    Returns (ok, info). Keeps 'session expired' distinguishable from
+    'this account has no access to the configured publication' — the two
+    failures look identical once python-substack's Api.__init__ is involved.
+    """
+    import requests  # noqa: PLC0415  (a python-substack dependency)
+
+    r = requests.get(
+        "https://substack.com/api/v1/user/profile/self", cookies=cookies, timeout=30
+    )
+    if r.status_code in (401, 403):
+        return False, {"reason": "session_invalid", "status": r.status_code}
+    r.raise_for_status()
+    data = r.json() or {}
+    subdomains = []
+    for pu in data.get("publicationUsers") or []:
+        pub = pu.get("publication") or {}
+        if pub.get("subdomain"):
+            subdomains.append(pub["subdomain"].lower())
+    return True, {
+        "handle": data.get("handle") or data.get("name"),
+        "user_id": data.get("id"),
+        "subdomains": subdomains,
+        "primary": (data.get("primaryPublication") or {}).get("subdomain"),
+    }
 
 
 def get_api(fresh=False):
@@ -125,9 +186,33 @@ def get_api(fresh=False):
                 '{"cookies": {"substack.sid": "<value>"}}. Never paste the cookie into chat.'
                 % CONFIG_PATH
             )
+        url = publication_url()
+        sub = configured_subdomain()
+        if not sub:
+            raise RuntimeError(
+                "publication_url %r is not a https://<name>.substack.com URL. The underlying "
+                "python-substack library resolves the publication by exactly that form, so a "
+                "custom domain cannot be used here — configure the canonical Substack URL in "
+                "%s." % (url, CONFIG_PATH)
+            )
+        # Pre-flight so failures name their real cause instead of surfacing as
+        # "'NoneType' object is not subscriptable" from inside change_publication().
+        ok, probe = probe_session(cookies)
+        if not ok:
+            raise RuntimeError(
+                "Substack session is invalid or expired (HTTP %s) — run refresh_cookie"
+                % probe.get("status")
+            )
+        if sub not in probe["subdomains"]:
+            raise RuntimeError(
+                "the logged-in account (%s) has no access to publication %r. Publications "
+                "available to this session: %s. Either fix publication_url in %s, or refresh "
+                "the cookie from a browser logged in as a user of %r."
+                % (probe["handle"], sub, probe["subdomains"] or "(none)", CONFIG_PATH, sub)
+            )
         from substack import Api  # noqa: PLC0415
 
-        api = Api(cookies_string=cookies_string(cookies), publication_url=publication_url())
+        api = Api(cookies_string=cookies_string(cookies), publication_url=url)
         _api_cache["api"] = api
         return api
 
@@ -141,23 +226,54 @@ def reset_api():
 
 
 def post_url_for_slug(slug):
-    return "%s/p/%s" % (publication_url(), slug) if slug else None
+    if not slug:
+        return None
+    try:
+        return "%s/p/%s" % (publication_url(), slug)
+    except RuntimeError:
+        return None
+
+
+def unwrap_items(raw, *keys):
+    """Substack wraps collections in an object (e.g. {"posts": [...]}) — unwrap it."""
+    if isinstance(raw, dict):
+        for k in keys:
+            v = raw.get(k)
+            if isinstance(v, list):
+                return v
+        return []
+    return raw or []
 
 
 def draft_summary(draft):
     """Public, cookie-free summary of a draft dict returned by the API."""
+    if not isinstance(draft, dict):
+        return {"warning": "unexpected draft payload shape", "raw": str(draft)[:200]}
     slug = draft.get("slug") or draft.get("draft_slug")
-    return {
-        "draft_id": draft.get("id"),
-        "title": draft.get("draft_title") or draft.get("title"),
+    published = draft.get("is_published")
+    if published is None:
+        published = bool(draft.get("post_date"))
+    draft_id = draft.get("id")
+    summary = {
+        "draft_id": draft_id,
+        # Unpublished drafts keep the working title in draft_title and leave title null.
+        "title": draft.get("draft_title") or draft.get("title") or "(untitled draft)",
         "subtitle": draft.get("draft_subtitle") or draft.get("subtitle"),
         "slug": slug,
         "post_url": post_url_for_slug(slug),
-        "editor_url": "%s/publish/post/%s" % (publication_url(), draft.get("id")),
-        "is_published": bool(draft.get("post_date")),
+        "is_published": bool(published),
         "scheduled_for": draft.get("trigger_at"),
         "updated_at": draft.get("draft_updated_at") or draft.get("updated_at"),
     }
+    try:
+        summary["editor_url"] = "%s/publish/post/%s" % (publication_url(), draft_id)
+    except RuntimeError:
+        pass
+    if not slug:
+        summary["post_url_note"] = (
+            "no slug set on this draft yet — call set_slug to pin the public URL"
+        )
+    return summary
 
 
 def parse_iso_aware(value):
@@ -345,9 +461,16 @@ TOOLS = [
 
 
 def tool_substack_status(_args):
+    """Layered diagnosis: deps → config → session → publication access → Api ready."""
     info = {"config_path": CONFIG_PATH, "server_version": SERVER_VERSION}
+    raw = raw_publication_url()
     try:
         info["publication_url"] = publication_url()
+        if raw and raw.strip().rstrip("/") != info["publication_url"]:
+            info["publication_url_note"] = (
+                "normalized from %r — python-substack only resolves the "
+                "https://<name>.substack.com form; consider fixing it in the config" % raw
+            )
     except RuntimeError as e:
         info["publication_url"] = "NOT CONFIGURED: %s" % e
     try:
@@ -365,20 +488,68 @@ def tool_substack_status(_args):
 
     cookies = current_cookies()
     info["cookie_configured"] = bool(cookies.get("substack.sid"))
-    info["cookie_names"] = sorted(cookies.keys())
-    if info["cookie_configured"] and "NOT INSTALLED" not in str(info["python_substack"]):
-        try:
-            api = get_api(fresh=True)
-            profile = api.get_user_profile()
-            pub = api.get_user_primary_publication() or {}
-            info["cookie_valid"] = True
-            info["logged_in_as"] = profile.get("handle") or profile.get("name")
-            info["primary_publication"] = pub.get("subdomain")
-        except Exception as e:  # noqa: BLE001
-            reset_api()
-            info["cookie_valid"] = False
-            info["cookie_error"] = str(e)[:300]
-            info["fix"] = "cookie is likely expired — run refresh_cookie"
+    # Names only, and only the auth-relevant ones — analytics cookies are noise here,
+    # and no cookie VALUE is ever reported.
+    info["auth_cookies_present"] = sorted(
+        k for k in cookies if k.startswith("substack.") or k == "cf_clearance"
+    )
+    info["cookies_stored"] = len(cookies)
+    if not info["cookie_configured"]:
+        info["api_ready"] = False
+        info["fix"] = (
+            "no substack.sid — run refresh_cookie, or paste it into %s" % CONFIG_PATH
+        )
+        return text_result(info)
+
+    # 1) Session validity, independent of any publication resolution.
+    try:
+        ok, probe = probe_session(cookies)
+    except Exception as e:  # noqa: BLE001
+        info["session_valid"] = "unknown"
+        info["api_ready"] = False
+        info["session_error"] = "could not reach Substack: %s" % str(e)[:200]
+        return text_result(info)
+    info["session_valid"] = ok
+    if not ok:
+        info["api_ready"] = False
+        info["fix"] = "session cookie is invalid or expired — run refresh_cookie"
+        return text_result(info)
+    info["logged_in_as"] = probe["handle"]
+    info["primary_publication"] = probe["primary"]
+    info["available_publications"] = probe["subdomains"]
+
+    # 2) Does the configured publication belong to this account?
+    try:
+        sub = configured_subdomain()
+    except RuntimeError:
+        info["api_ready"] = False
+        info["fix"] = "configure publication_url in %s" % CONFIG_PATH
+        return text_result(info)
+    if not sub:
+        info["api_ready"] = False
+        info["fix"] = (
+            "publication_url must be https://<name>.substack.com (custom domains are not "
+            "resolvable by python-substack)"
+        )
+        return text_result(info)
+    info["configured_publication"] = sub
+    if sub not in probe["subdomains"]:
+        info["api_ready"] = False
+        info["fix"] = (
+            "account %s has no access to %r — fix publication_url (available: %s) or refresh "
+            "the cookie from a session that owns it"
+            % (probe["handle"], sub, probe["subdomains"] or "(none)")
+        )
+        return text_result(info)
+
+    # 3) Full client construction (the step that used to fail opaquely).
+    try:
+        get_api(fresh=True)
+        info["api_ready"] = True
+    except Exception as e:  # noqa: BLE001
+        reset_api()
+        info["api_ready"] = False
+        info["api_error"] = str(e)[:300]
     return text_result(info)
 
 
@@ -426,7 +597,11 @@ def tool_refresh_cookie(args):
 
     result = {
         "saved_to": CONFIG_PATH,
-        "cookie_names": sorted(cookies.keys()),  # names only — values never leave the server
+        # Names only — cookie VALUES never leave the server.
+        "auth_cookies_saved": sorted(
+            k for k in cookies if k.startswith("substack.") or k == "cf_clearance"
+        ),
+        "cookies_stored": len(cookies),
         "browser": browser,
     }
     try:
@@ -463,6 +638,12 @@ def tool_create_draft(args):
             "requested slug %r but Substack stored %r (taken or normalized) — the post_url "
             "above reflects what was STORED; update social copy accordingly or set_slug again"
             % (slug, got)
+        )
+    elif not got:
+        summary["warning"] = (
+            "the draft was created but the response did not confirm slug %r — verify with "
+            "get_draft (or re-apply via set_slug) before using any post URL in social copy"
+            % slug
         )
     return text_result(summary)
 
@@ -503,7 +684,7 @@ def tool_get_draft(args):
 def tool_list_drafts(args):
     api = get_api()
     limit = max(1, min(50, int(args.get("limit") or 10)))
-    drafts = api.get_drafts(limit=limit) or []
+    drafts = unwrap_items(api.get_drafts(limit=limit), "posts", "drafts", "results")
     return text_result([draft_summary(d) for d in drafts])
 
 

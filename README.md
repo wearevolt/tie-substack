@@ -75,6 +75,20 @@ Then: restart Claude, ask it to run `substack_status`, then `refresh_cookie`.
 | `SUBSTACK_PUBLICATION_URL` | Publication URL (wins over config). |
 | `SUBSTACK_SESSION_TOKEN` | `substack.sid` value (wins over config; for CI-style setups). |
 
+`publication_url` must be the canonical **`https://<name>.substack.com`** URL:
+`python-substack` resolves the publication with a regex that contains a literal
+`https://`, so a bare host or a custom domain matches nothing. The server
+normalizes a missing scheme and rejects non-Substack domains with an explicit
+error (rather than the `'NoneType' object is not subscriptable` this used to
+produce), and `substack_status` reports session validity and publication access
+as separate checks.
+
+## Tests
+
+`python3 test_server.py` — offline regression checks (URL normalization, subdomain
+resolution, error attribution, `/drafts` payload unwrapping, draft summaries).
+Needs no cookie and makes no network calls.
+
 ## Caveats
 
 - Unofficial API — a Substack change can break any tool here; nothing is

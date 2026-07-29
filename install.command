@@ -75,9 +75,17 @@ try:
     cfg = json.load(open(p))
 except Exception:
     cfg = {}
-cfg["publication_url"] = os.environ["PUB_URL"].rstrip("/")
+# python-substack resolves the publication from the https://<name>.substack.com
+# form only — a bare host silently breaks every authenticated call.
+u = os.environ["PUB_URL"].strip().rstrip("/")
+if u.lower().startswith("http://"):
+    u = "https://" + u[len("http://"):]
+elif not u.lower().startswith("https://"):
+    u = "https://" + u
+cfg["publication_url"] = u
 json.dump(cfg, open(p, "w"), indent=2)
 os.chmod(p, stat.S_IRUSR | stat.S_IWUSR)
+print("  publication_url = %s" % u)
 EOF
 ok "publication saved to $INSTALL_DIR/config.json (0600)"
 
