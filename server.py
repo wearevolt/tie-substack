@@ -11,11 +11,19 @@ entering the model context.
 Auth is a browser session cookie (`substack.sid`). It lives ONLY in this
 server's local config file (mode 0600) — tools never echo it back, and the
 refresh_cookie tool (pycookiecheat) pulls it straight from the local Chrome
-profile into the config without displaying it.
+profile into the config without displaying it. By default that is the
+browser's DEFAULT profile; a per-client setup points `cookie_file` at a
+dedicated browser's Cookies DB instead (see README "Multiple clients").
 
 Config file (~/.tie-substack/config.json, override via TIE_SUBSTACK_CONFIG):
   { "publication_url": "https://<pub>.substack.com",
+    "cookie_file": "~/TIE-Browsers/<client>/Default/Cookies",   # optional
     "cookies": { "substack.sid": "...", ... } }
+
+Multi-client: register one server entry PER CLIENT in claude_desktop_config
+(e.g. "tie-substack-acme"), each with its own TIE_SUBSTACK_CONFIG +
+SUBSTACK_PUBLICATION_URL, and a cookie_file pointing into that client's
+dedicated browser. Sessions never mix across clients or Chrome profiles.
 
 Env overrides:
   SUBSTACK_PUBLICATION_URL   publication URL (wins over config)
@@ -37,7 +45,7 @@ import traceback
 from datetime import datetime, timezone
 
 SERVER_NAME = "tie-substack"
-SERVER_VERSION = "0.2.1"
+SERVER_VERSION = "0.3.0"
 
 # Substack's Publish-dialog settings. Every one of these gets a value whether or
 # not the caller picks it, so the tools always send them explicitly — see
@@ -150,6 +158,14 @@ def current_cookies():
 
 def cookies_string(cookies):
     return "; ".join("%s=%s" % (k, v) for k, v in cookies.items())
+
+
+def resolve_cookie_file(arg_value):
+    """Cookie-DB path for refresh_cookie: explicit arg > config 'cookie_file' > None
+    (None = the browser's default profile). The multi-client setup stores a per-client
+    path (a dedicated browser's <user-data-dir>/Default/Cookies) in each client config."""
+    raw = arg_value or load_config().get("cookie_file")
+    return os.path.expanduser(raw) if raw else None
 
 
 def probe_session(cookies):
@@ -510,7 +526,18 @@ TOOLS = [
                     "enum": ["chrome", "chromium", "brave", "firefox"],
                     "default": "chrome",
                     "description": "Which local browser profile to read the cookie from.",
-                }
+                },
+                "cookie_file": {
+                    "type": "string",
+                    "description": (
+                        "Absolute path to a specific Chrome-family 'Cookies' SQLite file "
+                        "to read INSTEAD of the browser's default profile — the "
+                        "multi-client setup points this at a dedicated per-client "
+                        "browser, e.g. ~/TIE-Browsers/<client>/Default/Cookies. Omit to "
+                        "use this server config's stored 'cookie_file' (if any), else "
+                        "the default profile. Not supported with browser=firefox."
+                    ),
+                },
             },
         },
     },
@@ -788,6 +815,9 @@ def tool_substack_status(_args):
         info["pycookiecheat"] = "installed (refresh_cookie available)"
     except ImportError:
         info["pycookiecheat"] = "not installed — refresh_cookie unavailable"
+    configured_cf = load_config().get("cookie_file")
+    if configured_cf:
+        info["cookie_file"] = configured_cf  # per-client browser this config reads from
 
     cookies = current_cookies()
     info["cookie_configured"] = bool(cookies.get("substack.sid"))
@@ -866,35 +896,52 @@ def tool_refresh_cookie(args):
         )
 
     browser = (args.get("browser") or "chrome").lower()
+    cookie_file = resolve_cookie_file(args.get("cookie_file"))
+    if cookie_file and browser == "firefox":
+        raise RuntimeError(
+            "cookie_file targets a Chrome-family Cookies SQLite file and cannot be "
+            "combined with browser=firefox"
+        )
+    if cookie_file and not os.path.isfile(cookie_file):
+        raise RuntimeError(
+            "cookie_file %s does not exist — for a dedicated per-client browser the "
+            "path is <user-data-dir>/Default/Cookies, and the browser must have been "
+            "launched (and logged in to Substack) at least once" % cookie_file
+        )
     url = "https://substack.com"
     cookies = None
     errors = []
     # pycookiecheat's API moved between versions; try new then old form.
     try:
         bt = pycookiecheat.BrowserType(browser)
-        cookies = pycookiecheat.chrome_cookies(url, browser=bt) \
+        cookies = pycookiecheat.chrome_cookies(url, browser=bt, cookie_file=cookie_file) \
             if browser != "firefox" else pycookiecheat.firefox_cookies(url)
     except Exception as e:  # noqa: BLE001
         errors.append(str(e))
         try:
-            cookies = pycookiecheat.chrome_cookies(url)
+            cookies = pycookiecheat.chrome_cookies(url, cookie_file=cookie_file)
         except Exception as e2:  # noqa: BLE001
             errors.append(str(e2))
     if not cookies:
         raise RuntimeError(
             "could not read cookies from %s (is the browser installed, are you logged in "
             "to substack.com there, was Keychain access granted?): %s"
-            % (browser, " | ".join(errors)[:400])
+            % (cookie_file or browser, " | ".join(errors)[:400])
         )
     if "substack.sid" not in cookies:
         raise RuntimeError(
             "no substack.sid among %s cookies for substack.com — log in to Substack in "
-            "that browser first (found: %s)" % (browser, sorted(cookies.keys()))
+            "that browser first (found: %s)"
+            % (cookie_file or browser, sorted(cookies.keys()))
         )
 
     cfg = load_config()
     cfg["cookies"] = cookies
     cfg.setdefault("publication_url", os.environ.get("SUBSTACK_PUBLICATION_URL", ""))
+    if args.get("cookie_file"):
+        # Persist an explicitly-passed path so the next no-arg refresh on this
+        # per-client config reads the same browser again.
+        cfg["cookie_file"] = cookie_file
     save_config(cfg)
     reset_api()
 
@@ -906,6 +953,7 @@ def tool_refresh_cookie(args):
         ),
         "cookies_stored": len(cookies),
         "browser": browser,
+        "cookie_file": cookie_file or "(default profile)",
     }
     try:
         api = get_api(fresh=True)

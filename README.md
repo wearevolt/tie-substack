@@ -153,11 +153,46 @@ error (rather than the `'NoneType' object is not subscriptable` this used to
 produce), and `substack_status` reports session validity and publication access
 as separate checks.
 
+## Multiple clients (one operator, several publications)
+
+`refresh_cookie` reads the browser's **default profile** unless told otherwise — with
+several Substack logins across Chrome profiles that grabs the wrong (or no) session.
+The supported model is **one dedicated browser + one config + one server entry per
+client**:
+
+1. **Dedicated browser per client** — a separate instance, not a profile in your daily
+   browser:
+   ```
+   open -na "Google Chrome" --args --user-data-dir="$HOME/TIE-Browsers/<client>"
+   ```
+   Log in to *that client's* Substack there, once. Nothing else needs to live in it.
+   (Cookie decryption still works: Chrome's Safe Storage Keychain key is per-app, not
+   per-user-data-dir.)
+2. **One server entry per client** in `claude_desktop_config.json`:
+   ```json
+   "tie-substack-<client>": {
+     "command": "python3", "args": ["<path>/server.py"],
+     "env": {
+       "TIE_SUBSTACK_CONFIG": "~/.tie-substack/<client>.json",
+       "SUBSTACK_PUBLICATION_URL": "https://<client>.substack.com"
+     }
+   }
+   ```
+3. **Point the config at the dedicated browser** — run `refresh_cookie` once with
+   `cookie_file: "~/TIE-Browsers/<client>/Default/Cookies"`; the path is persisted into
+   that client's config, so every later no-arg `refresh_cookie` on this server reads the
+   right browser automatically. `substack_status` reports the configured `cookie_file`
+   and which publication the session maps to — the caller should treat that as the proof
+   it is talking to the right client before creating drafts.
+
+`cookie_file` targets Chrome-family browsers (Chrome/Chromium/Brave); it cannot be
+combined with `browser: "firefox"`.
+
 ## Tests
 
 `python3 test_server.py` — offline regression checks (URL normalization, subdomain
-resolution, error attribution, `/drafts` payload unwrapping, draft summaries).
-Needs no cookie and makes no network calls.
+resolution, error attribution, `/drafts` payload unwrapping, draft summaries,
+per-client `cookie_file` resolution). Needs no cookie and makes no network calls.
 
 ## Caveats
 

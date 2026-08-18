@@ -169,6 +169,34 @@ check("unknown id degrades visibly",
 check("no attachments -> empty, not echo", srv.read_post_tags(FakeApi([]), 9)["names"], [])
 check("odd shape flagged", "note" in srv.read_post_tags(FakeApi({"x": 1}), 9), True)
 
+print("v0.3.0 — per-client cookie_file resolution")
+import json as _json
+_cfg_path = os.environ["TIE_SUBSTACK_CONFIG"]
+def _write_cfg(d):
+    with open(_cfg_path, "w") as f:
+        _json.dump(d, f)
+_write_cfg({})
+check("no arg, no config -> default profile", srv.resolve_cookie_file(None), None)
+check("explicit arg wins", srv.resolve_cookie_file("/tmp/x/Cookies"), "/tmp/x/Cookies")
+check("~ expands", srv.resolve_cookie_file("~/x/Cookies"),
+      os.path.expanduser("~/x/Cookies"))
+_write_cfg({"cookie_file": "~/TIE-Browsers/acme/Default/Cookies"})
+check("config fallback used when no arg", srv.resolve_cookie_file(None),
+      os.path.expanduser("~/TIE-Browsers/acme/Default/Cookies"))
+check("arg still wins over config", srv.resolve_cookie_file("/tmp/y/Cookies"),
+      "/tmp/y/Cookies")
+_write_cfg({})
+check("refresh_cookie schema exposes cookie_file",
+      "cookie_file" in [t for t in srv.TOOLS if t["name"] == "refresh_cookie"
+                        ][0]["inputSchema"]["properties"], True)
+try:
+    srv.tool_refresh_cookie({"browser": "firefox", "cookie_file": "/tmp/x/Cookies"})
+    check("firefox + cookie_file rejected", "no error", "RuntimeError")
+except RuntimeError:
+    check("firefox + cookie_file rejected", "RuntimeError", "RuntimeError")
+except Exception as e:  # pycookiecheat missing would raise before the guard — order matters
+    check("firefox + cookie_file rejected", type(e).__name__, "RuntimeError")
+
 print("\n%d failure(s)" % len(fails))
 for f in fails:
     print(" -", f)
