@@ -156,9 +156,21 @@ as separate checks.
 ## Multiple clients (one operator, several publications)
 
 `refresh_cookie` reads the browser's **default profile** unless told otherwise — with
-several Substack logins across Chrome profiles that grabs the wrong (or no) session.
-The supported model is **one dedicated browser + one config + one server entry per
-client**:
+several Substack logins across Chrome profiles that used to grab the wrong (or no)
+session. Two mechanisms fix it, and they compose:
+
+**A. Automatic profile scan (no setup — covers "several profiles in my main browser").**
+When no `cookie_file` is configured and the default profile has no session that reaches
+the configured publication, `refresh_cookie` walks the browser's other profiles
+(`Default`, `Profile 1`, …), validates each session against the publication, picks the
+one that reaches it, and **persists that profile's path** so later refreshes go straight
+to it. Deterministic code — cookie values never surface; the result reports only profile
+names + handles. Limits: it can only see the standard install's profiles (a dedicated
+`--user-data-dir` browser is invisible to the scan), and each secure-storage read may
+prompt for Keychain access once per browser app.
+
+**B. Dedicated browser per client (the recommended model for real multi-client work) —
+one dedicated browser + one config + one server entry per client:**
 
 1. **Dedicated browser per client** — a separate instance, not a profile in your daily
    browser:

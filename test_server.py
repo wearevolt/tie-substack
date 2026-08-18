@@ -197,6 +197,67 @@ except RuntimeError:
 except Exception as e:  # pycookiecheat missing would raise before the guard — order matters
     check("firefox + cookie_file rejected", type(e).__name__, "RuntimeError")
 
+print("v0.3.0 — profile scan: pick the profile whose session reaches the publication")
+import tempfile, types
+tmp = tempfile.mkdtemp()
+for prof in ("Default", "Profile 1", "Profile 2", "System Profile"):
+    os.makedirs(os.path.join(tmp, prof), exist_ok=True)
+for prof in ("Default", "Profile 1", "Profile 2"):
+    open(os.path.join(tmp, prof, "Cookies"), "w").close()
+check("enumerates Default + Profile N with a Cookies DB",
+      [n for n, _ in srv.chrome_profile_cookie_files("chrome", root=tmp)],
+      ["Default", "Profile 1", "Profile 2"])
+check("unknown browser -> empty", srv.chrome_profile_cookie_files("firefox"), [])
+
+fake_pcc = types.ModuleType("pycookiecheat")
+fake_pcc.BrowserType = lambda b: b
+BY_FILE = {
+    None: {"substack.sid": "sid-personal"},                                  # default: personal acct
+    os.path.join(tmp, "Profile 1", "Cookies"): {"other": "x"},               # not logged in
+    os.path.join(tmp, "Profile 2", "Cookies"): {"substack.sid": "sid-client"},  # the client acct
+}
+fake_pcc.chrome_cookies = lambda url, browser=None, cookie_file=None: dict(
+    BY_FILE.get(cookie_file) or {})
+sys.modules["pycookiecheat"] = fake_pcc
+
+def _fake_probe(cookies):
+    if cookies.get("substack.sid") == "sid-client":
+        return True, {"handle": "client", "primary": "acme", "subdomains": ["acme"]}
+    return True, {"handle": "me", "primary": "personal", "subdomains": ["personal"]}
+
+class _FakeApi:
+    def get_user_profile(self):
+        return {"handle": "client"}
+
+_orig = (srv.probe_session, srv.chrome_profile_cookie_files, srv.get_api, srv.reset_api)
+srv.probe_session = _fake_probe
+srv.chrome_profile_cookie_files = lambda browser, root=None: [
+    (n, os.path.join(tmp, n, "Cookies")) for n in ("Default", "Profile 1", "Profile 2")]
+srv.get_api = lambda fresh=False: _FakeApi()
+srv.reset_api = lambda: None
+os.environ["SUBSTACK_PUBLICATION_URL"] = "https://acme.substack.com"
+_write_cfg({})
+_payload = _json.loads(srv.tool_refresh_cookie({})["content"][0]["text"])
+check("scan picked the profile that reaches the publication",
+      _payload.get("profile"), "Profile 2")
+with open(_cfg_path) as f:
+    _saved = _json.load(f)
+check("scan hit persisted as cookie_file", _saved.get("cookie_file"),
+      os.path.join(tmp, "Profile 2", "Cookies"))
+check("the matching session was stored", _saved["cookies"]["substack.sid"], "sid-client")
+
+os.environ["SUBSTACK_PUBLICATION_URL"] = "https://nowhere.substack.com"
+_write_cfg({})
+try:
+    srv.tool_refresh_cookie({})
+    check("no profile reaches the publication -> explicit error", "no error", "RuntimeError")
+except RuntimeError:
+    check("no profile reaches the publication -> explicit error", "RuntimeError", "RuntimeError")
+
+srv.probe_session, srv.chrome_profile_cookie_files, srv.get_api, srv.reset_api = _orig
+del sys.modules["pycookiecheat"]
+os.environ.pop("SUBSTACK_PUBLICATION_URL", None)
+
 print("\n%d failure(s)" % len(fails))
 for f in fails:
     print(" -", f)

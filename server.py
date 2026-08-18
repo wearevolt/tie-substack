@@ -12,8 +12,11 @@ Auth is a browser session cookie (`substack.sid`). It lives ONLY in this
 server's local config file (mode 0600) — tools never echo it back, and the
 refresh_cookie tool (pycookiecheat) pulls it straight from the local Chrome
 profile into the config without displaying it. By default that is the
-browser's DEFAULT profile; a per-client setup points `cookie_file` at a
-dedicated browser's Cookies DB instead (see README "Multiple clients").
+browser's DEFAULT profile; when that profile has no session reaching the
+configured publication, refresh_cookie SCANS the browser's other profiles
+(Default, Profile 1, ...) and picks the one that does — a per-client setup
+instead points `cookie_file` at a dedicated browser's Cookies DB, which
+skips the scan entirely (see README "Multiple clients").
 
 Config file (~/.tie-substack/config.json, override via TIE_SUBSTACK_CONFIG):
   { "publication_url": "https://<pub>.substack.com",
@@ -166,6 +169,67 @@ def resolve_cookie_file(arg_value):
     path (a dedicated browser's <user-data-dir>/Default/Cookies) in each client config."""
     raw = arg_value or load_config().get("cookie_file")
     return os.path.expanduser(raw) if raw else None
+
+
+CHROME_FAMILY_DATA_DIRS = {
+    "chrome": "~/Library/Application Support/Google/Chrome",
+    "chromium": "~/Library/Application Support/Chromium",
+    "brave": "~/Library/Application Support/BraveSoftware/Brave-Browser",
+}
+
+
+def chrome_profile_cookie_files(browser, root=None):
+    """(profile_name, cookie_file) for every profile of the browser's STANDARD data dir
+    (Default, Profile 1, ...). Dedicated --user-data-dir browsers live elsewhere and are
+    not discoverable — those are addressed explicitly via cookie_file (the multi-client
+    model). macOS paths — this server's install story is macOS-only."""
+    base = root or CHROME_FAMILY_DATA_DIRS.get(browser)
+    if not base:
+        return []
+    base = os.path.expanduser(base)
+    if not os.path.isdir(base):
+        return []
+    out = []
+    for name in sorted(os.listdir(base)):
+        if name == "Default" or name.startswith("Profile "):
+            cf = os.path.join(base, name, "Cookies")
+            if os.path.isfile(cf):
+                out.append((name, cf))
+    return out
+
+
+def read_browser_cookies(pycookiecheat, browser, cookie_file, errors):
+    """One profile's substack.com cookies, or None. pycookiecheat's API moved between
+    versions — try the new form, then the old."""
+    url = "https://substack.com"
+    try:
+        bt = pycookiecheat.BrowserType(browser)
+        return pycookiecheat.chrome_cookies(url, browser=bt, cookie_file=cookie_file) \
+            if browser != "firefox" else pycookiecheat.firefox_cookies(url)
+    except Exception as e:  # noqa: BLE001
+        errors.append(str(e))
+        try:
+            return pycookiecheat.chrome_cookies(url, cookie_file=cookie_file)
+        except Exception as e2:  # noqa: BLE001
+            errors.append(str(e2))
+    return None
+
+
+def session_reaches(cookies, target):
+    """(matches, probe): the session is valid AND can access publication `target`
+    (any valid session counts when target is None)."""
+    if not cookies or "substack.sid" not in cookies:
+        return False, None
+    try:
+        ok, probe = probe_session(cookies)
+    except Exception:  # noqa: BLE001
+        return False, None
+    if not ok:
+        return False, probe
+    if target and target != probe.get("primary") \
+            and target not in (probe.get("subdomains") or []):
+        return False, probe
+    return True, probe
 
 
 def probe_session(cookies):
@@ -513,10 +577,13 @@ TOOLS = [
         "description": (
             "Pull the current substack.com session cookies from the LOCAL browser profile "
             "(via pycookiecheat; macOS will prompt for Keychain access) and store them in "
-            "the server's 0600 config file. The cookie value is never returned or shown — "
-            "the result only lists cookie NAMES and the validation outcome. Requires the "
-            "user to be logged in to Substack in that browser. Run only when the user asks "
-            "to refresh/repair Substack auth."
+            "the server's 0600 config file. If the default profile has no session that "
+            "reaches the configured publication (and no cookie_file is set), the browser's "
+            "other profiles are scanned automatically and the matching one is chosen and "
+            "persisted. The cookie value is never returned or shown — the result only "
+            "lists cookie NAMES, profile names/handles, and the validation outcome. "
+            "Requires the user to be logged in to Substack in that browser. Run only when "
+            "the user asks to refresh/repair Substack auth."
         ),
         "inputSchema": {
             "type": "object",
@@ -908,39 +975,59 @@ def tool_refresh_cookie(args):
             "path is <user-data-dir>/Default/Cookies, and the browser must have been "
             "launched (and logged in to Substack) at least once" % cookie_file
         )
-    url = "https://substack.com"
-    cookies = None
     errors = []
-    # pycookiecheat's API moved between versions; try new then old form.
+    cookies = read_browser_cookies(pycookiecheat, browser, cookie_file, errors)
     try:
-        bt = pycookiecheat.BrowserType(browser)
-        cookies = pycookiecheat.chrome_cookies(url, browser=bt, cookie_file=cookie_file) \
-            if browser != "firefox" else pycookiecheat.firefox_cookies(url)
-    except Exception as e:  # noqa: BLE001
-        errors.append(str(e))
-        try:
-            cookies = pycookiecheat.chrome_cookies(url, cookie_file=cookie_file)
-        except Exception as e2:  # noqa: BLE001
-            errors.append(str(e2))
+        target = configured_subdomain()
+    except RuntimeError:
+        target = None
+
+    chosen_profile = cookie_file or "(default profile)"
+    profiles_scanned = []
+    matched, _probe = session_reaches(cookies, target)
+    if not matched and target and not cookie_file and browser != "firefox":
+        # The scan (deterministic code — cookie values never surface, the model only
+        # sees profile names + handles): the default profile has no session that
+        # reaches the configured publication, so check each profile of the standard
+        # browser install and pick the one that does. A dedicated per-client browser
+        # is NOT discoverable this way — that's what cookie_file is for.
+        for name, cf in chrome_profile_cookie_files(browser):
+            c = read_browser_cookies(pycookiecheat, browser, cf, errors)
+            got, p = session_reaches(c, target)
+            profiles_scanned.append(
+                {"profile": name, "reaches_publication": got,
+                 "logged_in_as": (p or {}).get("handle")}
+            )
+            if got:
+                cookies, cookie_file, chosen_profile, matched = c, cf, name, True
+                break
     if not cookies:
         raise RuntimeError(
             "could not read cookies from %s (is the browser installed, are you logged in "
             "to substack.com there, was Keychain access granted?): %s"
-            % (cookie_file or browser, " | ".join(errors)[:400])
+            % (chosen_profile, " | ".join(errors)[:400])
         )
     if "substack.sid" not in cookies:
         raise RuntimeError(
             "no substack.sid among %s cookies for substack.com — log in to Substack in "
-            "that browser first (found: %s)"
-            % (cookie_file or browser, sorted(cookies.keys()))
+            "that browser first (found: %s)%s"
+            % (chosen_profile, sorted(cookies.keys()),
+               "; profiles scanned: %s" % profiles_scanned if profiles_scanned else "")
+        )
+    if target and not matched:
+        raise RuntimeError(
+            "found Substack session(s), but none that can access %r. Checked: %s. "
+            "Log in to that publication's account in one of this browser's profiles, or "
+            "pass cookie_file pointing at the right (e.g. dedicated per-client) browser."
+            % (target, profiles_scanned or [chosen_profile])
         )
 
     cfg = load_config()
     cfg["cookies"] = cookies
     cfg.setdefault("publication_url", os.environ.get("SUBSTACK_PUBLICATION_URL", ""))
-    if args.get("cookie_file"):
-        # Persist an explicitly-passed path so the next no-arg refresh on this
-        # per-client config reads the same browser again.
+    if args.get("cookie_file") or (profiles_scanned and matched and cookie_file):
+        # Persist the path that worked — explicitly passed, or found by the scan — so
+        # the next no-arg refresh on this config reads the same profile directly.
         cfg["cookie_file"] = cookie_file
     save_config(cfg)
     reset_api()
@@ -954,7 +1041,10 @@ def tool_refresh_cookie(args):
         "cookies_stored": len(cookies),
         "browser": browser,
         "cookie_file": cookie_file or "(default profile)",
+        "profile": chosen_profile,
     }
+    if profiles_scanned:
+        result["profiles_scanned"] = profiles_scanned
     try:
         api = get_api(fresh=True)
         profile = api.get_user_profile()
