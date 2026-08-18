@@ -170,7 +170,18 @@ names + handles. Limits: it can only see the standard install's profiles (a dedi
 prompt for Keychain access once per browser app.
 
 **B. Dedicated browser per client (the recommended model for real multi-client work) —
-one dedicated browser + one config + one server entry per client:**
+one dedicated browser + one config + one server entry per client.**
+
+The installer automates the whole setup — re-run it once per client:
+
+```
+TIE_SUBSTACK_CLIENT=acme ./install.command        # or run interactively and answer the prompts
+```
+
+It asks for the publication URL and the browser user-data dir (Enter accepts
+`~/TIE-Browsers/<client>`), writes `~/.tie-substack/<client>.json` (with `cookie_file`
+pointing into that browser), and registers the `tie-substack-<client>` server entry with
+the env overrides. The manual equivalent, for reference:
 
 1. **Dedicated browser per client** — a separate instance, not a profile in your daily
    browser:
