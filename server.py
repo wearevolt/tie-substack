@@ -215,6 +215,30 @@ def read_browser_cookies(pycookiecheat, browser, cookie_file, errors):
     return None
 
 
+def publication_accessible(probe, target):
+    """Can this session act on publication `target`? The SINGLE access predicate —
+    cookie selection (session_reaches), get_api's preflight, and substack_status must
+    all agree, or refresh_cookie can pick a session that later fails api_ready.
+    `primary` counts: a primary-only profile (primaryPublication set but absent from
+    publicationUsers) is still an account of that publication. Case-insensitive —
+    probe_session lowercases subdomains but not primary, and targets are lowercased."""
+    if not target:
+        return True
+    t = target.lower()
+    subs = [s.lower() for s in (probe.get("subdomains") or [])]
+    prim = (probe.get("primary") or "").lower()
+    return t in subs or t == prim
+
+
+def accessible_publications(probe):
+    """For error messages: everything the session can act on, primary included."""
+    out = [s.lower() for s in (probe.get("subdomains") or [])]
+    prim = (probe.get("primary") or "").lower()
+    if prim and prim not in out:
+        out.append(prim)
+    return sorted(out)
+
+
 def session_reaches(cookies, target):
     """(matches, probe): the session is valid AND can access publication `target`
     (any valid session counts when target is None)."""
@@ -226,8 +250,7 @@ def session_reaches(cookies, target):
         return False, None
     if not ok:
         return False, probe
-    if target and target != probe.get("primary") \
-            and target not in (probe.get("subdomains") or []):
+    if not publication_accessible(probe, target):
         return False, probe
     return True, probe
 
@@ -291,12 +314,13 @@ def get_api(fresh=False):
                 "Substack session is invalid or expired (HTTP %s) — run refresh_cookie"
                 % probe.get("status")
             )
-        if sub not in probe["subdomains"]:
+        if not publication_accessible(probe, sub):
             raise RuntimeError(
                 "the logged-in account (%s) has no access to publication %r. Publications "
                 "available to this session: %s. Either fix publication_url in %s, or refresh "
                 "the cookie from a browser logged in as a user of %r."
-                % (probe["handle"], sub, probe["subdomains"] or "(none)", CONFIG_PATH, sub)
+                % (probe["handle"], sub, accessible_publications(probe) or "(none)",
+                   CONFIG_PATH, sub)
             )
         from substack import Api  # noqa: PLC0415
 
@@ -933,12 +957,12 @@ def tool_substack_status(_args):
         )
         return text_result(info)
     info["configured_publication"] = sub
-    if sub not in probe["subdomains"]:
+    if not publication_accessible(probe, sub):
         info["api_ready"] = False
         info["fix"] = (
             "account %s has no access to %r — fix publication_url (available: %s) or refresh "
             "the cookie from a session that owns it"
-            % (probe["handle"], sub, probe["subdomains"] or "(none)")
+            % (probe["handle"], sub, accessible_publications(probe) or "(none)")
         )
         return text_result(info)
 

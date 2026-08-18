@@ -197,6 +197,21 @@ except RuntimeError:
 except Exception as e:  # pycookiecheat missing would raise before the guard — order matters
     check("firefox + cookie_file rejected", type(e).__name__, "RuntimeError")
 
+print("v0.3.0 — publication_accessible: one predicate for scan, get_api and status")
+check("subdomain member -> accessible",
+      srv.publication_accessible({"subdomains": ["acme"], "primary": None}, "acme"), True)
+check("primary-only profile -> accessible",
+      srv.publication_accessible({"subdomains": [], "primary": "acme"}, "acme"), True)
+check("primary case-insensitive",
+      srv.publication_accessible({"subdomains": [], "primary": "Acme"}, "acme"), True)
+check("no access -> rejected",
+      srv.publication_accessible({"subdomains": ["other"], "primary": "else"}, "acme"), False)
+check("no target -> any valid session",
+      srv.publication_accessible({"subdomains": [], "primary": None}, None), True)
+check("error listing merges primary",
+      srv.accessible_publications({"subdomains": ["beta"], "primary": "Acme"}),
+      ["acme", "beta"])
+
 print("v0.3.0 — profile scan: pick the profile whose session reaches the publication")
 import tempfile, types
 tmp = tempfile.mkdtemp()
@@ -222,7 +237,9 @@ sys.modules["pycookiecheat"] = fake_pcc
 
 def _fake_probe(cookies):
     if cookies.get("substack.sid") == "sid-client":
-        return True, {"handle": "client", "primary": "acme", "subdomains": ["acme"]}
+        # primary-only profile: acme is the primaryPublication but absent from
+        # publicationUsers — must still be selectable (shared predicate).
+        return True, {"handle": "client", "primary": "acme", "subdomains": []}
     return True, {"handle": "me", "primary": "personal", "subdomains": ["personal"]}
 
 class _FakeApi:
