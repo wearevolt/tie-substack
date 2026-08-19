@@ -69,7 +69,8 @@ Then: **quit Claude fully (Cmd-Q) and reopen**, ask it to run
 | Tool | What it does |
 |---|---|
 | `substack_status` | Cookie configured/valid? Logged-in user, publication, deps. |
-| `refresh_cookie` | Pull session cookies from the local browser into the config (names-only output). |
+| `refresh_cookie` | Pull session cookies from the local browser into the config (names-only output). Takes `profile:` to pick a specific login of the standard install. |
+| `list_profiles` | List browser profiles (directory, display name, signed-in email) from the plaintext Local State — no cookie reads, no Keychain prompt. |
 | `get_publication_settings` | Paid subscriptions enabled?, sections, existing tags, and which audience/comment values are therefore unavailable. Call before offering choices. |
 | `create_draft` | Draft from Markdown with **slug pinned** + explicit settings → `draft_id`, `slug`, `post_url`, `editor_url` and the settings **as stored**. |
 | `update_post_settings` | Fix settings on an existing draft without recreating it. |
@@ -162,12 +163,29 @@ session. Two mechanisms fix it, and they compose:
 **A. Automatic profile scan (no setup — covers "several profiles in my main browser").**
 When no `cookie_file` is configured and the default profile has no session that reaches
 the configured publication, `refresh_cookie` walks the browser's other profiles
-(`Default`, `Profile 1`, …), validates each session against the publication, picks the
-one that reaches it, and **persists that profile's path** so later refreshes go straight
-to it. Deterministic code — cookie values never surface; the result reports only profile
-names + handles. Limits: it can only see the standard install's profiles (a dedicated
-`--user-data-dir` browser is invisible to the scan), and each secure-storage read may
-prompt for Keychain access once per browser app.
+(`Default`, `Profile 1`, …), validates each session against the publication, and — when
+**exactly one** profile reaches it — picks that one and **persists its path** so later
+refreshes go straight to it. When SEVERAL profiles reach the publication (since v0.4.0)
+the scan stores nothing and errors with the candidate list — the choice between accounts
+is yours, not directory-sort order's; re-run with `profile:` (below). Deterministic code —
+cookie values never surface; the result reports only profile names + handles. Limits: it
+can only see the standard install's profiles (a dedicated `--user-data-dir` browser is
+invisible to the scan), and each secure-storage read may prompt for Keychain access once
+per browser app.
+
+**Choosing the right account (several of your OWN logins reach the same publication —
+the M:1 case).** Being on the publication's team is not identity: with two logins that
+both reach it, "reaches the publication" cannot tell them apart. Run `list_profiles`
+(names + emails from the browser's plaintext profile cache, no Keychain prompt), then
+`refresh_cookie` with `profile: "Work"` — matched case-insensitively against directory
+name, display name, or email, exact or unique substring. After an explicit choice the
+server pins `act_as: "<that handle>"` in the config, so every later no-arg refresh only
+accepts that identity (never silently another login, even if new profiles appear). The
+pin is plain config: edit or remove `act_as` by hand anytime, or set it up front —
+a Substack handle is the reliable form (an email only matches when Substack's profile
+API reports one). `substack_status` shows the pin and whether the current session
+matches it. Two profiles logged into the SAME account can only be split by `profile:`,
+not by `act_as`.
 
 **B. Dedicated browser per client (the recommended model for real multi-client work) —
 one dedicated browser + one config + one server entry per client.**
@@ -215,7 +233,8 @@ combined with `browser: "firefox"`.
 
 `python3 test_server.py` — offline regression checks (URL normalization, subdomain
 resolution, error attribution, `/drafts` payload unwrapping, draft summaries,
-per-client `cookie_file` resolution). Needs no cookie and makes no network calls.
+per-client `cookie_file` resolution, profile listing/selection, multi-match refusal,
+`act_as` pinning). Needs no cookie and makes no network calls.
 
 ## Caveats
 

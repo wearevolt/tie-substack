@@ -275,6 +275,192 @@ srv.probe_session, srv.chrome_profile_cookie_files, srv.get_api, srv.reset_api =
 del sys.modules["pycookiecheat"]
 os.environ.pop("SUBSTACK_PUBLICATION_URL", None)
 
+print("v0.4.0 — Local State parsing (list_profiles reads names/emails, never cookies)")
+root2 = tempfile.mkdtemp()
+with open(os.path.join(root2, "Local State"), "w") as f:
+    _json.dump({"profile": {"info_cache": {
+        "Default": {"name": "Person 1", "user_name": "me@x.com", "gaia_name": "Me"},
+        "Profile 1": {"name": "Work", "user_name": "work@client.com"},
+        "Profile 9": {},
+    }}}, f)
+_profs = srv.local_state_profiles("chrome", root=root2)
+check("profiles sorted by dir", [p["dir"] for p in _profs],
+      ["Default", "Profile 1", "Profile 9"])
+check("display name + email surfaced", (_profs[0]["name"], _profs[0]["email"]),
+      ("Person 1", "me@x.com"))
+check("empty meta -> empty strings", (_profs[2]["name"], _profs[2]["email"]), ("", ""))
+check("missing Local State -> []",
+      srv.local_state_profiles("chrome", root=tempfile.mkdtemp()), [])
+_payload = _json.loads(srv.tool_list_profiles({"root": root2})["content"][0]["text"])
+check("list_profiles count", _payload["count"], 3)
+check("list_profiles emails", _payload["profiles"][1]["email"], "work@client.com")
+try:
+    srv.tool_list_profiles({"root": os.path.join(root2, "nope")})
+    check("bogus root -> explicit error", "no error", "RuntimeError")
+except RuntimeError:
+    check("bogus root -> explicit error", "RuntimeError", "RuntimeError")
+
+print("v0.4.0 — profile selector: exact-or-substring, exactly one hit")
+check("dir name, case-insensitive",
+      srv.resolve_profile_selector("profile 1", "chrome", root=root2)["dir"], "Profile 1")
+check("display-name substring",
+      srv.resolve_profile_selector("work", "chrome", root=root2)["dir"], "Profile 1")
+check("email exact",
+      srv.resolve_profile_selector("work@client.com", "chrome", root=root2)["dir"],
+      "Profile 1")
+check("email substring, unique",
+      srv.resolve_profile_selector("me@x", "chrome", root=root2)["dir"], "Default")
+try:
+    srv.resolve_profile_selector("profile", "chrome", root=root2)
+    check("ambiguous selector -> error listing candidates", "no error", "ValueError")
+except ValueError as e:
+    check("ambiguous selector -> error listing candidates",
+          "Profile 1" in str(e) and "Profile 9" in str(e), True)
+try:
+    srv.resolve_profile_selector("zzz", "chrome", root=root2)
+    check("no match -> error", "no error", "ValueError")
+except ValueError:
+    check("no match -> error", "ValueError", "ValueError")
+root3 = tempfile.mkdtemp()
+with open(os.path.join(root3, "Local State"), "w") as f:
+    _json.dump({"profile": {"info_cache": {
+        "Default": {"name": "Person 1"}, "Profile 1": {"name": "Person 10"},
+    }}}, f)
+check("exact match beats substring ('Person 1' vs 'Person 10')",
+      srv.resolve_profile_selector("person 1", "chrome", root=root3)["dir"], "Default")
+
+print("v0.4.0 — multi-match scan stops; act_as pins the identity")
+fake_pcc = types.ModuleType("pycookiecheat")
+fake_pcc.BrowserType = lambda b: b
+BY_FILE2 = {
+    None: {"substack.sid": "sid-personal"},
+    os.path.join(tmp, "Default", "Cookies"): {"substack.sid": "sid-personal"},
+    os.path.join(tmp, "Profile 1", "Cookies"): {"substack.sid": "sid-alice"},
+    os.path.join(tmp, "Profile 2", "Cookies"): {"substack.sid": "sid-bob"},
+}
+fake_pcc.chrome_cookies = lambda url, browser=None, cookie_file=None: dict(
+    BY_FILE2.get(cookie_file) or {})
+sys.modules["pycookiecheat"] = fake_pcc
+
+def _fake_probe2(cookies):
+    sid = cookies.get("substack.sid")
+    if sid == "sid-alice":
+        return True, {"handle": "alice", "primary": None, "subdomains": ["acme"]}
+    if sid == "sid-bob":
+        return True, {"handle": "bob", "primary": None, "subdomains": ["acme"]}
+    return True, {"handle": "me", "primary": "personal", "subdomains": ["personal"]}
+
+_orig = (srv.probe_session, srv.chrome_profile_cookie_files, srv.local_state_profiles,
+         srv.get_api, srv.reset_api)
+srv.probe_session = _fake_probe2
+srv.chrome_profile_cookie_files = lambda browser, root=None: [
+    (n, os.path.join(tmp, n, "Cookies")) for n in ("Default", "Profile 1", "Profile 2")]
+srv.local_state_profiles = lambda browser, root=None: [
+    {"dir": "Default", "name": "Personal", "email": "me@x.com"},
+    {"dir": "Profile 1", "name": "Alice", "email": "alice@x.com"},
+    {"dir": "Profile 2", "name": "Bob", "email": "bob@x.com"},
+    {"dir": "Profile 9", "name": "Ghost", "email": ""},
+]
+srv.get_api = lambda fresh=False: _FakeApi()
+srv.reset_api = lambda: None
+os.environ["SUBSTACK_PUBLICATION_URL"] = "https://acme.substack.com"
+
+_write_cfg({})
+try:
+    srv.tool_refresh_cookie({})
+    check("two qualifying logins -> refuse to guess", "no error", "RuntimeError")
+except RuntimeError as e:
+    check("two qualifying logins -> refuse to guess",
+          "alice" in str(e) and "bob" in str(e) and "profile" in str(e), True)
+with open(_cfg_path) as f:
+    _saved = _json.load(f)
+check("multi-match stored NOTHING", "cookies" in _saved, False)
+
+_write_cfg({"act_as": "bob"})
+_payload = _json.loads(srv.tool_refresh_cookie({})["content"][0]["text"])
+check("act_as reduces two hits to one", _payload.get("profile"), "Profile 2")
+check("act_as reported in result", _payload.get("act_as"), "bob")
+with open(_cfg_path) as f:
+    _saved = _json.load(f)
+check("the pinned identity's session was stored",
+      _saved["cookies"]["substack.sid"], "sid-bob")
+
+_write_cfg({"act_as": "nobody"})
+try:
+    srv.tool_refresh_cookie({})
+    check("act_as matching no login -> explicit error", "no error", "RuntimeError")
+except RuntimeError as e:
+    check("act_as matching no login -> explicit error",
+          "act_as" in str(e) and "nobody" in str(e), True)
+
+print("v0.4.0 — explicit profile argument; act_as persistence")
+_write_cfg({})
+_payload = _json.loads(
+    srv.tool_refresh_cookie({"profile": "alice"})["content"][0]["text"])
+check("profile arg picked by display name", _payload.get("profile"), "Profile 1")
+check("explicit choice pins act_as", _payload.get("act_as_persisted"), True)
+with open(_cfg_path) as f:
+    _saved = _json.load(f)
+check("act_as persisted as the handle", _saved.get("act_as"), "alice")
+check("profile's Cookies path persisted", _saved.get("cookie_file"),
+      os.path.join(tmp, "Profile 1", "Cookies"))
+
+_write_cfg({"act_as": "bob"})
+_payload = _json.loads(
+    srv.tool_refresh_cookie({"profile": "Profile 2"})["content"][0]["text"])
+check("existing act_as never overwritten", "act_as_persisted" in _payload, False)
+with open(_cfg_path) as f:
+    _saved = _json.load(f)
+check("act_as still the original pin", _saved.get("act_as"), "bob")
+_write_cfg({"act_as": "bob"})
+try:
+    srv.tool_refresh_cookie({"profile": "alice"})
+    check("explicit profile vs pin mismatch -> error", "no error", "RuntimeError")
+except RuntimeError as e:
+    check("explicit profile vs pin mismatch -> error", "bob" in str(e), True)
+
+_write_cfg({})
+try:
+    srv.tool_refresh_cookie({"profile": "x", "cookie_file": "/tmp/y"})
+    check("profile + cookie_file rejected", "no error", "ValueError")
+except ValueError:
+    check("profile + cookie_file rejected", "ValueError", "ValueError")
+try:
+    srv.tool_refresh_cookie({"profile": "x", "browser": "firefox"})
+    check("profile + firefox rejected", "no error", "RuntimeError")
+except RuntimeError:
+    check("profile + firefox rejected", "RuntimeError", "RuntimeError")
+try:
+    srv.tool_refresh_cookie({"profile": "ghost"})
+    check("profile without a Cookies DB -> explicit error", "no error", "RuntimeError")
+except RuntimeError as e:
+    check("profile without a Cookies DB -> explicit error", "Cookies" in str(e), True)
+
+check("identity_matches: handle, case-insensitive",
+      srv.identity_matches({"handle": "Bob"}, "bob"), True)
+check("identity_matches: email fallback",
+      srv.identity_matches({"handle": "x", "email": "Bob@Y.com"}, "bob@y.com"), True)
+check("identity_matches: no pin -> everything qualifies",
+      srv.identity_matches({"handle": "x"}, ""), True)
+check("identity_matches: mismatch",
+      srv.identity_matches({"handle": "x"}, "bob"), False)
+
+(srv.probe_session, srv.chrome_profile_cookie_files, srv.local_state_profiles,
+ srv.get_api, srv.reset_api) = _orig
+del sys.modules["pycookiecheat"]
+os.environ.pop("SUBSTACK_PUBLICATION_URL", None)
+_write_cfg({})
+
+print("v0.4.0 — registration & version")
+check("refresh_cookie schema exposes profile",
+      "profile" in [t for t in srv.TOOLS if t["name"] == "refresh_cookie"
+                    ][0]["inputSchema"]["properties"], True)
+check("list_profiles registered", "list_profiles" in srv.TOOL_HANDLERS, True)
+check("list_profiles never offers firefox",
+      "firefox" in [t for t in srv.TOOLS if t["name"] == "list_profiles"
+                    ][0]["inputSchema"]["properties"]["browser"]["enum"], False)
+check("server version", srv.SERVER_VERSION, "0.4.0")
+
 print("\n%d failure(s)" % len(fails))
 for f in fails:
     print(" -", f)
