@@ -267,6 +267,7 @@ with open(_cfg_path) as f:
 check("scan hit persisted as cookie_file", _saved.get("cookie_file"),
       os.path.join(tmp, "Profile 2", "Cookies"))
 check("the matching session was stored", _saved["cookies"]["substack.sid"], "sid-client")
+check("unique scan hit pins the identity", _saved.get("act_as"), "client")
 
 os.environ["SUBSTACK_PUBLICATION_URL"] = "https://nowhere.substack.com"
 _write_cfg({})
@@ -423,6 +424,23 @@ try:
     check("explicit profile vs pin mismatch -> error", "no error", "RuntimeError")
 except RuntimeError as e:
     check("explicit profile vs pin mismatch -> error", "bob" in str(e), True)
+    check("mismatch refusal offers confirm_switch", "confirm_switch" in str(e), True)
+
+print("v0.4.0 — confirm_switch: switching accounts is deliberate, never silent")
+_payload = _json.loads(srv.tool_refresh_cookie(
+    {"profile": "alice", "confirm_switch": True})["content"][0]["text"])
+check("confirm_switch re-pins to the new identity", _payload.get("act_as"), "alice")
+check("the switch is reported", _payload.get("act_as_changed"),
+      {"from": "bob", "to": "alice"})
+with open(_cfg_path) as f:
+    _saved = _json.load(f)
+check("new pin persisted", _saved.get("act_as"), "alice")
+check("switched session stored", _saved["cookies"]["substack.sid"], "sid-alice")
+try:
+    srv.tool_refresh_cookie({"confirm_switch": True})
+    check("confirm_switch without profile rejected", "no error", "ValueError")
+except ValueError:
+    check("confirm_switch without profile rejected", "ValueError", "ValueError")
 
 _write_cfg({})
 try:
@@ -512,6 +530,102 @@ with open(_cfg_path) as f:
     _saved = _json.load(f)
 check("pure default hit still persists no cookie_file",
       "cookie_file" in _saved, False)
+check("scan-validated default hit pins the identity too",
+      _saved.get("act_as"), "carol")
+
+print("v0.4.0 — legacy unpinned cookie_file is re-validated (upgrade path)")
+BY_FILE3[os.path.join(tmp, "Profile 2", "Cookies")] = {"substack.sid": "sid-bob"}
+_orig_dirs = srv.CHROME_FAMILY_DATA_DIRS
+srv.CHROME_FAMILY_DATA_DIRS = {"chrome": tmp}  # tmp now counts as a standard install
+# Pre-0.4.0 state: scan-persisted path, no identity pin — a wrong login must not
+# survive the upgrade silently; the stored path is ignored and the scan re-runs.
+_write_cfg({"cookie_file": os.path.join(tmp, "Profile 2", "Cookies")})
+try:
+    srv.tool_refresh_cookie({})
+    check("legacy pin re-validated -> refuses on 2 identities", "no error",
+          "RuntimeError")
+except RuntimeError as e:
+    check("legacy pin re-validated -> refuses on 2 identities",
+          "carol" in str(e) and "bob" in str(e), True)
+with open(_cfg_path) as f:
+    _saved = _json.load(f)
+check("legacy re-validation stored nothing", "cookies" in _saved, False)
+# With an act_as pin the stored path is trusted exactly as before — no scan.
+_write_cfg({"cookie_file": os.path.join(tmp, "Profile 2", "Cookies"),
+            "act_as": "bob"})
+_payload = _json.loads(srv.tool_refresh_cookie({})["content"][0]["text"])
+check("pinned cookie_file honored, no legacy override",
+      _payload.get("profile"), os.path.join(tmp, "Profile 2", "Cookies"))
+check("pinned cookie_file: no scan ran", "profiles_scanned" in _payload, False)
+# A dedicated --user-data-dir path (model B) is outside the standard install and
+# keeps the old contract: that exact DB, no scan, no pin required.
+ded = tempfile.mkdtemp()
+os.makedirs(os.path.join(ded, "Default"), exist_ok=True)
+open(os.path.join(ded, "Default", "Cookies"), "w").close()
+BY_FILE3[os.path.join(ded, "Default", "Cookies")] = {"substack.sid": "sid-bob"}
+_write_cfg({"cookie_file": os.path.join(ded, "Default", "Cookies")})
+_payload = _json.loads(srv.tool_refresh_cookie({})["content"][0]["text"])
+check("dedicated-browser cookie_file untouched by the legacy check",
+      _payload.get("profile"), os.path.join(ded, "Default", "Cookies"))
+check("dedicated path: no scan ran", "profiles_scanned" in _payload, False)
+# substack_status flags the legacy state so it is visible before any refresh.
+_write_cfg({"cookie_file": os.path.join(tmp, "Profile 2", "Cookies"),
+            "cookies": {"substack.sid": "sid-bob"}})
+_status = _json.loads(srv.tool_substack_status({})["content"][0]["text"])
+check("status flags the legacy unpinned state", "identity_note" in _status, True)
+check("legacy state is write-blocking in status", _status.get("api_ready"), False)
+check("legacy status fix names refresh_cookie",
+      "refresh_cookie" in _status.get("fix", ""), True)
+# Family inference: a Brave-family legacy pin must be re-validated against
+# BRAVE's profiles, not Chrome's (a no-arg call defaults browser to chrome).
+srv.CHROME_FAMILY_DATA_DIRS = {"chrome": tempfile.mkdtemp(), "brave": tmp}
+srv.chrome_profile_cookie_files = lambda browser, root=None: (
+    [(n, os.path.join(tmp, n, "Cookies"))
+     for n in ("Default", "Profile 1", "Profile 2")]
+    if browser == "brave" else [])
+_write_cfg({"cookie_file": os.path.join(tmp, "Profile 2", "Cookies")})
+try:
+    srv.tool_refresh_cookie({})
+    check("brave legacy pin -> re-validated against the brave family",
+          "no error", "RuntimeError")
+except RuntimeError as e:
+    check("brave legacy pin -> re-validated against the brave family",
+          "carol" in str(e) and "bob" in str(e), True)
+# An EXPLICIT browser naming a different family wins: path honored, no override.
+_write_cfg({"cookie_file": os.path.join(tmp, "Profile 2", "Cookies")})
+_payload = _json.loads(
+    srv.tool_refresh_cookie({"browser": "chrome"})["content"][0]["text"])
+check("explicit other-family browser -> legacy override skipped",
+      _payload.get("profile"), os.path.join(tmp, "Profile 2", "Cookies"))
+check("explicit other-family browser: no scan ran",
+      "profiles_scanned" in _payload, False)
+# Self-heal: a legacy pin with a SINGLE qualifying login re-validates AND pins
+# in one no-arg refresh — the write block below clears itself.
+BY_FILE3[None] = {}
+BY_FILE3[os.path.join(tmp, "Default", "Cookies")] = {}
+_write_cfg({"cookie_file": os.path.join(tmp, "Profile 2", "Cookies")})
+_payload = _json.loads(srv.tool_refresh_cookie({})["content"][0]["text"])
+check("legacy heal: unique identity adopted", _payload.get("profile"), "Profile 2")
+check("legacy heal: identity pinned", _payload.get("act_as_persisted"), True)
+with open(_cfg_path) as f:
+    _saved = _json.load(f)
+check("legacy heal: pin persisted", _saved.get("act_as"), "bob")
+# Heal when the DEFAULT profile is the one that qualifies: the stale legacy
+# path must be dropped and the identity pinned — else the config loops in the
+# write-blocked state forever.
+BY_FILE3[None] = {"substack.sid": "sid-carol"}
+BY_FILE3[os.path.join(tmp, "Default", "Cookies")] = {"substack.sid": "sid-carol"}
+BY_FILE3[os.path.join(tmp, "Profile 2", "Cookies")] = {}
+_write_cfg({"cookie_file": os.path.join(tmp, "Profile 2", "Cookies")})
+_payload = _json.loads(srv.tool_refresh_cookie({})["content"][0]["text"])
+check("legacy heal via default: default kept",
+      _payload.get("profile"), "(default profile)")
+with open(_cfg_path) as f:
+    _saved = _json.load(f)
+check("legacy heal via default: stale path dropped",
+      "cookie_file" in _saved, False)
+check("legacy heal via default: identity pinned", _saved.get("act_as"), "carol")
+srv.CHROME_FAMILY_DATA_DIRS = _orig_dirs
 
 (srv.probe_session, srv.chrome_profile_cookie_files, srv.local_state_profiles,
  srv.get_api, srv.reset_api) = _orig
@@ -560,6 +674,39 @@ except RuntimeError as e:
 _write_cfg({"cookies": {"substack.sid": "sid-bob"}, "act_as": "bob"})
 check("restoring the pin restores cached access",
       isinstance(srv.get_api(), _FakeSubApi), True)
+# The legacy-unpinned state blocks writes too — cold cache and warm cache both.
+_orig_dirs = srv.CHROME_FAMILY_DATA_DIRS
+srv.CHROME_FAMILY_DATA_DIRS = {"chrome": tmp}
+_write_cfg({"cookies": {"substack.sid": "sid-bob"},
+            "cookie_file": os.path.join(tmp, "Profile 2", "Cookies")})
+srv.reset_api()
+try:
+    srv.get_api(fresh=True)
+    check("legacy unpinned config blocks get_api (cold)", "no error", "RuntimeError")
+except RuntimeError as e:
+    check("legacy unpinned config blocks get_api (cold)",
+          "pre-0.4.0" in str(e) and "refresh_cookie" in str(e), True)
+_write_cfg({"cookies": {"substack.sid": "sid-bob"}, "act_as": "bob"})
+srv.reset_api()
+srv.get_api(fresh=True)  # warm the cache in a healthy state
+_write_cfg({"cookies": {"substack.sid": "sid-bob"},
+            "cookie_file": os.path.join(tmp, "Profile 2", "Cookies")})
+try:
+    srv.get_api()  # cache hit path
+    check("legacy unpinned config blocks get_api (warm cache)",
+          "no error", "RuntimeError")
+except RuntimeError as e:
+    check("legacy unpinned config blocks get_api (warm cache)",
+          "pre-0.4.0" in str(e), True)
+# An explicit env session token overrides config cookies entirely — stale
+# legacy config must not block a CI/env-driven setup.
+os.environ["SUBSTACK_SESSION_TOKEN"] = "sid-bob"
+srv.reset_api()
+check("SUBSTACK_SESSION_TOKEN exempt from the legacy block",
+      isinstance(srv.get_api(fresh=True), _FakeSubApi), True)
+os.environ.pop("SUBSTACK_SESSION_TOKEN", None)
+srv.CHROME_FAMILY_DATA_DIRS = _orig_dirs
+srv.reset_api()
 srv.probe_session = _orig_probe
 srv.reset_api()
 del sys.modules["substack"]

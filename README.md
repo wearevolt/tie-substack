@@ -165,8 +165,9 @@ When no `cookie_file` is configured, `refresh_cookie` walks ALL of the browser's
 standard profiles (`Default`, `Profile 1`, …) and validates each session against the
 publication — the default profile gets **no special trust** (since v0.4.0): being the
 default doesn't make it the right *account*. When exactly one **login** reaches the
-publication it is picked and its path **persisted** so later refreshes go straight to
-it (two profiles signed into the *same* account don't count as ambiguity). When several
+publication it is picked, its path **persisted**, and its identity **pinned as
+`act_as`** so later refreshes go straight to it (two profiles signed into the *same*
+account don't count as ambiguity). When several
 distinct logins reach it, the scan stores nothing and errors with the candidate list —
 the choice between accounts is yours, not directory-sort order's; re-run with
 `profile:` (below). Deterministic code — cookie values never surface; the result
@@ -187,6 +188,23 @@ a Substack handle is the reliable form (an email only matches when Substack's pr
 API reports one). `substack_status` shows the pin and whether the current session
 matches it. Two profiles logged into the SAME account can only be split by `profile:`,
 not by `act_as`.
+
+**Switching accounts** is deliberate, never silent: `refresh_cookie` with `profile:`
+naming a login that differs from the pin refuses and names both identities; re-run with
+`confirm_switch: true` (the agent passes it only on your explicit ask — same contract as
+`confirm_send_email`) and the pin is rewritten to the new login, reported as
+`act_as_changed`. No config editing needed. Upgrading from ≤0.3.0: a scan-persisted
+standard-install `cookie_file` with no pin is re-validated via the scan on the next
+no-arg `refresh_cookie` (it may ask you to pick once; the browser family is inferred
+from the stored path, so a Brave/Chromium pin is re-checked against that browser's own
+profiles) — a wrong account persisted by the
+old first-match behavior cannot survive the upgrade silently, and **until that refresh
+runs, every Substack-facing tool refuses — reads included** (`substack_status` shows the
+state with `api_ready: false`).
+Removing `act_as` by hand while a standard-install `cookie_file` is persisted puts the
+config back into this re-validate-before-write state. Dedicated per-client
+browsers (model B) are not affected. Just logged in on a new profile? Fully quit the
+browser once (Cmd-Q) so the fresh session reaches the on-disk Cookies DB.
 
 **B. Dedicated browser per client (the recommended model for real multi-client work) —
 one dedicated browser + one config + one server entry per client.**
