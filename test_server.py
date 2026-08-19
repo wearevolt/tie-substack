@@ -5,6 +5,11 @@ Run:  python3 test_server.py
 import importlib.util, os, sys
 
 os.environ["TIE_SUBSTACK_CONFIG"] = "/tmp/tie-substack-test-config.json"
+# The temp config survives across runs — an aborted run must not poison the next.
+try:
+    os.remove(os.environ["TIE_SUBSTACK_CONFIG"])
+except FileNotFoundError:
+    pass
 spec = importlib.util.spec_from_file_location(
     "srv", os.path.join(os.path.dirname(os.path.abspath(__file__)), "server.py")
 )
@@ -448,6 +453,102 @@ check("identity_matches: mismatch",
 (srv.probe_session, srv.chrome_profile_cookie_files, srv.local_state_profiles,
  srv.get_api, srv.reset_api) = _orig
 del sys.modules["pycookiecheat"]
+os.environ.pop("SUBSTACK_PUBLICATION_URL", None)
+_write_cfg({})
+
+print("v0.4.0 — default profile gets no special trust (review fix)")
+fake_pcc = types.ModuleType("pycookiecheat")
+fake_pcc.BrowserType = lambda b: b
+BY_FILE3 = {
+    None: {"substack.sid": "sid-carol"},
+    os.path.join(tmp, "Default", "Cookies"): {"substack.sid": "sid-carol"},
+    os.path.join(tmp, "Profile 1", "Cookies"): {"other": "x"},
+    os.path.join(tmp, "Profile 2", "Cookies"): {"substack.sid": "sid-bob"},
+}
+fake_pcc.chrome_cookies = lambda url, browser=None, cookie_file=None: dict(
+    BY_FILE3.get(cookie_file) or {})
+sys.modules["pycookiecheat"] = fake_pcc
+
+def _fake_probe3(cookies):
+    sid = cookies.get("substack.sid")
+    if sid in ("sid-carol", "sid-carol2"):
+        return True, {"handle": "carol", "primary": None, "subdomains": ["acme"]}
+    if sid == "sid-bob":
+        return True, {"handle": "bob", "primary": None, "subdomains": ["acme"]}
+    return False, {"reason": "session_invalid", "status": 401}
+
+_orig = (srv.probe_session, srv.chrome_profile_cookie_files, srv.local_state_profiles,
+         srv.get_api, srv.reset_api)
+srv.probe_session = _fake_probe3
+srv.chrome_profile_cookie_files = lambda browser, root=None: [
+    (n, os.path.join(tmp, n, "Cookies")) for n in ("Default", "Profile 1", "Profile 2")]
+srv.local_state_profiles = lambda browser, root=None: []
+srv.get_api = lambda fresh=False: _FakeApi()
+srv.reset_api = lambda: None
+os.environ["SUBSTACK_PUBLICATION_URL"] = "https://acme.substack.com"
+
+# Default (carol) AND Profile 2 (bob) both reach acme — the default must NOT win.
+_write_cfg({})
+try:
+    srv.tool_refresh_cookie({})
+    check("default + another login both reach -> refuse", "no error", "RuntimeError")
+except RuntimeError as e:
+    check("default + another login both reach -> refuse",
+          "carol" in str(e) and "bob" in str(e), True)
+with open(_cfg_path) as f:
+    _saved = _json.load(f)
+check("default-vs-other ambiguity stored NOTHING", "cookies" in _saved, False)
+# act_as resolves the same ambiguity without a profile argument.
+_write_cfg({"act_as": "bob"})
+_payload = _json.loads(srv.tool_refresh_cookie({})["content"][0]["text"])
+check("act_as disambiguates default-vs-other", _payload.get("profile"), "Profile 2")
+# Two profiles signed into the SAME account are not an ambiguity — default kept.
+BY_FILE3[os.path.join(tmp, "Profile 2", "Cookies")] = {"substack.sid": "sid-carol2"}
+_write_cfg({})
+_payload = _json.loads(srv.tool_refresh_cookie({})["content"][0]["text"])
+check("same identity twice -> default kept, no refusal",
+      _payload.get("profile"), "(default profile)")
+with open(_cfg_path) as f:
+    _saved = _json.load(f)
+check("pure default hit still persists no cookie_file",
+      "cookie_file" in _saved, False)
+
+(srv.probe_session, srv.chrome_profile_cookie_files, srv.local_state_profiles,
+ srv.get_api, srv.reset_api) = _orig
+del sys.modules["pycookiecheat"]
+
+print("v0.4.0 — act_as gates get_api and substack_status (review fix)")
+os.environ.pop("SUBSTACK_SESSION_TOKEN", None)  # set at the top — wins over config
+fake_sub = types.ModuleType("substack")
+class _FakeSubApi:
+    def __init__(self, **kw):
+        pass
+fake_sub.Api = _FakeSubApi
+sys.modules["substack"] = fake_sub
+_orig_probe = srv.probe_session
+srv.probe_session = _fake_probe3
+_write_cfg({"cookies": {"substack.sid": "sid-carol"}, "act_as": "bob"})
+srv.reset_api()
+try:
+    srv.get_api(fresh=True)
+    check("get_api refuses a wrong-identity session", "no error", "RuntimeError")
+except RuntimeError as e:
+    check("get_api refuses a wrong-identity session",
+          "act_as" in str(e) and "bob" in str(e) and "carol" in str(e), True)
+_status = _json.loads(srv.tool_substack_status({})["content"][0]["text"])
+check("status: wrong identity -> api_ready False", _status.get("api_ready"), False)
+check("status: wrong identity -> act_as fix hint", "act_as" in _status.get("fix", ""),
+      True)
+_write_cfg({"cookies": {"substack.sid": "sid-bob"}, "act_as": "bob"})
+srv.reset_api()
+check("get_api passes the pinned identity",
+      isinstance(srv.get_api(fresh=True), _FakeSubApi), True)
+_status = _json.loads(srv.tool_substack_status({})["content"][0]["text"])
+check("status: matching identity -> api_ready True", _status.get("api_ready"), True)
+check("status: act_as_matches reported", _status.get("act_as_matches"), True)
+srv.probe_session = _orig_probe
+srv.reset_api()
+del sys.modules["substack"]
 os.environ.pop("SUBSTACK_PUBLICATION_URL", None)
 _write_cfg({})
 

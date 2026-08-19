@@ -161,17 +161,18 @@ several Substack logins across Chrome profiles that used to grab the wrong (or n
 session. Two mechanisms fix it, and they compose:
 
 **A. Automatic profile scan (no setup — covers "several profiles in my main browser").**
-When no `cookie_file` is configured and the default profile has no session that reaches
-the configured publication, `refresh_cookie` walks the browser's other profiles
-(`Default`, `Profile 1`, …), validates each session against the publication, and — when
-**exactly one** profile reaches it — picks that one and **persists its path** so later
-refreshes go straight to it. When SEVERAL profiles reach the publication (since v0.4.0)
-the scan stores nothing and errors with the candidate list — the choice between accounts
-is yours, not directory-sort order's; re-run with `profile:` (below). Deterministic code —
-cookie values never surface; the result reports only profile names + handles. Limits: it
-can only see the standard install's profiles (a dedicated `--user-data-dir` browser is
-invisible to the scan), and each secure-storage read may prompt for Keychain access once
-per browser app.
+When no `cookie_file` is configured, `refresh_cookie` walks ALL of the browser's
+standard profiles (`Default`, `Profile 1`, …) and validates each session against the
+publication — the default profile gets **no special trust** (since v0.4.0): being the
+default doesn't make it the right *account*. When exactly one **login** reaches the
+publication it is picked and its path **persisted** so later refreshes go straight to
+it (two profiles signed into the *same* account don't count as ambiguity). When several
+distinct logins reach it, the scan stores nothing and errors with the candidate list —
+the choice between accounts is yours, not directory-sort order's; re-run with
+`profile:` (below). Deterministic code — cookie values never surface; the result
+reports only profile names + handles. Limits: it can only see the standard install's
+profiles (a dedicated `--user-data-dir` browser is invisible to the scan), and each
+secure-storage read may prompt for Keychain access once per browser app.
 
 **Choosing the right account (several of your OWN logins reach the same publication —
 the M:1 case).** Being on the publication's team is not identity: with two logins that
