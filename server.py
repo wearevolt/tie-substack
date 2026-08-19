@@ -379,7 +379,17 @@ def get_api(fresh=False):
     """python-substack Api, cached (its __init__ does network round-trips)."""
     with _api_lock:
         if _api_cache["api"] is not None and not fresh:
-            return _api_cache["api"]
+            # The act_as pin must hold for CACHED clients too — the config can
+            # change under a warm cache (hand-edit, another tool), and a cache
+            # hit must never hand back a client the pin no longer trusts. On
+            # mismatch, drop the cache and fall through to the full preflight,
+            # which re-probes and raises the canonical identity error.
+            if identity_matches(
+                {"handle": _api_cache.get("handle"), "email": _api_cache.get("email")},
+                (load_config().get("act_as") or "").strip(),
+            ):
+                return _api_cache["api"]
+            _api_cache["api"] = None
         cookies = current_cookies()
         if not cookies.get("substack.sid"):
             raise RuntimeError(
@@ -427,12 +437,18 @@ def get_api(fresh=False):
 
         api = Api(cookies_string=cookies_string(cookies), publication_url=url)
         _api_cache["api"] = api
+        # Remember whose session this client wraps, so cache hits can re-check
+        # the act_as pin without a network probe.
+        _api_cache["handle"] = probe.get("handle")
+        _api_cache["email"] = probe.get("email")
         return api
 
 
 def reset_api():
     with _api_lock:
         _api_cache["api"] = None
+        _api_cache["handle"] = None
+        _api_cache["email"] = None
 
 
 # ---------------------------------------------------------------- helpers

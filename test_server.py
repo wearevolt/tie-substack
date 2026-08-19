@@ -546,6 +546,20 @@ check("get_api passes the pinned identity",
 _status = _json.loads(srv.tool_substack_status({})["content"][0]["text"])
 check("status: matching identity -> api_ready True", _status.get("api_ready"), True)
 check("status: act_as_matches reported", _status.get("act_as_matches"), True)
+# The live C3 failure (2026-08-19): the pin changes AFTER the cache is warm —
+# a cache hit must not hand back the now-untrusted client.
+check("cache is warm going into the pin flip",
+      isinstance(srv.get_api(), _FakeSubApi), True)
+_write_cfg({"cookies": {"substack.sid": "sid-bob"}, "act_as": "nobody"})
+try:
+    srv.get_api()  # no fresh — the exact create_draft path
+    check("warm cache does not bypass act_as", "no error", "RuntimeError")
+except RuntimeError as e:
+    check("warm cache does not bypass act_as",
+          "act_as" in str(e) and "nobody" in str(e), True)
+_write_cfg({"cookies": {"substack.sid": "sid-bob"}, "act_as": "bob"})
+check("restoring the pin restores cached access",
+      isinstance(srv.get_api(), _FakeSubApi), True)
 srv.probe_session = _orig_probe
 srv.reset_api()
 del sys.modules["substack"]
