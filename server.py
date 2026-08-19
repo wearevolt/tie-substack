@@ -1335,8 +1335,15 @@ def tool_refresh_cookie(args):
         # that's what cookie_file is for.
         hits = []
         for name, cf in chrome_profile_cookie_files(browser):
-            c = read_browser_cookies(pycookiecheat, browser, cf, errors)
-            got_pub, p = session_reaches(c, target)
+            if name == "Default":
+                # The scan only runs with no cookie_file, so the initial read
+                # above WAS this profile (pycookiecheat's default) — reuse it
+                # rather than decrypting the same DB again (each decrypt is a
+                # separate macOS Keychain prompt).
+                c, got_pub, p = cookies, matched_pub, probe
+            else:
+                c = read_browser_cookies(pycookiecheat, browser, cf, errors)
+                got_pub, p = session_reaches(c, target)
             got = got_pub and identity_matches(p, act_as)
             entry = {"profile": name, "reaches_publication": got_pub,
                      "logged_in_as": (p or {}).get("handle")}
