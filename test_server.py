@@ -5,6 +5,11 @@ Run:  python3 test_server.py
 import importlib.util, os, sys
 
 os.environ["TIE_SUBSTACK_CONFIG"] = "/tmp/tie-substack-test-config.json"
+# The temp config survives across runs — an aborted run must not poison the next.
+try:
+    os.remove(os.environ["TIE_SUBSTACK_CONFIG"])
+except FileNotFoundError:
+    pass
 spec = importlib.util.spec_from_file_location(
     "srv", os.path.join(os.path.dirname(os.path.abspath(__file__)), "server.py")
 )
@@ -262,6 +267,7 @@ with open(_cfg_path) as f:
 check("scan hit persisted as cookie_file", _saved.get("cookie_file"),
       os.path.join(tmp, "Profile 2", "Cookies"))
 check("the matching session was stored", _saved["cookies"]["substack.sid"], "sid-client")
+check("unique scan hit pins the identity", _saved.get("act_as"), "client")
 
 os.environ["SUBSTACK_PUBLICATION_URL"] = "https://nowhere.substack.com"
 _write_cfg({})
@@ -274,6 +280,452 @@ except RuntimeError:
 srv.probe_session, srv.chrome_profile_cookie_files, srv.get_api, srv.reset_api = _orig
 del sys.modules["pycookiecheat"]
 os.environ.pop("SUBSTACK_PUBLICATION_URL", None)
+
+print("v0.4.0 — Local State parsing (list_profiles reads names/emails, never cookies)")
+root2 = tempfile.mkdtemp()
+with open(os.path.join(root2, "Local State"), "w") as f:
+    _json.dump({"profile": {"info_cache": {
+        "Default": {"name": "Person 1", "user_name": "me@x.com", "gaia_name": "Me"},
+        "Profile 1": {"name": "Work", "user_name": "work@client.com"},
+        "Profile 9": {},
+    }}}, f)
+_profs = srv.local_state_profiles("chrome", root=root2)
+check("profiles sorted by dir", [p["dir"] for p in _profs],
+      ["Default", "Profile 1", "Profile 9"])
+check("display name + email surfaced", (_profs[0]["name"], _profs[0]["email"]),
+      ("Person 1", "me@x.com"))
+check("empty meta -> empty strings", (_profs[2]["name"], _profs[2]["email"]), ("", ""))
+check("missing Local State -> []",
+      srv.local_state_profiles("chrome", root=tempfile.mkdtemp()), [])
+_payload = _json.loads(srv.tool_list_profiles({"root": root2})["content"][0]["text"])
+check("list_profiles count", _payload["count"], 3)
+check("list_profiles emails", _payload["profiles"][1]["email"], "work@client.com")
+try:
+    srv.tool_list_profiles({"root": os.path.join(root2, "nope")})
+    check("bogus root -> explicit error", "no error", "RuntimeError")
+except RuntimeError:
+    check("bogus root -> explicit error", "RuntimeError", "RuntimeError")
+
+print("v0.4.0 — profile selector: exact-or-substring, exactly one hit")
+check("dir name, case-insensitive",
+      srv.resolve_profile_selector("profile 1", "chrome", root=root2)["dir"], "Profile 1")
+check("display-name substring",
+      srv.resolve_profile_selector("work", "chrome", root=root2)["dir"], "Profile 1")
+check("email exact",
+      srv.resolve_profile_selector("work@client.com", "chrome", root=root2)["dir"],
+      "Profile 1")
+check("email substring, unique",
+      srv.resolve_profile_selector("me@x", "chrome", root=root2)["dir"], "Default")
+try:
+    srv.resolve_profile_selector("profile", "chrome", root=root2)
+    check("ambiguous selector -> error listing candidates", "no error", "ValueError")
+except ValueError as e:
+    check("ambiguous selector -> error listing candidates",
+          "Profile 1" in str(e) and "Profile 9" in str(e), True)
+try:
+    srv.resolve_profile_selector("zzz", "chrome", root=root2)
+    check("no match -> error", "no error", "ValueError")
+except ValueError:
+    check("no match -> error", "ValueError", "ValueError")
+root3 = tempfile.mkdtemp()
+with open(os.path.join(root3, "Local State"), "w") as f:
+    _json.dump({"profile": {"info_cache": {
+        "Default": {"name": "Person 1"}, "Profile 1": {"name": "Person 10"},
+    }}}, f)
+check("exact match beats substring ('Person 1' vs 'Person 10')",
+      srv.resolve_profile_selector("person 1", "chrome", root=root3)["dir"], "Default")
+
+print("v0.4.0 — multi-match scan stops; act_as pins the identity")
+fake_pcc = types.ModuleType("pycookiecheat")
+fake_pcc.BrowserType = lambda b: b
+BY_FILE2 = {
+    None: {"substack.sid": "sid-personal"},
+    os.path.join(tmp, "Default", "Cookies"): {"substack.sid": "sid-personal"},
+    os.path.join(tmp, "Profile 1", "Cookies"): {"substack.sid": "sid-alice"},
+    os.path.join(tmp, "Profile 2", "Cookies"): {"substack.sid": "sid-bob"},
+}
+fake_pcc.chrome_cookies = lambda url, browser=None, cookie_file=None: dict(
+    BY_FILE2.get(cookie_file) or {})
+sys.modules["pycookiecheat"] = fake_pcc
+
+def _fake_probe2(cookies):
+    sid = cookies.get("substack.sid")
+    if sid == "sid-alice":
+        return True, {"handle": "alice", "primary": None, "subdomains": ["acme"]}
+    if sid == "sid-bob":
+        return True, {"handle": "bob", "primary": None, "subdomains": ["acme"]}
+    return True, {"handle": "me", "primary": "personal", "subdomains": ["personal"]}
+
+_orig = (srv.probe_session, srv.chrome_profile_cookie_files, srv.local_state_profiles,
+         srv.get_api, srv.reset_api)
+srv.probe_session = _fake_probe2
+srv.chrome_profile_cookie_files = lambda browser, root=None: [
+    (n, os.path.join(tmp, n, "Cookies")) for n in ("Default", "Profile 1", "Profile 2")]
+srv.local_state_profiles = lambda browser, root=None: [
+    {"dir": "Default", "name": "Personal", "email": "me@x.com"},
+    {"dir": "Profile 1", "name": "Alice", "email": "alice@x.com"},
+    {"dir": "Profile 2", "name": "Bob", "email": "bob@x.com"},
+    {"dir": "Profile 9", "name": "Ghost", "email": ""},
+]
+srv.get_api = lambda fresh=False: _FakeApi()
+srv.reset_api = lambda: None
+os.environ["SUBSTACK_PUBLICATION_URL"] = "https://acme.substack.com"
+
+_write_cfg({})
+try:
+    srv.tool_refresh_cookie({})
+    check("two qualifying logins -> refuse to guess", "no error", "RuntimeError")
+except RuntimeError as e:
+    check("two qualifying logins -> refuse to guess",
+          "alice" in str(e) and "bob" in str(e) and "profile" in str(e), True)
+    check("refusal candidates carry display names (not just dirs)",
+          "Alice" in str(e) and "Bob" in str(e), True)
+with open(_cfg_path) as f:
+    _saved = _json.load(f)
+check("multi-match stored NOTHING", "cookies" in _saved, False)
+
+_write_cfg({"act_as": "bob"})
+_payload = _json.loads(srv.tool_refresh_cookie({})["content"][0]["text"])
+check("profiles_scanned entries carry the display name",
+      any(e.get("name") for e in _payload.get("profiles_scanned", [])), True)
+check("act_as reduces two hits to one", _payload.get("profile"), "Profile 2")
+check("act_as reported in result", _payload.get("act_as"), "bob")
+with open(_cfg_path) as f:
+    _saved = _json.load(f)
+check("the pinned identity's session was stored",
+      _saved["cookies"]["substack.sid"], "sid-bob")
+
+_write_cfg({"act_as": "nobody"})
+try:
+    srv.tool_refresh_cookie({})
+    check("act_as matching no login -> explicit error", "no error", "RuntimeError")
+except RuntimeError as e:
+    check("act_as matching no login -> explicit error",
+          "act_as" in str(e) and "nobody" in str(e), True)
+
+print("v0.4.0 — explicit profile argument; act_as persistence")
+_write_cfg({})
+_payload = _json.loads(
+    srv.tool_refresh_cookie({"profile": "alice"})["content"][0]["text"])
+check("profile arg picked by display name", _payload.get("profile"), "Profile 1")
+check("explicit choice pins act_as", _payload.get("act_as_persisted"), True)
+with open(_cfg_path) as f:
+    _saved = _json.load(f)
+check("act_as persisted as the handle", _saved.get("act_as"), "alice")
+check("profile's Cookies path persisted", _saved.get("cookie_file"),
+      os.path.join(tmp, "Profile 1", "Cookies"))
+
+_write_cfg({"act_as": "bob"})
+_payload = _json.loads(
+    srv.tool_refresh_cookie({"profile": "Profile 2"})["content"][0]["text"])
+check("existing act_as never overwritten", "act_as_persisted" in _payload, False)
+with open(_cfg_path) as f:
+    _saved = _json.load(f)
+check("act_as still the original pin", _saved.get("act_as"), "bob")
+_write_cfg({"act_as": "bob"})
+try:
+    srv.tool_refresh_cookie({"profile": "alice"})
+    check("explicit profile vs pin mismatch -> error", "no error", "RuntimeError")
+except RuntimeError as e:
+    check("explicit profile vs pin mismatch -> error", "bob" in str(e), True)
+    check("mismatch refusal offers confirm_switch", "confirm_switch" in str(e), True)
+
+print("v0.4.0 — confirm_switch: switching accounts is deliberate, never silent")
+_payload = _json.loads(srv.tool_refresh_cookie(
+    {"profile": "alice", "confirm_switch": True})["content"][0]["text"])
+check("confirm_switch re-pins to the new identity", _payload.get("act_as"), "alice")
+check("the switch is reported", _payload.get("act_as_changed"),
+      {"from": "bob", "to": "alice"})
+with open(_cfg_path) as f:
+    _saved = _json.load(f)
+check("new pin persisted", _saved.get("act_as"), "alice")
+check("switched session stored", _saved["cookies"]["substack.sid"], "sid-alice")
+try:
+    srv.tool_refresh_cookie({"confirm_switch": True})
+    check("confirm_switch without profile rejected", "no error", "ValueError")
+except ValueError:
+    check("confirm_switch without profile rejected", "ValueError", "ValueError")
+
+_write_cfg({})
+try:
+    srv.tool_refresh_cookie({"profile": "x", "cookie_file": "/tmp/y"})
+    check("profile + cookie_file rejected", "no error", "ValueError")
+except ValueError:
+    check("profile + cookie_file rejected", "ValueError", "ValueError")
+try:
+    srv.tool_refresh_cookie({"profile": "x", "browser": "firefox"})
+    check("profile + firefox rejected", "no error", "RuntimeError")
+except RuntimeError:
+    check("profile + firefox rejected", "RuntimeError", "RuntimeError")
+try:
+    srv.tool_refresh_cookie({"profile": "ghost"})
+    check("profile without a Cookies DB -> explicit error", "no error", "RuntimeError")
+except RuntimeError as e:
+    check("profile without a Cookies DB -> explicit error", "Cookies" in str(e), True)
+
+check("identity_matches: handle, case-insensitive",
+      srv.identity_matches({"handle": "Bob"}, "bob"), True)
+check("identity_matches: email fallback",
+      srv.identity_matches({"handle": "x", "email": "Bob@Y.com"}, "bob@y.com"), True)
+check("identity_matches: no pin -> everything qualifies",
+      srv.identity_matches({"handle": "x"}, ""), True)
+check("identity_matches: mismatch",
+      srv.identity_matches({"handle": "x"}, "bob"), False)
+
+(srv.probe_session, srv.chrome_profile_cookie_files, srv.local_state_profiles,
+ srv.get_api, srv.reset_api) = _orig
+del sys.modules["pycookiecheat"]
+os.environ.pop("SUBSTACK_PUBLICATION_URL", None)
+_write_cfg({})
+
+print("v0.4.0 — default profile gets no special trust (review fix)")
+fake_pcc = types.ModuleType("pycookiecheat")
+fake_pcc.BrowserType = lambda b: b
+BY_FILE3 = {
+    None: {"substack.sid": "sid-carol"},
+    os.path.join(tmp, "Default", "Cookies"): {"substack.sid": "sid-carol"},
+    os.path.join(tmp, "Profile 1", "Cookies"): {"other": "x"},
+    os.path.join(tmp, "Profile 2", "Cookies"): {"substack.sid": "sid-bob"},
+}
+fake_pcc.chrome_cookies = lambda url, browser=None, cookie_file=None: dict(
+    BY_FILE3.get(cookie_file) or {})
+sys.modules["pycookiecheat"] = fake_pcc
+
+def _fake_probe3(cookies):
+    sid = cookies.get("substack.sid")
+    if sid in ("sid-carol", "sid-carol2"):
+        return True, {"handle": "carol", "primary": None, "subdomains": ["acme"]}
+    if sid == "sid-bob":
+        return True, {"handle": "bob", "primary": None, "subdomains": ["acme"]}
+    return False, {"reason": "session_invalid", "status": 401}
+
+_orig = (srv.probe_session, srv.chrome_profile_cookie_files, srv.local_state_profiles,
+         srv.get_api, srv.reset_api)
+srv.probe_session = _fake_probe3
+srv.chrome_profile_cookie_files = lambda browser, root=None: [
+    (n, os.path.join(tmp, n, "Cookies")) for n in ("Default", "Profile 1", "Profile 2")]
+srv.local_state_profiles = lambda browser, root=None: []
+srv.get_api = lambda fresh=False: _FakeApi()
+srv.reset_api = lambda: None
+os.environ["SUBSTACK_PUBLICATION_URL"] = "https://acme.substack.com"
+
+# Default (carol) AND Profile 2 (bob) both reach acme — the default must NOT win.
+_write_cfg({})
+try:
+    srv.tool_refresh_cookie({})
+    check("default + another login both reach -> refuse", "no error", "RuntimeError")
+except RuntimeError as e:
+    check("default + another login both reach -> refuse",
+          "carol" in str(e) and "bob" in str(e), True)
+with open(_cfg_path) as f:
+    _saved = _json.load(f)
+check("default-vs-other ambiguity stored NOTHING", "cookies" in _saved, False)
+# act_as resolves the same ambiguity without a profile argument.
+_write_cfg({"act_as": "bob"})
+_payload = _json.loads(srv.tool_refresh_cookie({})["content"][0]["text"])
+check("act_as disambiguates default-vs-other", _payload.get("profile"), "Profile 2")
+# Two profiles signed into the SAME account are not an ambiguity — default kept.
+BY_FILE3[os.path.join(tmp, "Profile 2", "Cookies")] = {"substack.sid": "sid-carol2"}
+_write_cfg({})
+_payload = _json.loads(srv.tool_refresh_cookie({})["content"][0]["text"])
+check("same identity twice -> default kept, no refusal",
+      _payload.get("profile"), "(default profile)")
+with open(_cfg_path) as f:
+    _saved = _json.load(f)
+check("pure default hit still persists no cookie_file",
+      "cookie_file" in _saved, False)
+check("scan-validated default hit pins the identity too",
+      _saved.get("act_as"), "carol")
+
+print("v0.4.0 — legacy unpinned cookie_file is re-validated (upgrade path)")
+BY_FILE3[os.path.join(tmp, "Profile 2", "Cookies")] = {"substack.sid": "sid-bob"}
+_orig_dirs = srv.CHROME_FAMILY_DATA_DIRS
+srv.CHROME_FAMILY_DATA_DIRS = {"chrome": tmp}  # tmp now counts as a standard install
+# Pre-0.4.0 state: scan-persisted path, no identity pin — a wrong login must not
+# survive the upgrade silently; the stored path is ignored and the scan re-runs.
+_write_cfg({"cookie_file": os.path.join(tmp, "Profile 2", "Cookies")})
+try:
+    srv.tool_refresh_cookie({})
+    check("legacy pin re-validated -> refuses on 2 identities", "no error",
+          "RuntimeError")
+except RuntimeError as e:
+    check("legacy pin re-validated -> refuses on 2 identities",
+          "carol" in str(e) and "bob" in str(e), True)
+with open(_cfg_path) as f:
+    _saved = _json.load(f)
+check("legacy re-validation stored nothing", "cookies" in _saved, False)
+# With an act_as pin the stored path is trusted exactly as before — no scan.
+_write_cfg({"cookie_file": os.path.join(tmp, "Profile 2", "Cookies"),
+            "act_as": "bob"})
+_payload = _json.loads(srv.tool_refresh_cookie({})["content"][0]["text"])
+check("pinned cookie_file honored, no legacy override",
+      _payload.get("profile"), os.path.join(tmp, "Profile 2", "Cookies"))
+check("pinned cookie_file: no scan ran", "profiles_scanned" in _payload, False)
+# A dedicated --user-data-dir path (model B) is outside the standard install and
+# keeps the old contract: that exact DB, no scan, no pin required.
+ded = tempfile.mkdtemp()
+os.makedirs(os.path.join(ded, "Default"), exist_ok=True)
+open(os.path.join(ded, "Default", "Cookies"), "w").close()
+BY_FILE3[os.path.join(ded, "Default", "Cookies")] = {"substack.sid": "sid-bob"}
+_write_cfg({"cookie_file": os.path.join(ded, "Default", "Cookies")})
+_payload = _json.loads(srv.tool_refresh_cookie({})["content"][0]["text"])
+check("dedicated-browser cookie_file untouched by the legacy check",
+      _payload.get("profile"), os.path.join(ded, "Default", "Cookies"))
+check("dedicated path: no scan ran", "profiles_scanned" in _payload, False)
+# substack_status flags the legacy state so it is visible before any refresh.
+_write_cfg({"cookie_file": os.path.join(tmp, "Profile 2", "Cookies"),
+            "cookies": {"substack.sid": "sid-bob"}})
+_status = _json.loads(srv.tool_substack_status({})["content"][0]["text"])
+check("status flags the legacy unpinned state", "identity_note" in _status, True)
+check("legacy state is write-blocking in status", _status.get("api_ready"), False)
+check("legacy status fix names refresh_cookie",
+      "refresh_cookie" in _status.get("fix", ""), True)
+# Family inference: a Brave-family legacy pin must be re-validated against
+# BRAVE's profiles, not Chrome's (a no-arg call defaults browser to chrome).
+srv.CHROME_FAMILY_DATA_DIRS = {"chrome": tempfile.mkdtemp(), "brave": tmp}
+srv.chrome_profile_cookie_files = lambda browser, root=None: (
+    [(n, os.path.join(tmp, n, "Cookies"))
+     for n in ("Default", "Profile 1", "Profile 2")]
+    if browser == "brave" else [])
+_write_cfg({"cookie_file": os.path.join(tmp, "Profile 2", "Cookies")})
+try:
+    srv.tool_refresh_cookie({})
+    check("brave legacy pin -> re-validated against the brave family",
+          "no error", "RuntimeError")
+except RuntimeError as e:
+    check("brave legacy pin -> re-validated against the brave family",
+          "carol" in str(e) and "bob" in str(e), True)
+# An EXPLICIT browser naming a different family wins: path honored, no override.
+_write_cfg({"cookie_file": os.path.join(tmp, "Profile 2", "Cookies")})
+_payload = _json.loads(
+    srv.tool_refresh_cookie({"browser": "chrome"})["content"][0]["text"])
+check("explicit other-family browser -> legacy override skipped",
+      _payload.get("profile"), os.path.join(tmp, "Profile 2", "Cookies"))
+check("explicit other-family browser: no scan ran",
+      "profiles_scanned" in _payload, False)
+# Self-heal: a legacy pin with a SINGLE qualifying login re-validates AND pins
+# in one no-arg refresh — the write block below clears itself.
+BY_FILE3[None] = {}
+BY_FILE3[os.path.join(tmp, "Default", "Cookies")] = {}
+_write_cfg({"cookie_file": os.path.join(tmp, "Profile 2", "Cookies")})
+_payload = _json.loads(srv.tool_refresh_cookie({})["content"][0]["text"])
+check("legacy heal: unique identity adopted", _payload.get("profile"), "Profile 2")
+check("legacy heal: identity pinned", _payload.get("act_as_persisted"), True)
+with open(_cfg_path) as f:
+    _saved = _json.load(f)
+check("legacy heal: pin persisted", _saved.get("act_as"), "bob")
+# Heal when the DEFAULT profile is the one that qualifies: the stale legacy
+# path must be dropped and the identity pinned — else the config loops in the
+# write-blocked state forever.
+BY_FILE3[None] = {"substack.sid": "sid-carol"}
+BY_FILE3[os.path.join(tmp, "Default", "Cookies")] = {"substack.sid": "sid-carol"}
+BY_FILE3[os.path.join(tmp, "Profile 2", "Cookies")] = {}
+_write_cfg({"cookie_file": os.path.join(tmp, "Profile 2", "Cookies")})
+_payload = _json.loads(srv.tool_refresh_cookie({})["content"][0]["text"])
+check("legacy heal via default: default kept",
+      _payload.get("profile"), "(default profile)")
+with open(_cfg_path) as f:
+    _saved = _json.load(f)
+check("legacy heal via default: stale path dropped",
+      "cookie_file" in _saved, False)
+check("legacy heal via default: identity pinned", _saved.get("act_as"), "carol")
+srv.CHROME_FAMILY_DATA_DIRS = _orig_dirs
+
+(srv.probe_session, srv.chrome_profile_cookie_files, srv.local_state_profiles,
+ srv.get_api, srv.reset_api) = _orig
+del sys.modules["pycookiecheat"]
+
+print("v0.4.0 — act_as gates get_api and substack_status (review fix)")
+os.environ.pop("SUBSTACK_SESSION_TOKEN", None)  # set at the top — wins over config
+fake_sub = types.ModuleType("substack")
+class _FakeSubApi:
+    def __init__(self, **kw):
+        pass
+fake_sub.Api = _FakeSubApi
+sys.modules["substack"] = fake_sub
+_orig_probe = srv.probe_session
+srv.probe_session = _fake_probe3
+_write_cfg({"cookies": {"substack.sid": "sid-carol"}, "act_as": "bob"})
+srv.reset_api()
+try:
+    srv.get_api(fresh=True)
+    check("get_api refuses a wrong-identity session", "no error", "RuntimeError")
+except RuntimeError as e:
+    check("get_api refuses a wrong-identity session",
+          "act_as" in str(e) and "bob" in str(e) and "carol" in str(e), True)
+_status = _json.loads(srv.tool_substack_status({})["content"][0]["text"])
+check("status: wrong identity -> api_ready False", _status.get("api_ready"), False)
+check("status: wrong identity -> act_as fix hint", "act_as" in _status.get("fix", ""),
+      True)
+_write_cfg({"cookies": {"substack.sid": "sid-bob"}, "act_as": "bob"})
+srv.reset_api()
+check("get_api passes the pinned identity",
+      isinstance(srv.get_api(fresh=True), _FakeSubApi), True)
+_status = _json.loads(srv.tool_substack_status({})["content"][0]["text"])
+check("status: matching identity -> api_ready True", _status.get("api_ready"), True)
+check("status: act_as_matches reported", _status.get("act_as_matches"), True)
+# The live C3 failure (2026-08-19): the pin changes AFTER the cache is warm —
+# a cache hit must not hand back the now-untrusted client.
+check("cache is warm going into the pin flip",
+      isinstance(srv.get_api(), _FakeSubApi), True)
+_write_cfg({"cookies": {"substack.sid": "sid-bob"}, "act_as": "nobody"})
+try:
+    srv.get_api()  # no fresh — the exact create_draft path
+    check("warm cache does not bypass act_as", "no error", "RuntimeError")
+except RuntimeError as e:
+    check("warm cache does not bypass act_as",
+          "act_as" in str(e) and "nobody" in str(e), True)
+_write_cfg({"cookies": {"substack.sid": "sid-bob"}, "act_as": "bob"})
+check("restoring the pin restores cached access",
+      isinstance(srv.get_api(), _FakeSubApi), True)
+# The legacy-unpinned state blocks writes too — cold cache and warm cache both.
+_orig_dirs = srv.CHROME_FAMILY_DATA_DIRS
+srv.CHROME_FAMILY_DATA_DIRS = {"chrome": tmp}
+_write_cfg({"cookies": {"substack.sid": "sid-bob"},
+            "cookie_file": os.path.join(tmp, "Profile 2", "Cookies")})
+srv.reset_api()
+try:
+    srv.get_api(fresh=True)
+    check("legacy unpinned config blocks get_api (cold)", "no error", "RuntimeError")
+except RuntimeError as e:
+    check("legacy unpinned config blocks get_api (cold)",
+          "pre-0.4.0" in str(e) and "refresh_cookie" in str(e), True)
+_write_cfg({"cookies": {"substack.sid": "sid-bob"}, "act_as": "bob"})
+srv.reset_api()
+srv.get_api(fresh=True)  # warm the cache in a healthy state
+_write_cfg({"cookies": {"substack.sid": "sid-bob"},
+            "cookie_file": os.path.join(tmp, "Profile 2", "Cookies")})
+try:
+    srv.get_api()  # cache hit path
+    check("legacy unpinned config blocks get_api (warm cache)",
+          "no error", "RuntimeError")
+except RuntimeError as e:
+    check("legacy unpinned config blocks get_api (warm cache)",
+          "pre-0.4.0" in str(e), True)
+# An explicit env session token overrides config cookies entirely — stale
+# legacy config must not block a CI/env-driven setup.
+os.environ["SUBSTACK_SESSION_TOKEN"] = "sid-bob"
+srv.reset_api()
+check("SUBSTACK_SESSION_TOKEN exempt from the legacy block",
+      isinstance(srv.get_api(fresh=True), _FakeSubApi), True)
+os.environ.pop("SUBSTACK_SESSION_TOKEN", None)
+srv.CHROME_FAMILY_DATA_DIRS = _orig_dirs
+srv.reset_api()
+srv.probe_session = _orig_probe
+srv.reset_api()
+del sys.modules["substack"]
+os.environ.pop("SUBSTACK_PUBLICATION_URL", None)
+_write_cfg({})
+
+print("v0.4.0 — registration & version")
+check("refresh_cookie schema exposes profile",
+      "profile" in [t for t in srv.TOOLS if t["name"] == "refresh_cookie"
+                    ][0]["inputSchema"]["properties"], True)
+check("list_profiles registered", "list_profiles" in srv.TOOL_HANDLERS, True)
+check("list_profiles never offers firefox",
+      "firefox" in [t for t in srv.TOOLS if t["name"] == "list_profiles"
+                    ][0]["inputSchema"]["properties"]["browser"]["enum"], False)
+check("server version", srv.SERVER_VERSION, "0.4.0")
 
 print("\n%d failure(s)" % len(fails))
 for f in fails:

@@ -11,16 +11,22 @@ entering the model context.
 Auth is a browser session cookie (`substack.sid`). It lives ONLY in this
 server's local config file (mode 0600) — tools never echo it back, and the
 refresh_cookie tool (pycookiecheat) pulls it straight from the local Chrome
-profile into the config without displaying it. By default that is the
-browser's DEFAULT profile; when that profile has no session reaching the
-configured publication, refresh_cookie SCANS the browser's other profiles
-(Default, Profile 1, ...) and picks the one that does — a per-client setup
-instead points `cookie_file` at a dedicated browser's Cookies DB, which
-skips the scan entirely (see README "Multiple clients").
+profile into the config without displaying it. When a publication (or an
+`act_as` pin) is configured, refresh_cookie SCANS ALL of the browser's
+standard profiles (Default, Profile 1, ...) — the default profile gets no
+special trust, since "reaches the publication" is not identity — and
+proceeds ONLY when exactly one qualifying login exists; with several it
+stores nothing and asks for an explicit `profile` (see list_profiles).
+The optional `act_as` config pin restricts which logged-in identity
+qualifies anywhere (including get_api's preflight, so every write tool is
+gated). A per-client setup instead points `cookie_file` at a dedicated
+browser's Cookies DB, which skips the scan entirely (see README
+"Multiple clients").
 
 Config file (~/.tie-substack/config.json, override via TIE_SUBSTACK_CONFIG):
   { "publication_url": "https://<pub>.substack.com",
     "cookie_file": "~/TIE-Browsers/<client>/Default/Cookies",   # optional
+    "act_as": "<substack handle>",                              # optional identity pin
     "cookies": { "substack.sid": "...", ... } }
 
 Multi-client: register one server entry PER CLIENT in claude_desktop_config
@@ -48,7 +54,7 @@ import traceback
 from datetime import datetime, timezone
 
 SERVER_NAME = "tie-substack"
-SERVER_VERSION = "0.3.0"
+SERVER_VERSION = "0.4.0"
 
 # Substack's Publish-dialog settings. Every one of these gets a value whether or
 # not the caller picks it, so the tools always send them explicitly — see
@@ -198,6 +204,111 @@ def chrome_profile_cookie_files(browser, root=None):
     return out
 
 
+def standard_install_browser(path):
+    """Which browser family's STANDARD install contains this cookie path — or
+    None for a dedicated --user-data-dir browser. Distinguishes scan/profile-
+    persisted pins from the multi-client model's dedicated paths (only the
+    former can silently hold a wrong login), and names the family so a legacy
+    re-validation scans the browser that actually produced the path."""
+    if not path:
+        return None
+    p = os.path.expanduser(path)
+    for b, root in CHROME_FAMILY_DATA_DIRS.items():
+        if p.startswith(os.path.expanduser(root) + os.sep):
+            return b
+    return None
+
+
+def in_standard_install(path):
+    return standard_install_browser(path) is not None
+
+
+def legacy_unpinned(cfg):
+    """Pre-0.4.0 state: a standard-install cookie_file with no identity pin.
+    Every 0.4.0 success path that persists a standard-install path also pins
+    act_as (explicit profile AND scan-validated matches), so this combination
+    can only be inherited — and the stored session may be the wrong login (the
+    old scan took the first match). Every tool that talks to Substack (reads
+    included — get_api serves both) refuses in this state until a refresh
+    re-validates it; one no-arg refresh_cookie heals it. An explicit
+    SUBSTACK_SESSION_TOKEN is exempt: it overrides config cookies entirely
+    (current_cookies), and that session is probed and identity-gated on its
+    own — stale local config must not block a CI/env-driven setup."""
+    if os.environ.get("SUBSTACK_SESSION_TOKEN"):
+        return False
+    return (not (cfg.get("act_as") or "").strip()
+            and in_standard_install(cfg.get("cookie_file")))
+
+
+def local_state_path(browser, root=None):
+    """Path to the browser's plaintext 'Local State' JSON, or None for an
+    unknown browser. The file maps profile dirs to display names/emails."""
+    base = root or CHROME_FAMILY_DATA_DIRS.get(browser)
+    if not base:
+        return None
+    return os.path.join(os.path.expanduser(base), "Local State")
+
+
+def local_state_profiles(browser, root=None):
+    """[{dir, name, email}] for every profile in the browser's 'Local State'
+    (profile.info_cache). Names/emails only — never touches the Cookies DB or
+    the Keychain. `root=` addresses a dedicated --user-data-dir browser (and
+    is the test seam). Missing file -> [] so callers can degrade gracefully."""
+    path = local_state_path(browser, root)
+    if not path or not os.path.isfile(path):
+        return []
+    try:
+        with open(path) as f:
+            data = json.load(f)
+    except Exception as e:  # noqa: BLE001
+        raise RuntimeError("could not parse %s: %s" % (path, e))
+    info = (data.get("profile") or {}).get("info_cache") or {}
+    out = []
+    for d in sorted(info):
+        meta = info[d] or {}
+        out.append({
+            "dir": d,
+            "name": meta.get("name") or meta.get("gaia_name") or "",
+            "email": meta.get("user_name") or "",
+        })
+    return out
+
+
+def resolve_profile_selector(selector, browser, root=None):
+    """The one profile a human-friendly selector means. Matched case-insensitively
+    against directory name, display name, and email — exact first, substring only
+    when nothing matches exactly (so 'Person 1' is not ambiguous with 'Person 10').
+    Anything but exactly one hit is an error listing what IS available."""
+    profiles = local_state_profiles(browser, root)
+    if not profiles:
+        raise RuntimeError(
+            'no browser profiles found — no "Local State" file under %s '
+            "(is %s installed?)"
+            % (root or CHROME_FAMILY_DATA_DIRS.get(browser), browser)
+        )
+    sel = (selector or "").strip().lower()
+    if not sel:
+        raise ValueError("profile selector is empty")
+
+    def fields(p):
+        return (p["dir"].lower(), p["name"].lower(), p["email"].lower())
+
+    cands = [p for p in profiles if sel in fields(p)]
+    if not cands:
+        cands = [p for p in profiles if any(sel in f for f in fields(p) if f)]
+    if len(cands) == 1:
+        return cands[0]
+    if not cands:
+        raise ValueError(
+            "profile %r does not match any %s profile — available: %s "
+            "(see list_profiles)" % (selector, browser, profiles)
+        )
+    raise ValueError(
+        "profile %r matches %d profiles: %s — use the exact directory name, "
+        "display name, or email (see list_profiles)" % (selector, len(cands), cands)
+    )
+
+
 def read_browser_cookies(pycookiecheat, browser, cookie_file, errors):
     """One profile's substack.com cookies, or None. pycookiecheat's API moved between
     versions — try the new form, then the old."""
@@ -239,6 +350,21 @@ def accessible_publications(probe):
     return sorted(out)
 
 
+def identity_matches(probe, act_as):
+    """Does the probed session belong to the pinned identity? act_as matches the
+    Substack handle (what the server itself persists) or, as a hand-typed
+    convenience, the account email when the profile API reports one. Unset pin
+    -> everything qualifies. Kept separate from session_reaches so callers can
+    tell 'wrong publication' from 'wrong identity' in error messages."""
+    if not act_as:
+        return True
+    a = act_as.strip().lower()
+    return (
+        ((probe or {}).get("handle") or "").strip().lower() == a
+        or ((probe or {}).get("email") or "").strip().lower() == a
+    )
+
+
 def session_reaches(cookies, target):
     """(matches, probe): the session is valid AND can access publication `target`
     (any valid session counts when target is None)."""
@@ -278,6 +404,7 @@ def probe_session(cookies):
             subdomains.append(pub["subdomain"].lower())
     return True, {
         "handle": data.get("handle") or data.get("name"),
+        "email": data.get("email"),
         "user_id": data.get("id"),
         "subdomains": subdomains,
         "primary": (data.get("primaryPublication") or {}).get("subdomain"),
@@ -288,7 +415,18 @@ def get_api(fresh=False):
     """python-substack Api, cached (its __init__ does network round-trips)."""
     with _api_lock:
         if _api_cache["api"] is not None and not fresh:
-            return _api_cache["api"]
+            # The act_as pin must hold for CACHED clients too — the config can
+            # change under a warm cache (hand-edit, another tool), and a cache
+            # hit must never hand back a client the pin no longer trusts. On
+            # mismatch (or a legacy-unpinned config), drop the cache and fall
+            # through to the full preflight, which raises the canonical error.
+            cfg_now = load_config()
+            if not legacy_unpinned(cfg_now) and identity_matches(
+                {"handle": _api_cache.get("handle"), "email": _api_cache.get("email")},
+                (cfg_now.get("act_as") or "").strip(),
+            ):
+                return _api_cache["api"]
+            _api_cache["api"] = None
         cookies = current_cookies()
         if not cookies.get("substack.sid"):
             raise RuntimeError(
@@ -322,16 +460,45 @@ def get_api(fresh=False):
                 % (probe["handle"], sub, accessible_publications(probe) or "(none)",
                    CONFIG_PATH, sub)
             )
+        cfg_now = load_config()
+        act_as = (cfg_now.get("act_as") or "").strip()
+        if legacy_unpinned(cfg_now):
+            # A wrong-but-valid session inherited from ≤0.3.0 must not reach
+            # any Substack-facing tool (reads included — acting as the wrong
+            # identity is misleading either way) before refresh_cookie runs.
+            raise RuntimeError(
+                "this config has a pre-0.4.0 standard-install cookie_file with no "
+                "identity pin — the stored session (currently logged in as %r) may "
+                "be the wrong login. Run refresh_cookie (it re-validates via the "
+                'profile scan) or refresh_cookie with profile: "<login>" before '
+                "reading or writing as this account. Config: %s"
+                % (probe.get("handle"), CONFIG_PATH)
+            )
+        if not identity_matches(probe, act_as):
+            # The pin gates every write tool here, not just refresh_cookie — a
+            # stale, hand-pasted, or env-injected cookie must not act as the
+            # wrong account just because it can reach the publication.
+            raise RuntimeError(
+                "the session is logged in as %r, not the pinned act_as=%r — run "
+                "refresh_cookie (optionally with profile:, see list_profiles), or "
+                "change/remove act_as in %s." % (probe["handle"], act_as, CONFIG_PATH)
+            )
         from substack import Api  # noqa: PLC0415
 
         api = Api(cookies_string=cookies_string(cookies), publication_url=url)
         _api_cache["api"] = api
+        # Remember whose session this client wraps, so cache hits can re-check
+        # the act_as pin without a network probe.
+        _api_cache["handle"] = probe.get("handle")
+        _api_cache["email"] = probe.get("email")
         return api
 
 
 def reset_api():
     with _api_lock:
         _api_cache["api"] = None
+        _api_cache["handle"] = None
+        _api_cache["email"] = None
 
 
 # ---------------------------------------------------------------- helpers
@@ -601,11 +768,14 @@ TOOLS = [
         "description": (
             "Pull the current substack.com session cookies from the LOCAL browser profile "
             "(via pycookiecheat; macOS will prompt for Keychain access) and store them in "
-            "the server's 0600 config file. If the default profile has no session that "
-            "reaches the configured publication (and no cookie_file is set), the browser's "
-            "other profiles are scanned automatically and the matching one is chosen and "
-            "persisted. The cookie value is never returned or shown — the result only "
-            "lists cookie NAMES, profile names/handles, and the validation outcome. "
+            "the server's 0600 config file. When a publication is configured (and no "
+            "cookie_file is set), ALL of the browser's standard profiles are scanned — "
+            "the default profile gets no special trust; when EXACTLY ONE login reaches "
+            "the publication it is chosen, persisted, and pinned as act_as, and with "
+            "several distinct logins nothing is stored and the error lists the "
+            "candidates so you re-run with `profile`. An `act_as` config pin restricts which logged-in identity "
+            "qualifies at all. The cookie value is never returned or shown — the result "
+            "only lists cookie NAMES, profile names/handles, and the validation outcome. "
             "Requires the user to be logged in to Substack in that browser. Run only when "
             "the user asks to refresh/repair Substack auth."
         ),
@@ -627,6 +797,57 @@ TOOLS = [
                         "browser, e.g. ~/TIE-Browsers/<client>/Default/Cookies. Omit to "
                         "use this server config's stored 'cookie_file' (if any), else "
                         "the default profile. Not supported with browser=firefox."
+                    ),
+                },
+                "profile": {
+                    "type": "string",
+                    "description": (
+                        "Pick ONE profile of the standard browser install by directory "
+                        "name ('Profile 2'), display name, or signed-in email — "
+                        "case-insensitive, exact or unique substring (run list_profiles "
+                        "first). Use when several logins reach the same publication. "
+                        "Mutually exclusive with cookie_file; not supported with "
+                        "browser=firefox."
+                    ),
+                },
+                "confirm_switch": {
+                    "type": "boolean",
+                    "description": (
+                        "Required true to SWITCH the pinned identity: when `profile` "
+                        "resolves to a login different from the configured act_as, the "
+                        "call refuses unless this is set, and on success the pin is "
+                        "rewritten to the new login. Only meaningful together with "
+                        "`profile`. Pass it ONLY when the user explicitly asked to act "
+                        "as a different account — never on your own initiative."
+                    ),
+                },
+            },
+        },
+    },
+    {
+        "name": "list_profiles",
+        "description": (
+            "List the local Chrome-family browser's profiles (directory, display name, "
+            "signed-in email) by parsing the browser's plaintext 'Local State' file. "
+            "Reads NO cookie data and triggers NO Keychain prompt — use it to pick the "
+            "`profile` argument for refresh_cookie when several Substack logins reach "
+            "the same publication."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "browser": {
+                    "type": "string",
+                    "enum": ["chrome", "chromium", "brave"],
+                    "default": "chrome",
+                    "description": "Which browser's profiles to list.",
+                },
+                "root": {
+                    "type": "string",
+                    "description": (
+                        "Override the browser user-data directory (e.g. a dedicated "
+                        "per-client browser like ~/TIE-Browsers/<client>). Default: "
+                        "the standard install location for `browser`."
                     ),
                 },
             },
@@ -906,9 +1127,20 @@ def tool_substack_status(_args):
         info["pycookiecheat"] = "installed (refresh_cookie available)"
     except ImportError:
         info["pycookiecheat"] = "not installed — refresh_cookie unavailable"
-    configured_cf = load_config().get("cookie_file")
+    cfg = load_config()
+    configured_cf = cfg.get("cookie_file")
     if configured_cf:
         info["cookie_file"] = configured_cf  # per-client browser this config reads from
+    act_as = (cfg.get("act_as") or "").strip()
+    if act_as:
+        info["act_as"] = act_as  # identity pin — refresh_cookie only accepts this login
+    elif configured_cf and in_standard_install(configured_cf):
+        info["identity_note"] = (
+            "standard-install cookie_file with no identity pin (pre-0.4.0 state) — "
+            "with several logins the wrong account can persist silently; the next "
+            "no-arg refresh_cookie re-validates via the scan, or pin explicitly with "
+            "refresh_cookie profile:"
+        )
 
     cookies = current_cookies()
     info["cookie_configured"] = bool(cookies.get("substack.sid"))
@@ -941,6 +1173,29 @@ def tool_substack_status(_args):
     info["logged_in_as"] = probe["handle"]
     info["primary_publication"] = probe["primary"]
     info["available_publications"] = probe["subdomains"]
+    if act_as:
+        info["act_as_matches"] = identity_matches(probe, act_as)
+        if not info["act_as_matches"]:
+            # Same gate as get_api — a wrong-identity session must not report
+            # api_ready, or the caller would draft/publish as the wrong account.
+            info["api_ready"] = False
+            info["fix"] = (
+                "session is logged in as %r, not the pinned act_as=%r — run "
+                "refresh_cookie (optionally with profile:, see list_profiles), "
+                "or change/remove act_as in %s" % (probe["handle"], act_as, CONFIG_PATH)
+            )
+            return text_result(info)
+    elif legacy_unpinned(cfg):
+        # Mirror get_api's write block: the legacy state must never report
+        # api_ready — logged_in_as above shows WHO the stale session really is.
+        info["api_ready"] = False
+        info["fix"] = (
+            "pre-0.4.0 standard-install cookie_file with no identity pin — the "
+            "stored session (logged_in_as above) may be the wrong login; run "
+            "refresh_cookie (re-validates via the profile scan) or refresh_cookie "
+            "profile: before reading or writing as this account"
+        )
+        return text_result(info)
 
     # 2) Does the configured publication belong to this account?
     try:
@@ -986,19 +1241,71 @@ def tool_refresh_cookie(args):
             "pip install pycookiecheat, or paste the cookie into %s manually" % CONFIG_PATH
         )
 
-    browser = (args.get("browser") or "chrome").lower()
-    cookie_file = resolve_cookie_file(args.get("cookie_file"))
-    if cookie_file and browser == "firefox":
-        raise RuntimeError(
-            "cookie_file targets a Chrome-family Cookies SQLite file and cannot be "
-            "combined with browser=firefox"
+    raw_browser = (args.get("browser") or "").strip().lower()
+    browser = raw_browser or "chrome"
+    act_as = (load_config().get("act_as") or "").strip()
+    profile_arg = (args.get("profile") or "").strip()
+    if profile_arg and args.get("cookie_file"):
+        raise ValueError(
+            "pass either profile or cookie_file, not both — profile selects a standard-"
+            "install browser profile, cookie_file targets an arbitrary Cookies DB"
         )
-    if cookie_file and not os.path.isfile(cookie_file):
-        raise RuntimeError(
-            "cookie_file %s does not exist — for a dedicated per-client browser the "
-            "path is <user-data-dir>/Default/Cookies, and the browser must have been "
-            "launched (and logged in to Substack) at least once" % cookie_file
+    if args.get("confirm_switch") and not profile_arg:
+        raise ValueError(
+            "confirm_switch only applies to an explicit profile choice — pass it "
+            "together with profile"
         )
+    if profile_arg and browser == "firefox":
+        raise RuntimeError(
+            "profile selection reads Chrome-family profiles and cannot be combined "
+            "with browser=firefox"
+        )
+    legacy_revalidated = False
+    if profile_arg:
+        # An explicit profile deliberately bypasses a config-persisted cookie_file —
+        # it is the only way to correct a stored path that points at the wrong login.
+        prof = resolve_profile_selector(profile_arg, browser)
+        cookie_file = dict(chrome_profile_cookie_files(browser)).get(prof["dir"])
+        if not cookie_file:
+            raise RuntimeError(
+                "profile %r (%s) has no Cookies database — launch the browser with "
+                "that profile and log in to substack.com there first"
+                % (prof["name"] or prof["dir"], prof["dir"])
+            )
+        chosen_profile = prof["dir"]
+    else:
+        cookie_file = resolve_cookie_file(args.get("cookie_file"))
+        if cookie_file and browser == "firefox":
+            raise RuntimeError(
+                "cookie_file targets a Chrome-family Cookies SQLite file and cannot be "
+                "combined with browser=firefox"
+            )
+        legacy_family = (
+            standard_install_browser(cookie_file)
+            if cookie_file and not args.get("cookie_file") and not act_as
+            else None
+        )
+        if legacy_family and (not raw_browser or raw_browser == legacy_family):
+            # Legacy-unpinned state: a standard-install path persisted by a
+            # pre-0.4.0 scan (or first-match pick) with no identity pin — the
+            # explicit-profile flow always pins, so this combination can only
+            # be inherited. A wrong login persisted back then would otherwise
+            # survive every guard (pin skips the scan, no act_as to fail), so
+            # ignore the stored path once and re-validate via the scan below —
+            # scanning the family that produced the path (a Brave/Chromium pin
+            # must not be "re-validated" against Chrome's profiles). An
+            # EXPLICIT browser argument naming a different family wins: the
+            # stored path is honored as-is.
+            browser = legacy_family
+            cookie_file = None
+            legacy_revalidated = True
+        if cookie_file and not os.path.isfile(cookie_file):
+            raise RuntimeError(
+                "cookie_file %s does not exist — for a dedicated per-client browser the "
+                "path is <user-data-dir>/Default/Cookies, and the browser must have been "
+                "launched (and logged in to Substack) at least once" % cookie_file
+            )
+        chosen_profile = cookie_file or "(default profile)"
     errors = []
     cookies = read_browser_cookies(pycookiecheat, browser, cookie_file, errors)
     try:
@@ -1006,25 +1313,89 @@ def tool_refresh_cookie(args):
     except RuntimeError:
         target = None
 
-    chosen_profile = cookie_file or "(default profile)"
     profiles_scanned = []
-    matched, _probe = session_reaches(cookies, target)
-    if not matched and target and not cookie_file and browser != "firefox":
+    matched_pub, probe = session_reaches(cookies, target)
+    matched = matched_pub and identity_matches(probe, act_as)
+    act_as_switch = False
+    if (profile_arg and act_as and matched_pub and not matched
+            and args.get("confirm_switch")):
+        # The human explicitly confirmed acting as this other login (same trust
+        # contract as schedule_draft's confirm_send_email) — accept the session
+        # now; the pin is rewritten in the persistence block below.
+        matched = True
+        act_as_switch = True
+    if (target or act_as) and not cookie_file and browser != "firefox":
         # The scan (deterministic code — cookie values never surface, the model only
-        # sees profile names + handles): the default profile has no session that
-        # reaches the configured publication, so check each profile of the standard
-        # browser install and pick the one that does. A dedicated per-client browser
-        # is NOT discoverable this way — that's what cookie_file is for.
+        # sees profile names + handles): check EVERY profile of the standard browser
+        # install, even when the default profile qualifies — "the default reaches
+        # the publication" is not identity, and trusting it silently is exactly the
+        # wrong-account pick this exists to prevent. One qualifying IDENTITY
+        # proceeds; several mean the choice is the operator's, not directory-sort
+        # order's. A dedicated per-client browser is NOT discoverable this way —
+        # that's what cookie_file is for.
+        # Human-readable names for every scanned profile, so profiles_scanned and
+        # the refusal/no-access errors are self-sufficient (the profile argument
+        # accepts dir name, display name, or email — don't force a list_profiles
+        # round-trip to tell 'Profile 2' from 'Juliet — TIE'). Best-effort: a
+        # missing Local State just leaves names blank, never blocks the scan.
+        ls_meta = {}
+        try:
+            ls_meta = {p["dir"]: p for p in local_state_profiles(browser)}
+        except Exception:  # noqa: BLE001
+            pass
+        hits = []
         for name, cf in chrome_profile_cookie_files(browser):
-            c = read_browser_cookies(pycookiecheat, browser, cf, errors)
-            got, p = session_reaches(c, target)
-            profiles_scanned.append(
-                {"profile": name, "reaches_publication": got,
-                 "logged_in_as": (p or {}).get("handle")}
-            )
+            if name == "Default":
+                # The scan only runs with no cookie_file, so the initial read
+                # above WAS this profile (pycookiecheat's default) — reuse it
+                # rather than decrypting the same DB again (each decrypt is a
+                # separate macOS Keychain prompt).
+                c, got_pub, p = cookies, matched_pub, probe
+            else:
+                c = read_browser_cookies(pycookiecheat, browser, cf, errors)
+                got_pub, p = session_reaches(c, target)
+            got = got_pub and identity_matches(p, act_as)
+            meta = ls_meta.get(name) or {}
+            entry = {"profile": name, "reaches_publication": got_pub,
+                     "logged_in_as": (p or {}).get("handle")}
+            if meta.get("name"):
+                entry["name"] = meta["name"]
+            if meta.get("email"):
+                entry["email"] = meta["email"]
+            if act_as:
+                entry["matches_act_as"] = got
+            profiles_scanned.append(entry)
             if got:
-                cookies, cookie_file, chosen_profile, matched = c, cf, name, True
-                break
+                hits.append((name, cf, c, p))
+        # Group by identity: two profiles logged into the SAME account are not an
+        # ambiguity (either acts as that identity); two different handles are —
+        # no matter which of them the default profile happens to be.
+        idents = {}
+        for h in hits:
+            idents.setdefault((h[3] or {}).get("handle") or h[0], []).append(h)
+        default_handle = (probe or {}).get("handle")
+        if matched and default_handle not in idents:
+            idents[default_handle or "(default profile)"] = []
+        if len(idents) > 1:
+            cands = [{"profile": n, "name": (ls_meta.get(n) or {}).get("name", ""),
+                      "email": (ls_meta.get(n) or {}).get("email", ""),
+                      "logged_in_as": (p or {}).get("handle")} for n, cf, c, p in hits]
+            if matched and default_handle not in {c["logged_in_as"] for c in cands}:
+                cands.insert(0, {"profile": "(default profile)", "name": "",
+                                 "logged_in_as": default_handle})
+            raise RuntimeError(
+                "%d Substack logins reach %r — refusing to guess between accounts, "
+                "nothing was stored. Candidates: %s. Re-run refresh_cookie with "
+                'profile: "<name>" (or set act_as in %s to pin an identity).'
+                % (len(idents), target, cands, CONFIG_PATH)
+            )
+        if hits and not matched:
+            # A single qualifying identity, found by the scan: prefer its Default-
+            # dir session when it has several, for continuity with older behavior.
+            only = next(iter(idents.values()))
+            pick = next((h for h in only if h[0] == "Default"), only[0])
+            chosen_profile, cookie_file, cookies, probe = pick
+            matched = True
     if not cookies:
         raise RuntimeError(
             "could not read cookies from %s (is the browser installed, are you logged in "
@@ -1038,21 +1409,70 @@ def tool_refresh_cookie(args):
             % (chosen_profile, sorted(cookies.keys()),
                "; profiles scanned: %s" % profiles_scanned if profiles_scanned else "")
         )
-    if target and not matched:
+    if not matched and act_as and (
+        matched_pub or any(e.get("reaches_publication") for e in profiles_scanned)
+    ):
+        if profile_arg:
+            raise RuntimeError(
+                "profile %r is logged in as %r, but the config pins act_as=%r — "
+                "re-run with confirm_switch: true to SWITCH the pinned identity "
+                "(only on the user's explicit ask), pick a profile matching the "
+                "pin (list_profiles), or edit act_as in %s."
+                % (chosen_profile, (probe or {}).get("handle"), act_as, CONFIG_PATH)
+            )
+        raise RuntimeError(
+            "found Substack session(s) reaching %r, but none logged in as the pinned "
+            "act_as=%r (found: %s). Log in as that identity, pick a profile explicitly "
+            "(list_profiles), or change/remove act_as in %s. Note: act_as matches the "
+            "Substack handle — if you configured an email that never matches, use the "
+            "handle."
+            % (target, act_as,
+               profiles_scanned
+               or [{"profile": chosen_profile,
+                    "logged_in_as": (probe or {}).get("handle")}],
+               CONFIG_PATH)
+        )
+    if (target or act_as) and not matched:
         raise RuntimeError(
             "found Substack session(s), but none that can access %r. Checked: %s. "
-            "Log in to that publication's account in one of this browser's profiles, or "
-            "pass cookie_file pointing at the right (e.g. dedicated per-client) browser."
+            "Log in to that publication's account in one of this browser's profiles, "
+            "pass profile to pick a specific login, or pass cookie_file pointing at "
+            "the right (e.g. dedicated per-client) browser."
             % (target, profiles_scanned or [chosen_profile])
         )
 
     cfg = load_config()
     cfg["cookies"] = cookies
     cfg.setdefault("publication_url", os.environ.get("SUBSTACK_PUBLICATION_URL", ""))
-    if args.get("cookie_file") or (profiles_scanned and matched and cookie_file):
-        # Persist the path that worked — explicitly passed, or found by the scan — so
-        # the next no-arg refresh on this config reads the same profile directly.
+    if args.get("cookie_file") or profile_arg or (profiles_scanned and matched and cookie_file):
+        # Persist the path that worked — explicitly passed, chosen by profile, or
+        # found by the scan — so the next no-arg refresh reads the same profile.
         cfg["cookie_file"] = cookie_file
+    elif legacy_revalidated and matched and not cookie_file:
+        # The re-validation was won by the DEFAULT profile, not the stale
+        # pre-0.4.0 path — drop that path, or the config would loop in the
+        # legacy write-blocked state forever.
+        cfg.pop("cookie_file", None)
+    act_as_persisted = False
+    act_as_prev = None
+    if profile_arg and (probe or {}).get("handle"):
+        if not cfg.get("act_as"):
+            # Pin the identity the user just chose explicitly, so later no-arg
+            # refreshes stay deterministic even if more logins appear.
+            cfg["act_as"] = probe["handle"]
+            act_as_persisted = True
+        elif act_as_switch:
+            # Confirmed switch: rewrite the pin to the newly chosen login.
+            act_as_prev = cfg["act_as"]
+            cfg["act_as"] = probe["handle"]
+    elif (profiles_scanned and matched
+          and not cfg.get("act_as") and (probe or {}).get("handle")):
+        # The scan validated exactly one identity — pin it, whether it was
+        # adopted from a profile hit or the default profile won. There was no
+        # choice to make, and the pin keeps "standard-install cookie_file with
+        # no act_as" an exclusively pre-0.4.0 state that write tools refuse.
+        cfg["act_as"] = probe["handle"]
+        act_as_persisted = True
     save_config(cfg)
     reset_api()
 
@@ -1067,6 +1487,12 @@ def tool_refresh_cookie(args):
         "cookie_file": cookie_file or "(default profile)",
         "profile": chosen_profile,
     }
+    if cfg.get("act_as"):
+        result["act_as"] = cfg["act_as"]
+    if act_as_persisted:
+        result["act_as_persisted"] = True
+    if act_as_prev:
+        result["act_as_changed"] = {"from": act_as_prev, "to": cfg.get("act_as")}
     if profiles_scanned:
         result["profiles_scanned"] = profiles_scanned
     try:
@@ -1079,6 +1505,31 @@ def tool_refresh_cookie(args):
         result["cookie_valid"] = False
         result["validation_error"] = str(e)[:300]
     return text_result(result)
+
+
+def tool_list_profiles(args):
+    """Names/emails from the browser's plaintext profile cache — reads no cookie
+    data and triggers no Keychain prompt."""
+    browser = (args.get("browser") or "chrome").lower()
+    root = args.get("root")
+    if root:
+        root = os.path.expanduser(root)
+    path = local_state_path(browser, root)
+    if not path or not os.path.isfile(path):
+        raise RuntimeError(
+            'no "Local State" file at %s — is %s installed? For a dedicated '
+            "--user-data-dir browser pass root=<user-data-dir>."
+            % (path or "(unknown browser %r)" % browser, browser)
+        )
+    profiles = local_state_profiles(browser, root)
+    return text_result({
+        "browser": browser,
+        "root": os.path.dirname(path),
+        "profiles": profiles,
+        "count": len(profiles),
+        "note": ("names/emails from the browser's plaintext profile cache — "
+                 "no cookies were read"),
+    })
 
 
 def tool_get_publication_settings(_args):
@@ -1354,6 +1805,7 @@ def tool_delete_draft(args):
 TOOL_HANDLERS = {
     "substack_status": tool_substack_status,
     "refresh_cookie": tool_refresh_cookie,
+    "list_profiles": tool_list_profiles,
     "get_publication_settings": tool_get_publication_settings,
     "create_draft": tool_create_draft,
     "update_post_settings": tool_update_post_settings,
