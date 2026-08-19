@@ -378,12 +378,16 @@ try:
 except RuntimeError as e:
     check("two qualifying logins -> refuse to guess",
           "alice" in str(e) and "bob" in str(e) and "profile" in str(e), True)
+    check("refusal candidates carry display names (not just dirs)",
+          "Alice" in str(e) and "Bob" in str(e), True)
 with open(_cfg_path) as f:
     _saved = _json.load(f)
 check("multi-match stored NOTHING", "cookies" in _saved, False)
 
 _write_cfg({"act_as": "bob"})
 _payload = _json.loads(srv.tool_refresh_cookie({})["content"][0]["text"])
+check("profiles_scanned entries carry the display name",
+      any(e.get("name") for e in _payload.get("profiles_scanned", [])), True)
 check("act_as reduces two hits to one", _payload.get("profile"), "Profile 2")
 check("act_as reported in result", _payload.get("act_as"), "bob")
 with open(_cfg_path) as f:

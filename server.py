@@ -1333,6 +1333,16 @@ def tool_refresh_cookie(args):
         # proceeds; several mean the choice is the operator's, not directory-sort
         # order's. A dedicated per-client browser is NOT discoverable this way —
         # that's what cookie_file is for.
+        # Human-readable names for every scanned profile, so profiles_scanned and
+        # the refusal/no-access errors are self-sufficient (the profile argument
+        # accepts dir name, display name, or email — don't force a list_profiles
+        # round-trip to tell 'Profile 2' from 'Juliet — TIE'). Best-effort: a
+        # missing Local State just leaves names blank, never blocks the scan.
+        ls_meta = {}
+        try:
+            ls_meta = {p["dir"]: p for p in local_state_profiles(browser)}
+        except Exception:  # noqa: BLE001
+            pass
         hits = []
         for name, cf in chrome_profile_cookie_files(browser):
             if name == "Default":
@@ -1345,8 +1355,13 @@ def tool_refresh_cookie(args):
                 c = read_browser_cookies(pycookiecheat, browser, cf, errors)
                 got_pub, p = session_reaches(c, target)
             got = got_pub and identity_matches(p, act_as)
+            meta = ls_meta.get(name) or {}
             entry = {"profile": name, "reaches_publication": got_pub,
                      "logged_in_as": (p or {}).get("handle")}
+            if meta.get("name"):
+                entry["name"] = meta["name"]
+            if meta.get("email"):
+                entry["email"] = meta["email"]
             if act_as:
                 entry["matches_act_as"] = got
             profiles_scanned.append(entry)
@@ -1362,12 +1377,8 @@ def tool_refresh_cookie(args):
         if matched and default_handle not in idents:
             idents[default_handle or "(default profile)"] = []
         if len(idents) > 1:
-            names = {}
-            try:
-                names = {q["dir"]: q["name"] for q in local_state_profiles(browser)}
-            except Exception:  # noqa: BLE001  — decoration only, never block the error
-                pass
-            cands = [{"profile": n, "name": names.get(n, ""),
+            cands = [{"profile": n, "name": (ls_meta.get(n) or {}).get("name", ""),
+                      "email": (ls_meta.get(n) or {}).get("email", ""),
                       "logged_in_as": (p or {}).get("handle")} for n, cf, c, p in hits]
             if matched and default_handle not in {c["logged_in_as"] for c in cands}:
                 cands.insert(0, {"profile": "(default profile)", "name": "",
