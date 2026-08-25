@@ -728,7 +728,7 @@ check("list_profiles registered", "list_profiles" in srv.TOOL_HANDLERS, True)
 check("list_profiles never offers firefox",
       "firefox" in [t for t in srv.TOOLS if t["name"] == "list_profiles"
                     ][0]["inputSchema"]["properties"]["browser"]["enum"], False)
-check("server version", srv.SERVER_VERSION, "0.4.1")
+check("server version", srv.SERVER_VERSION, "0.4.2")
 
 print("\n%d failure(s)" % len(fails))
 for f in fails:
