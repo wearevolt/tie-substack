@@ -27,6 +27,9 @@ else
 fi
 INSTALL_DIR="$HOME/.tie-substack"
 VENV="$INSTALL_DIR/venv"
+UV="$INSTALL_DIR/bin/uv"
+UV_PYTHON_DIR="$INSTALL_DIR/python"
+UV_CACHE_DIR="$INSTALL_DIR/cache/uv"
 CONFIG="$HOME/Library/Application Support/Claude/claude_desktop_config.json"
 RAW_URL="https://raw.githubusercontent.com/wearevolt/tie-substack/main/server.py"
 
@@ -46,42 +49,94 @@ ask() { # ask <prompt> <default>
 
 bold "tie-substack installer"
 echo
+mkdir -p "$INSTALL_DIR"
 
-# --- 1. python3 (>= 3.10 REQUIRED) ---------------------------------------
+# --- 1. python3 (>= 3.10 REQUIRED) -----------------------------------------
 # On Python < 3.10 pip silently resolves the 2023-era python-substack, whose
 # Api has no create_draft_from_markdown — every draft tool then fails with an
-# AttributeError (operator-hit 2026-08-25). Pick the newest capable interpreter.
+# AttributeError (operator-hit 2026-08-25). If no suitable system interpreter
+# exists, install a private uv + Python 3.13 under ~/.tie-substack.
+python_supported() {
+  "$1" -c 'import sys; raise SystemExit(0 if sys.version_info >= (3,10) else 1)' 2>/dev/null
+}
+uv_run() {
+  UV_PYTHON_INSTALL_DIR="$UV_PYTHON_DIR" UV_CACHE_DIR="$UV_CACHE_DIR" "$UV" "$@"
+}
+
 PY=""
-for c in python3.13 python3.12 python3.11 python3.10 python3; do
-  if command -v "$c" >/dev/null 2>&1 && "$c" -c 'import sys; raise SystemExit(0 if sys.version_info >= (3,10) else 1)' 2>/dev/null; then
-    PY="$c"; break
+PY_SOURCE=""
+if [ -n "${TIE_SUBSTACK_PYTHON:-}" ]; then
+  if command -v "$TIE_SUBSTACK_PYTHON" >/dev/null 2>&1 && python_supported "$TIE_SUBSTACK_PYTHON"; then
+    PY="$TIE_SUBSTACK_PYTHON"
+    PY_SOURCE=" from TIE_SUBSTACK_PYTHON"
+  else
+    fail "TIE_SUBSTACK_PYTHON must point to Python 3.10 or newer."
+    pause; exit 1
   fi
-done
-if [ -n "$PY" ]; then
-  ok "python found: $($PY --version 2>&1) ($PY)"
+elif [ -x "$VENV/bin/python3" ] && python_supported "$VENV/bin/python3"; then
+  PY="$VENV/bin/python3"
+  PY_SOURCE=" in existing venv"
 else
-  fail "no Python 3.10+ found — this server requires it (python-substack >= 0.3)."
-  echo "      Install a current Python (e.g. from python.org or 'brew install python'),"
-  echo "      then re-run this installer."
-  pause; exit 1
+  for c in python3.14 python3.13 python3.12 python3.11 python3.10 python3; do
+    if command -v "$c" >/dev/null 2>&1 && python_supported "$c"; then
+      PY="$c"; break
+    fi
+  done
+fi
+if [ -n "$PY" ]; then
+  ok "python found$PY_SOURCE: $("$PY" --version 2>&1) ($PY)"
+else
+  warn "no validated system Python found; installing private uv-managed Python 3.13"
+  if [ ! -x "$UV" ]; then
+    if ! command -v curl >/dev/null 2>&1; then
+      fail "curl not found, so uv cannot be bootstrapped automatically."
+      echo "      Install Python 3.13 from python.org, then re-run this installer."
+      pause; exit 1
+    fi
+    mkdir -p "$INSTALL_DIR/bin"
+    curl -LsSf https://astral.sh/uv/install.sh | env UV_UNMANAGED_INSTALL="$INSTALL_DIR/bin" sh \
+      && ok "uv installed: $UV" \
+      || { fail "uv install failed — check network and rerun"; exit 1; }
+  else
+    ok "uv exists: $UV"
+  fi
+  uv_run python install 3.13 \
+    && ok "uv-managed Python 3.13 installed" \
+    || { fail "uv could not install Python 3.13 — check network and rerun"; exit 1; }
+  PY="$(uv_run python find 3.13 2>/dev/null || true)"
+  if [ -z "$PY" ] || ! python_supported "$PY"; then
+    fail "uv installed Python, but no supported Python 3.13 executable was found."
+    pause; exit 1
+  fi
+  ok "python found: $("$PY" --version 2>&1) ($PY)"
 fi
 
 # --- 2. venv + dependencies ---------------------------------------------
-mkdir -p "$INSTALL_DIR"
-# An existing venv built on an old Python carries the old library — rebuild it.
-if [ -x "$VENV/bin/python3" ] && ! "$VENV/bin/python3" -c 'import sys; raise SystemExit(0 if sys.version_info >= (3,10) else 1)' 2>/dev/null; then
-  ok "existing venv uses Python < 3.10 — rebuilding it with $PY"
+# An existing venv built on unsupported Python carries the old or unvalidated
+# library stack — rebuild it.
+if [ -x "$VENV/bin/python3" ] && ! python_supported "$VENV/bin/python3"; then
+  ok "existing venv uses unsupported Python — rebuilding it with $PY"
   rm -rf "$VENV"
 fi
 if [ ! -x "$VENV/bin/python3" ]; then
-  "$PY" -m venv "$VENV" || { fail "could not create venv at $VENV"; exit 1; }
+  if [ -x "$UV" ]; then
+    uv_run venv --python "$PY" "$VENV" || { fail "could not create venv at $VENV"; exit 1; }
+  else
+    "$PY" -m venv "$VENV" || { fail "could not create venv at $VENV"; exit 1; }
+  fi
   ok "venv created: $VENV"
 else
   ok "venv exists: $VENV"
 fi
-"$VENV/bin/pip" install -q --upgrade pip 'python-substack>=0.3.0,<0.5' pycookiecheat \
-  && ok "dependencies installed (python-substack>=0.3, pycookiecheat)" \
-  || { fail "pip install failed — check network and rerun"; exit 1; }
+if [ -x "$UV" ]; then
+  uv_run pip install --python "$VENV/bin/python3" 'python-substack>=0.3.0,<0.5' pycookiecheat \
+    && ok "dependencies installed with uv (python-substack>=0.3, pycookiecheat)" \
+    || { fail "dependency install failed — check network and rerun"; exit 1; }
+else
+  "$VENV/bin/pip" install -q --upgrade pip 'python-substack>=0.3.0,<0.5' pycookiecheat \
+    && ok "dependencies installed (python-substack>=0.3, pycookiecheat)" \
+    || { fail "pip install failed — check network and rerun"; exit 1; }
+fi
 
 # --- 3. server.py --------------------------------------------------------
 if [ -f "$SCRIPT_DIR/server.py" ]; then
@@ -202,7 +257,7 @@ if [ -f "$CONFIG" ]; then
 fi
 VENV="$VENV" INSTALL_DIR="$INSTALL_DIR" CONFIG="$CONFIG" \
 CLIENT="$CLIENT" CLIENT_CONFIG="$CLIENT_CONFIG" SERVER_NAME="$SERVER_NAME" \
-PUB_NORM="$PUB_NORM" python3 <<'EOF'
+PUB_NORM="$PUB_NORM" "$VENV/bin/python3" <<'EOF'
 import json, os
 cfg_path = os.environ["CONFIG"]
 try:

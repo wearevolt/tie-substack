@@ -54,7 +54,7 @@ import traceback
 from datetime import datetime, timezone
 
 SERVER_NAME = "tie-substack"
-SERVER_VERSION = "0.4.1"
+SERVER_VERSION = "0.4.2"
 
 # Substack's Publish-dialog settings. Every one of these gets a value whether or
 # not the caller picks it, so the tools always send them explicitly — see
