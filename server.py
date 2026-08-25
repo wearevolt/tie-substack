@@ -54,7 +54,7 @@ import traceback
 from datetime import datetime, timezone
 
 SERVER_NAME = "tie-substack"
-SERVER_VERSION = "0.4.0"
+SERVER_VERSION = "0.4.1"
 
 # Substack's Publish-dialog settings. Every one of these gets a value whether or
 # not the caller picks it, so the tools always send them explicitly — see
@@ -1792,7 +1792,10 @@ def tool_list_drafts(args):
         api.get_drafts(filter="draft", limit=limit), "posts", "drafts", "results"
     )
     drafts.sort(
-        key=lambda d: d.get("draft_updated_at") or d.get("draft_created_at") or "",
+        key=lambda d: (
+            (d.get("draft_updated_at") or d.get("draft_created_at") or "")
+            if isinstance(d, dict) else ""
+        ),
         reverse=True,
     )
     return text_result([draft_summary(d) for d in drafts])
