@@ -47,25 +47,40 @@ ask() { # ask <prompt> <default>
 bold "tie-substack installer"
 echo
 
-# --- 1. python3 ---------------------------------------------------------
-if command -v python3 >/dev/null 2>&1; then
-  ok "python3 found: $(python3 --version 2>&1)"
+# --- 1. python3 (>= 3.10 REQUIRED) ---------------------------------------
+# On Python < 3.10 pip silently resolves the 2023-era python-substack, whose
+# Api has no create_draft_from_markdown — every draft tool then fails with an
+# AttributeError (operator-hit 2026-08-25). Pick the newest capable interpreter.
+PY=""
+for c in python3.13 python3.12 python3.11 python3.10 python3; do
+  if command -v "$c" >/dev/null 2>&1 && "$c" -c 'import sys; raise SystemExit(0 if sys.version_info >= (3,10) else 1)' 2>/dev/null; then
+    PY="$c"; break
+  fi
+done
+if [ -n "$PY" ]; then
+  ok "python found: $($PY --version 2>&1) ($PY)"
 else
-  fail "python3 not found. Install Xcode Command Line Tools first:"
-  echo "      xcode-select --install"
+  fail "no Python 3.10+ found — this server requires it (python-substack >= 0.3)."
+  echo "      Install a current Python (e.g. from python.org or 'brew install python'),"
+  echo "      then re-run this installer."
   pause; exit 1
 fi
 
 # --- 2. venv + dependencies ---------------------------------------------
 mkdir -p "$INSTALL_DIR"
+# An existing venv built on an old Python carries the old library — rebuild it.
+if [ -x "$VENV/bin/python3" ] && ! "$VENV/bin/python3" -c 'import sys; raise SystemExit(0 if sys.version_info >= (3,10) else 1)' 2>/dev/null; then
+  ok "existing venv uses Python < 3.10 — rebuilding it with $PY"
+  rm -rf "$VENV"
+fi
 if [ ! -x "$VENV/bin/python3" ]; then
-  python3 -m venv "$VENV" || { fail "could not create venv at $VENV"; exit 1; }
+  "$PY" -m venv "$VENV" || { fail "could not create venv at $VENV"; exit 1; }
   ok "venv created: $VENV"
 else
   ok "venv exists: $VENV"
 fi
-"$VENV/bin/pip" install -q --upgrade pip python-substack pycookiecheat \
-  && ok "dependencies installed (python-substack, pycookiecheat)" \
+"$VENV/bin/pip" install -q --upgrade pip 'python-substack>=0.3.0,<0.5' pycookiecheat \
+  && ok "dependencies installed (python-substack>=0.3, pycookiecheat)" \
   || { fail "pip install failed — check network and rerun"; exit 1; }
 
 # --- 3. server.py --------------------------------------------------------

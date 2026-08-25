@@ -641,6 +641,9 @@ fake_sub = types.ModuleType("substack")
 class _FakeSubApi:
     def __init__(self, **kw):
         pass
+
+    def create_draft_from_markdown(self, **kw):  # get_api's modern-library probe
+        raise NotImplementedError
 fake_sub.Api = _FakeSubApi
 sys.modules["substack"] = fake_sub
 _orig_probe = srv.probe_session
@@ -725,7 +728,7 @@ check("list_profiles registered", "list_profiles" in srv.TOOL_HANDLERS, True)
 check("list_profiles never offers firefox",
       "firefox" in [t for t in srv.TOOLS if t["name"] == "list_profiles"
                     ][0]["inputSchema"]["properties"]["browser"]["enum"], False)
-check("server version", srv.SERVER_VERSION, "0.4.0")
+check("server version", srv.SERVER_VERSION, "0.4.1")
 
 print("\n%d failure(s)" % len(fails))
 for f in fails:
