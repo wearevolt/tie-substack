@@ -485,6 +485,15 @@ def get_api(fresh=False):
             )
         from substack import Api  # noqa: PLC0415
 
+        if not hasattr(Api, "create_draft_from_markdown"):
+            raise RuntimeError(
+                "the installed python-substack library is too old for this server "
+                "(no Api.create_draft_from_markdown — typically a venv built on "
+                "Python < 3.10, where pip silently resolves the 2023-era library). "
+                "Fix: re-run the installer, which now requires Python 3.10+ and a "
+                "pinned library: bash -c \"$(curl -fsSL https://raw.github"
+                "usercontent.com/wearevolt/tie-substack/main/install.command)\""
+            )
         api = Api(cookies_string=cookies_string(cookies), publication_url=url)
         _api_cache["api"] = api
         # Remember whose session this client wraps, so cache hits can re-check
@@ -1049,15 +1058,18 @@ TOOLS = [
     {
         "name": "list_drafts",
         "description": (
-            "List recent drafts (id, title, slug, post_url, audience, comments, "
-            "send_email). Substack's list payload is a NARROWER projection than "
-            "get_draft: subtitle, SEO fields, section, tags and the schedule are not in "
-            "it, and the response says so per field instead of reporting null — call "
-            "get_draft for those."
+            "List recent DRAFTS ONLY (id, title, slug, post_url, audience, comments, "
+            "send_email), newest first; published posts are excluded. limit is capped "
+            "at 25 — Substack rejects more with a bare 400. Substack's list payload is "
+            "a NARROWER projection than get_draft: subtitle, SEO fields, section, tags "
+            "and the schedule are not in it, and the response says so per field "
+            "instead of reporting null — call get_draft for those."
         ),
         "inputSchema": {
             "type": "object",
-            "properties": {"limit": {"type": "integer", "default": 10}},
+            "properties": {
+                "limit": {"type": "integer", "default": 10, "minimum": 1, "maximum": 25}
+            },
         },
     },
     {
@@ -1771,8 +1783,18 @@ def tool_get_draft(args):
 
 def tool_list_drafts(args):
     api = get_api()
-    limit = max(1, min(50, int(args.get("limit") or 10)))
-    drafts = unwrap_items(api.get_drafts(limit=limit), "posts", "drafts", "results")
+    # Substack rejects limit > 25 with a bare APIError(400): Invalid value.
+    limit = max(1, min(25, int(args.get("limit") or 10)))
+    # Without filter="draft" the endpoint ALSO returns published posts, so on an
+    # old publication the page fills with years-old articles and real drafts
+    # never surface (operator-reported 2026-08-25; verified live).
+    drafts = unwrap_items(
+        api.get_drafts(filter="draft", limit=limit), "posts", "drafts", "results"
+    )
+    drafts.sort(
+        key=lambda d: d.get("draft_updated_at") or d.get("draft_created_at") or "",
+        reverse=True,
+    )
     return text_result([draft_summary(d) for d in drafts])
 
 
