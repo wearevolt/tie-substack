@@ -1,52 +1,55 @@
 #!/usr/bin/env python3
-"""tie-substack — local MCP server (stdio) for scheduling Substack posts.
+"""tie-substack: local MCP server (stdio) for scheduling Substack posts, one server for
+several client publications.
 
 Substack has no official write API, so this server wraps the community
-`python-substack` library (Substack's internal endpoints) to create drafts,
-pin the post slug (=> the public URL is known BEFORE publication), and
-schedule publication. It exists so the tie-social skill can run its Substack
-leg from Claude surfaces (Cowork/Desktop) without any credential ever
-entering the model context.
+`python-substack` library (Substack's internal endpoints) to create drafts, pin the
+post slug (=> the public URL is known BEFORE publication), and schedule publication.
+It exists so the tie-social skill can run its Substack leg from Claude surfaces
+(Cowork/Desktop) without any credential ever entering the model context.
 
-Auth is a browser session cookie (`substack.sid`). It lives ONLY in this
-server's local config file (mode 0600) — tools never echo it back, and the
-refresh_cookie tool (pycookiecheat) pulls it straight from the local Chrome
-profile into the config without displaying it. When a publication (or an
-`act_as` pin) is configured, refresh_cookie SCANS ALL of the browser's
-standard profiles (Default, Profile 1, ...) — the default profile gets no
-special trust, since "reaches the publication" is not identity — and
-proceeds ONLY when exactly one qualifying login exists; with several it
-stores nothing and asks for an explicit `profile` (see list_profiles).
-The optional `act_as` config pin restricts which logged-in identity
-qualifies anywhere (including get_api's preflight, so every write tool is
-gated). A per-client setup instead points `cookie_file` at a dedicated
-browser's Cookies DB, which skips the scan entirely (see README
-"Multiple clients").
+0.5.0: ONE server entry serves every client.
+  - A client registry (~/.tie-substack/clients.json, 0600) keys on the brand slug used
+    by the tie-social plugin (brands/<slug>/brand.json -> substack.client) and holds the
+    publication URL, the bound cookie source (a standard browser profile or a dedicated
+    user-data dir) and the pinned identity (`act_as`).
+  - One session per client (~/.tie-substack/sessions/<slug>.json, 0600). Values never
+    leave this process: tools report cookie NAMES, handles and outcomes only.
+  - Every Substack-facing tool takes `client`; there is no "current client". Every
+    publication-scoped tool also takes `expected_publication`: before the handler runs
+    the dispatcher compares the canonical host of that value, the registry's publication
+    for the client and the publication the live session actually reaches, and refuses on
+    any mismatch, naming all three. Every response echoes client, publication and identity.
+  - Three tool scopes, each handed only its own facade (structural, not a convention):
+      registry    local only, no network: list_clients, add_client, list_browser_profiles,
+                  open_client_browser
+      probe       identity and access probes: clients_status, bind_client, refresh_session
+      publication the full python-substack client, only after the check above
+  - Sessions switch per call; an expired session is re-read once from the client's bound
+    cookie source, then the call fails with the fix named.
 
-Config file (~/.tie-substack/config.json, override via TIE_SUBSTACK_CONFIG):
-  { "publication_url": "https://<pub>.substack.com",
-    "cookie_file": "~/TIE-Browsers/<client>/Default/Cookies",   # optional
-    "act_as": "<substack handle>",                              # optional identity pin
-    "cookies": { "substack.sid": "...", ... } }
+Env:
+  TIE_SUBSTACK_HOME        registry home (default ~/.tie-substack); tests point it at a temp dir
+  TIE_SUBSTACK_CLIENT +    an explicit substack.sid for exactly that client (CI-style setups);
+  SUBSTACK_SESSION_TOKEN   ignored for every other client
 
-Multi-client: register one server entry PER CLIENT in claude_desktop_config
-(e.g. "tie-substack-acme"), each with its own TIE_SUBSTACK_CONFIG +
-SUBSTACK_PUBLICATION_URL, and a cookie_file pointing into that client's
-dedicated browser. Sessions never mix across clients or Chrome profiles.
+CLI (used by install.command for the 0.4 -> 0.5 migration; offline except check-clients):
+  server.py migrate --desktop-config PATH [--default-slug tie] [--installed-server PATH]
+  server.py check-clients
+  server.py switch --desktop-config PATH --command PY --server SERVER [--failed a,b]
+  server.py rollback --desktop-config PATH [--last]
 
-Env overrides:
-  SUBSTACK_PUBLICATION_URL   publication URL (wins over config)
-  SUBSTACK_SESSION_TOKEN     substack.sid value (wins over config cookies)
-
-Protocol: MCP over stdio, newline-delimited JSON-RPC 2.0 (same plumbing as
-wearevolt/tie-imagegen). Requires: python-substack; pycookiecheat optional
-(only refresh_cookie needs it).
+Protocol: MCP over stdio, newline-delimited JSON-RPC 2.0. Requires: python-substack;
+pycookiecheat optional (bind_client / refresh_session need it).
 """
 
+import hashlib
 import json
 import os
 import re
+import shutil
 import stat
+import subprocess
 import sys
 import threading
 import time
@@ -54,24 +57,42 @@ import traceback
 from datetime import datetime, timezone
 
 SERVER_NAME = "tie-substack"
-SERVER_VERSION = "0.4.2"
+SERVER_VERSION = "0.5.0"
+CONFIG_FORMAT_VERSION = 1
 
-# Substack's Publish-dialog settings. Every one of these gets a value whether or
-# not the caller picks it, so the tools always send them explicitly — see
-# AUDIENCE/COMMENT notes in create_draft.
 AUDIENCE_VALUES = ("everyone", "only_free", "only_paid", "founding")
 COMMENT_VALUES = ("none", "only_paid", "everyone")  # "none" == comments disabled
-# Meaningless (and rejected by the UI) unless the publication sells subscriptions.
 PAID_AUDIENCE_VALUES = ("only_free", "only_paid", "founding")
 FALLBACK_PROTOCOL = "2025-06-18"
-
-CONFIG_PATH = os.path.expanduser(
-    os.environ.get("TIE_SUBSTACK_CONFIG", "~/.tie-substack/config.json")
-)
+SESSION_TTL_SECONDS = 600  # a validated session is trusted this long between probes
+SLUG_RE = re.compile(r"^[a-z0-9]+(?:-[a-z0-9]+)*$")
+CLIENT_RE = re.compile(r"^[a-z][a-z0-9-]{1,30}$")
+RESERVED_NAMES = ("clients.json", "migration.json")
+RESERVED_DIR_PREFIXES = ("sessions", "backup-", "legacy", "venv", "python", "cache", "bin")
 
 _write_lock = threading.Lock()
 _api_lock = threading.Lock()
-_api_cache = {"api": None}
+_api_cache = {}  # slug -> {"api", "handle", "email", "sid", "validated_at"}
+
+
+def home():
+    return os.path.expanduser(os.environ.get("TIE_SUBSTACK_HOME", "~/.tie-substack"))
+
+
+def clients_path():
+    return os.path.join(home(), "clients.json")
+
+
+def sessions_dir():
+    return os.path.join(home(), "sessions")
+
+
+def session_path(slug):
+    return os.path.join(sessions_dir(), "%s.json" % slug)
+
+
+def journal_path():
+    return os.path.join(home(), "migration.json")
 
 
 def log(msg):
@@ -94,34 +115,117 @@ def reply_error(req_id, code, message):
     send({"jsonrpc": "2.0", "id": req_id, "error": {"code": code, "message": message}})
 
 
-# ---------------------------------------------------------------- config
+class ClientError(RuntimeError):
+    """A refusal the caller can act on (unknown client, unbound, mismatch)."""
 
 
-def load_config():
+class PublicationMismatch(ClientError):
+    def __init__(self, client, expected, registry, live):
+        self.client, self.expected, self.registry, self.live = client, expected, registry, live
+        super().__init__(
+            "publication mismatch for client %r: expected_publication=%r, registry=%r, "
+            "live session reaches=%r. Nothing was done. Fix the brand (publication.domain), the "
+            "registry (add_client / bind_client) or the session (refresh_session) so all three "
+            "agree." % (client, expected, registry, live if live is not None else "(not probed)")
+        )
+
+
+# ---------------------------------------------------------------- private storage
+
+
+def read_json(path, default):
     try:
-        with open(CONFIG_PATH) as f:
+        with open(path) as f:
             return json.load(f)
     except FileNotFoundError:
-        return {}
+        return default
     except Exception as e:  # noqa: BLE001
-        raise RuntimeError("config file %s is unreadable: %s" % (CONFIG_PATH, e))
+        raise RuntimeError("%s is unreadable: %s" % (path, e))
 
 
-def save_config(cfg):
-    d = os.path.dirname(CONFIG_PATH)
+def write_private_json(path, data):
+    d = os.path.dirname(path)
     os.makedirs(d, exist_ok=True)
-    with open(CONFIG_PATH, "w") as f:
-        json.dump(cfg, f, indent=2)
-    os.chmod(CONFIG_PATH, stat.S_IRUSR | stat.S_IWUSR)  # 0600 — it holds a session cookie
+    try:
+        os.chmod(d, stat.S_IRWXU)
+    except OSError:
+        pass
+    tmp = path + ".tmp"
+    with open(tmp, "w") as f:
+        json.dump(data, f, indent=2)
+    os.chmod(tmp, stat.S_IRUSR | stat.S_IWUSR)  # 0600: sessions hold cookies
+    os.replace(tmp, path)
+
+
+def load_clients():
+    data = read_json(clients_path(), {"version": CONFIG_FORMAT_VERSION, "clients": {}})
+    if not isinstance(data, dict) or not isinstance(data.get("clients"), dict):
+        raise RuntimeError("%s has an unexpected shape" % clients_path())
+    return data
+
+
+def save_clients(data):
+    data["version"] = CONFIG_FORMAT_VERSION
+    write_private_json(clients_path(), data)
+
+
+def validate_client_slug(slug):
+    s = (slug or "").strip().lower()
+    if not CLIENT_RE.match(s):
+        raise ClientError(
+            "client %r is not a valid slug (lowercase letters, digits, hyphens; the brand's "
+            "identity.slug)" % slug
+        )
+    return s
+
+
+def client_record(slug):
+    s = validate_client_slug(slug)
+    clients = load_clients()["clients"]
+    rec = clients.get(s)
+    if rec is None:
+        raise ClientError(
+            "unknown client %r; configured clients: %s. Add it with add_client, then "
+            "bind_client." % (s, ", ".join(sorted(clients)) or "(none)")
+        )
+    return s, rec
+
+
+def update_client(slug, **fields):
+    data = load_clients()
+    rec = data["clients"].setdefault(slug, {})
+    rec.update(fields)
+    save_clients(data)
+    return rec
+
+
+def load_session(slug):
+    return read_json(session_path(slug), {})
+
+
+def save_session(slug, cookies, probe=None, source_path=None):
+    write_private_json(session_path(slug), {
+        "cookies": cookies,
+        "saved_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+        "handle": (probe or {}).get("handle"),
+        "source_path": source_path,
+    })
+
+
+def session_cookies(slug):
+    """The client's stored cookies. An env token applies to exactly the client named by
+    TIE_SUBSTACK_CLIENT (CI-style setups) and never to anyone else."""
+    token = os.environ.get("SUBSTACK_SESSION_TOKEN")
+    if token and os.environ.get("TIE_SUBSTACK_CLIENT", "").strip().lower() == slug:
+        return {"substack.sid": token}
+    return load_session(slug).get("cookies") or {}
+
+
+# ---------------------------------------------------------------- URLs
 
 
 def normalize_publication_url(url):
-    """Force the https://<name>.substack.com form python-substack's resolver requires.
-
-    Its Api.__init__ extracts the subdomain with a regex containing a literal
-    'https://', so a bare host or an http:// URL silently resolves to no
-    publication and later blows up as 'NoneType' is not subscriptable.
-    """
+    """Force the https://<name>.substack.com form python-substack's resolver requires."""
     u = (url or "").strip().rstrip("/")
     if not u:
         return ""
@@ -132,63 +236,40 @@ def normalize_publication_url(url):
     return u
 
 
-def raw_publication_url():
-    return os.environ.get("SUBSTACK_PUBLICATION_URL") or load_config().get(
-        "publication_url"
-    ) or ""
-
-
-def publication_url():
-    url = normalize_publication_url(raw_publication_url())
-    if not url:
-        raise RuntimeError(
-            "publication_url is not configured — set SUBSTACK_PUBLICATION_URL or add "
-            '"publication_url" to %s (e.g. via install.command)' % CONFIG_PATH
-        )
-    return url
-
-
 SUBDOMAIN_RE = re.compile(r"^https://([^./]+)\.substack\.com$", re.I)
 
 
-def configured_subdomain():
-    """The publication subdomain, or None if the URL isn't a *.substack.com one."""
-    m = SUBDOMAIN_RE.match(publication_url())
+def subdomain_of(url):
+    m = SUBDOMAIN_RE.match(normalize_publication_url(url))
     return m.group(1).lower() if m else None
 
 
-def current_cookies():
-    """Cookie dict from env override or config. Values NEVER leave this process."""
-    token = os.environ.get("SUBSTACK_SESSION_TOKEN")
-    if token:
-        return {"substack.sid": token}
-    return load_config().get("cookies") or {}
+def canonical_host(value):
+    """Lower-case host of a publication given as URL, host, or host/path."""
+    v = (value or "").strip().lower()
+    v = re.sub(r"^https?://", "", v)
+    v = v.split("/")[0].split("?")[0]
+    return v[4:] if v.startswith("www.") else v
 
 
 def cookies_string(cookies):
     return "; ".join("%s=%s" % (k, v) for k, v in cookies.items())
 
 
-def resolve_cookie_file(arg_value):
-    """Cookie-DB path for refresh_cookie: explicit arg > config 'cookie_file' > None
-    (None = the browser's default profile). The multi-client setup stores a per-client
-    path (a dedicated browser's <user-data-dir>/Default/Cookies) in each client config."""
-    raw = arg_value or load_config().get("cookie_file")
-    return os.path.expanduser(raw) if raw else None
-
+# ---------------------------------------------------------------- browsers (macOS)
 
 CHROME_FAMILY_DATA_DIRS = {
     "chrome": "~/Library/Application Support/Google/Chrome",
     "chromium": "~/Library/Application Support/Chromium",
     "brave": "~/Library/Application Support/BraveSoftware/Brave-Browser",
 }
+BROWSER_APPS = {"chrome": "Google Chrome", "chromium": "Chromium", "brave": "Brave Browser"}
 
 
 def chrome_profile_cookie_files(browser, root=None):
     """(profile_name, cookie_file) for every profile of the browser's STANDARD data dir
-    (Default, Profile 1, ...). Dedicated --user-data-dir browsers live elsewhere and are
-    not discoverable — those are addressed explicitly via cookie_file (the multi-client
-    model). macOS paths — this server's install story is macOS-only."""
+    (Default, Profile 1, ...). A dedicated --user-data-dir lives elsewhere and is bound
+    explicitly (bind_client user_data_dir=)."""
     base = root or CHROME_FAMILY_DATA_DIRS.get(browser)
     if not base:
         return []
@@ -205,11 +286,7 @@ def chrome_profile_cookie_files(browser, root=None):
 
 
 def standard_install_browser(path):
-    """Which browser family's STANDARD install contains this cookie path — or
-    None for a dedicated --user-data-dir browser. Distinguishes scan/profile-
-    persisted pins from the multi-client model's dedicated paths (only the
-    former can silently hold a wrong login), and names the family so a legacy
-    re-validation scans the browser that actually produced the path."""
+    """Which browser family's STANDARD install contains this cookie path, else None."""
     if not path:
         return None
     p = os.path.expanduser(path)
@@ -219,30 +296,7 @@ def standard_install_browser(path):
     return None
 
 
-def in_standard_install(path):
-    return standard_install_browser(path) is not None
-
-
-def legacy_unpinned(cfg):
-    """Pre-0.4.0 state: a standard-install cookie_file with no identity pin.
-    Every 0.4.0 success path that persists a standard-install path also pins
-    act_as (explicit profile AND scan-validated matches), so this combination
-    can only be inherited — and the stored session may be the wrong login (the
-    old scan took the first match). Every tool that talks to Substack (reads
-    included — get_api serves both) refuses in this state until a refresh
-    re-validates it; one no-arg refresh_cookie heals it. An explicit
-    SUBSTACK_SESSION_TOKEN is exempt: it overrides config cookies entirely
-    (current_cookies), and that session is probed and identity-gated on its
-    own — stale local config must not block a CI/env-driven setup."""
-    if os.environ.get("SUBSTACK_SESSION_TOKEN"):
-        return False
-    return (not (cfg.get("act_as") or "").strip()
-            and in_standard_install(cfg.get("cookie_file")))
-
-
 def local_state_path(browser, root=None):
-    """Path to the browser's plaintext 'Local State' JSON, or None for an
-    unknown browser. The file maps profile dirs to display names/emails."""
     base = root or CHROME_FAMILY_DATA_DIRS.get(browser)
     if not base:
         return None
@@ -250,10 +304,8 @@ def local_state_path(browser, root=None):
 
 
 def local_state_profiles(browser, root=None):
-    """[{dir, name, email}] for every profile in the browser's 'Local State'
-    (profile.info_cache). Names/emails only — never touches the Cookies DB or
-    the Keychain. `root=` addresses a dedicated --user-data-dir browser (and
-    is the test seam). Missing file -> [] so callers can degrade gracefully."""
+    """[{dir, name, email}] from the browser's plaintext 'Local State' (profile.info_cache).
+    Names/emails only; never touches the Cookies DB or the Keychain."""
     path = local_state_path(browser, root)
     if not path or not os.path.isfile(path):
         return []
@@ -275,15 +327,12 @@ def local_state_profiles(browser, root=None):
 
 
 def resolve_profile_selector(selector, browser, root=None):
-    """The one profile a human-friendly selector means. Matched case-insensitively
-    against directory name, display name, and email — exact first, substring only
-    when nothing matches exactly (so 'Person 1' is not ambiguous with 'Person 10').
-    Anything but exactly one hit is an error listing what IS available."""
+    """The one profile a human-friendly selector means: directory name, display name or
+    email, case-insensitive, exact first, substring only when nothing matches exactly."""
     profiles = local_state_profiles(browser, root)
     if not profiles:
         raise RuntimeError(
-            'no browser profiles found — no "Local State" file under %s '
-            "(is %s installed?)"
+            'no browser profiles found: no "Local State" file under %s (is %s installed?)'
             % (root or CHROME_FAMILY_DATA_DIRS.get(browser), browser)
         )
     sel = (selector or "").strip().lower()
@@ -300,18 +349,18 @@ def resolve_profile_selector(selector, browser, root=None):
         return cands[0]
     if not cands:
         raise ValueError(
-            "profile %r does not match any %s profile — available: %s "
-            "(see list_profiles)" % (selector, browser, profiles)
+            "profile %r does not match any %s profile; available: %s (see list_browser_profiles)"
+            % (selector, browser, profiles)
         )
     raise ValueError(
-        "profile %r matches %d profiles: %s — use the exact directory name, "
-        "display name, or email (see list_profiles)" % (selector, len(cands), cands)
+        "profile %r matches %d profiles: %s; use the exact directory name, display name or "
+        "email (see list_browser_profiles)" % (selector, len(cands), cands)
     )
 
 
 def read_browser_cookies(pycookiecheat, browser, cookie_file, errors):
-    """One profile's substack.com cookies, or None. pycookiecheat's API moved between
-    versions — try the new form, then the old."""
+    """One profile's substack.com cookies, or None (pycookiecheat's API moved between
+    versions; try the new form, then the old)."""
     url = "https://substack.com"
     try:
         bt = pycookiecheat.BrowserType(browser)
@@ -326,68 +375,23 @@ def read_browser_cookies(pycookiecheat, browser, cookie_file, errors):
     return None
 
 
-def publication_accessible(probe, target):
-    """Can this session act on publication `target`? The SINGLE access predicate —
-    cookie selection (session_reaches), get_api's preflight, and substack_status must
-    all agree, or refresh_cookie can pick a session that later fails api_ready.
-    `primary` counts: a primary-only profile (primaryPublication set but absent from
-    publicationUsers) is still an account of that publication. Case-insensitive —
-    probe_session lowercases subdomains but not primary, and targets are lowercased."""
-    if not target:
-        return True
-    t = target.lower()
-    subs = [s.lower() for s in (probe.get("subdomains") or [])]
-    prim = (probe.get("primary") or "").lower()
-    return t in subs or t == prim
-
-
-def accessible_publications(probe):
-    """For error messages: everything the session can act on, primary included."""
-    out = [s.lower() for s in (probe.get("subdomains") or [])]
-    prim = (probe.get("primary") or "").lower()
-    if prim and prim not in out:
-        out.append(prim)
-    return sorted(out)
-
-
-def identity_matches(probe, act_as):
-    """Does the probed session belong to the pinned identity? act_as matches the
-    Substack handle (what the server itself persists) or, as a hand-typed
-    convenience, the account email when the profile API reports one. Unset pin
-    -> everything qualifies. Kept separate from session_reaches so callers can
-    tell 'wrong publication' from 'wrong identity' in error messages."""
-    if not act_as:
-        return True
-    a = act_as.strip().lower()
-    return (
-        ((probe or {}).get("handle") or "").strip().lower() == a
-        or ((probe or {}).get("email") or "").strip().lower() == a
-    )
-
-
-def session_reaches(cookies, target):
-    """(matches, probe): the session is valid AND can access publication `target`
-    (any valid session counts when target is None)."""
-    if not cookies or "substack.sid" not in cookies:
-        return False, None
+def import_pycookiecheat():
     try:
-        ok, probe = probe_session(cookies)
-    except Exception:  # noqa: BLE001
-        return False, None
-    if not ok:
-        return False, probe
-    if not publication_accessible(probe, target):
-        return False, probe
-    return True, probe
+        import pycookiecheat  # noqa: PLC0415
+    except ImportError:
+        raise RuntimeError(
+            "pycookiecheat is not installed in the server's environment; re-run the installer "
+            "(it installs it) before binding or refreshing sessions"
+        )
+    return pycookiecheat
+
+
+# ---------------------------------------------------------------- probes
 
 
 def probe_session(cookies):
-    """Check the session WITHOUT depending on publication resolution.
-
-    Returns (ok, info). Keeps 'session expired' distinguishable from
-    'this account has no access to the configured publication' — the two
-    failures look identical once python-substack's Api.__init__ is involved.
-    """
+    """(ok, info) for a cookie set WITHOUT depending on publication resolution, so
+    'session expired' stays distinguishable from 'no access to this publication'."""
     import requests  # noqa: PLC0415  (a python-substack dependency)
 
     r = requests.get(
@@ -411,115 +415,230 @@ def probe_session(cookies):
     }
 
 
-def get_api(fresh=False):
-    """python-substack Api, cached (its __init__ does network round-trips)."""
+def publication_accessible(probe, target):
+    """Can this session act on publication `target`? The SINGLE access predicate."""
+    if not target:
+        return True
+    t = target.lower()
+    subs = [s.lower() for s in (probe.get("subdomains") or [])]
+    prim = (probe.get("primary") or "").lower()
+    return t in subs or t == prim
+
+
+def accessible_publications(probe):
+    out = [s.lower() for s in ((probe or {}).get("subdomains") or [])]
+    prim = ((probe or {}).get("primary") or "").lower()
+    if prim and prim not in out:
+        out.append(prim)
+    return sorted(out)
+
+
+def identity_matches(probe, act_as):
+    """Does the probed session belong to the pinned identity (handle, or email as a
+    hand-typed convenience)? An unset pin matches everything."""
+    if not act_as:
+        return True
+    a = act_as.strip().lower()
+    return (
+        ((probe or {}).get("handle") or "").strip().lower() == a
+        or ((probe or {}).get("email") or "").strip().lower() == a
+    )
+
+
+# ---------------------------------------------------------------- cookie sources
+
+
+def cookie_source_file(source):
+    """The Cookies DB a registry cookie_source points at, or None."""
+    if not source:
+        return None
+    kind = source.get("type")
+    if kind == "profile":
+        files = dict(chrome_profile_cookie_files(source.get("browser") or "chrome"))
+        return files.get(source.get("profile"))
+    if kind == "user_data_dir":
+        return os.path.join(os.path.expanduser(source.get("path") or ""), "Default", "Cookies")
+    if kind == "cookie_file":
+        return os.path.expanduser(source.get("path") or "")
+    return None
+
+
+def describe_source(source):
+    if not source:
+        return "(unbound)"
+    kind = source.get("type")
+    if kind == "profile":
+        return "%s profile %r" % (source.get("browser") or "chrome", source.get("profile"))
+    if kind == "user_data_dir":
+        return "dedicated browser %s" % source.get("path")
+    return "cookie file %s" % source.get("path")
+
+
+def read_source_cookies(source):
+    """Cookies from the bound source. Raises with the fix named."""
+    pycookiecheat = import_pycookiecheat()
+    cf = cookie_source_file(source)
+    if not cf or not os.path.isfile(cf):
+        raise ClientError(
+            "the bound cookie source %s has no Cookies database at %s; launch that browser, "
+            "log in to Substack there once, then refresh_session" % (describe_source(source), cf)
+        )
+    errors = []
+    cookies = read_browser_cookies(pycookiecheat, source.get("browser") or "chrome", cf, errors)
+    if not cookies:
+        raise ClientError(
+            "could not read cookies from %s (is the browser installed, are you logged in to "
+            "substack.com there, was Keychain access granted?): %s"
+            % (describe_source(source), " | ".join(errors)[:400])
+        )
+    if "substack.sid" not in cookies:
+        raise ClientError(
+            "no substack.sid among the cookies of %s; log in to Substack in that browser first"
+            % describe_source(source)
+        )
+    return cookies, cf
+
+
+# ---------------------------------------------------------------- session manager
+
+
+def reset_api(slug=None):
     with _api_lock:
-        if _api_cache["api"] is not None and not fresh:
-            # The act_as pin must hold for CACHED clients too — the config can
-            # change under a warm cache (hand-edit, another tool), and a cache
-            # hit must never hand back a client the pin no longer trusts. On
-            # mismatch (or a legacy-unpinned config), drop the cache and fall
-            # through to the full preflight, which raises the canonical error.
-            cfg_now = load_config()
-            if not legacy_unpinned(cfg_now) and identity_matches(
-                {"handle": _api_cache.get("handle"), "email": _api_cache.get("email")},
-                (cfg_now.get("act_as") or "").strip(),
-            ):
-                return _api_cache["api"]
-            _api_cache["api"] = None
-        cookies = current_cookies()
+        if slug is None:
+            _api_cache.clear()
+        else:
+            _api_cache.pop(slug, None)
+
+
+def _context(slug, rec, probe):
+    return {
+        "client": slug,
+        "publication": canonical_host(rec.get("publication_url")),
+        "act_as": rec.get("act_as"),
+        "logged_in_as": (probe or {}).get("handle"),
+    }
+
+
+def get_api(slug, expected_publication, fresh=False):
+    """(api, context) for one client, after every check: registry entry, expected vs
+    registry publication, a valid session (one auto-refresh from the bound source), the
+    session reaching the publication, and the pinned identity. Nothing defaults."""
+    slug, rec = client_record(slug)
+    pub_url = normalize_publication_url(rec.get("publication_url"))
+    sub = subdomain_of(pub_url)
+    if not sub:
+        raise ClientError(
+            "client %r has publication_url %r, which is not a https://<name>.substack.com URL; "
+            "python-substack resolves only that form (custom domains cannot be used)"
+            % (slug, rec.get("publication_url"))
+        )
+    expected_host = canonical_host(expected_publication)
+    registry_host = canonical_host(pub_url)
+    if not expected_host:
+        raise ClientError("expected_publication is required on every publication-scoped tool")
+    if expected_host != registry_host:
+        raise PublicationMismatch(slug, expected_host, registry_host, None)
+    act_as = (rec.get("act_as") or "").strip()
+    if not act_as:
+        raise ClientError(
+            "client %r is unbound (no act_as identity): run bind_client first, then retry" % slug
+        )
+    with _api_lock:
+        cookies = session_cookies(slug)
+        source = rec.get("cookie_source")
+        refreshed = False
         if not cookies.get("substack.sid"):
-            raise RuntimeError(
-                "no substack.sid cookie configured. Run the refresh_cookie tool (pulls it "
-                "from your local Chrome via pycookiecheat), or paste it manually into %s as "
-                '{"cookies": {"substack.sid": "<value>"}}. Never paste the cookie into chat.'
-                % CONFIG_PATH
-            )
-        url = publication_url()
-        sub = configured_subdomain()
-        if not sub:
-            raise RuntimeError(
-                "publication_url %r is not a https://<name>.substack.com URL. The underlying "
-                "python-substack library resolves the publication by exactly that form, so a "
-                "custom domain cannot be used here — configure the canonical Substack URL in "
-                "%s." % (url, CONFIG_PATH)
-            )
-        # Pre-flight so failures name their real cause instead of surfacing as
-        # "'NoneType' object is not subscriptable" from inside change_publication().
+            if not source:
+                raise ClientError(
+                    "client %r has no session and no bound cookie source: run bind_client" % slug
+                )
+            cookies, cf = read_source_cookies(source)
+            refreshed = True
+        entry = _api_cache.get(slug)
+        if (entry and not fresh and not refreshed
+                and entry.get("sid") == cookies.get("substack.sid")
+                and time.time() - entry.get("validated_at", 0) < SESSION_TTL_SECONDS
+                and identity_matches(entry, act_as)):
+            return entry["api"], _context(slug, rec, entry)
         ok, probe = probe_session(cookies)
+        if not ok and source and not refreshed:
+            # One automatic re-read of the bound source, then fail with the fix named.
+            cookies, cf = read_source_cookies(source)
+            ok, probe = probe_session(cookies)
+            refreshed = True
         if not ok:
-            raise RuntimeError(
-                "Substack session is invalid or expired (HTTP %s) — run refresh_cookie"
-                % probe.get("status")
+            raise ClientError(
+                "client %r: Substack session is invalid or expired (HTTP %s) and the bound "
+                "source %s did not yield a valid one; log in to Substack in that browser, then "
+                "refresh_session" % (slug, probe.get("status"), describe_source(source))
             )
         if not publication_accessible(probe, sub):
-            raise RuntimeError(
-                "the logged-in account (%s) has no access to publication %r. Publications "
-                "available to this session: %s. Either fix publication_url in %s, or refresh "
-                "the cookie from a browser logged in as a user of %r."
-                % (probe["handle"], sub, accessible_publications(probe) or "(none)",
-                   CONFIG_PATH, sub)
-            )
-        cfg_now = load_config()
-        act_as = (cfg_now.get("act_as") or "").strip()
-        if legacy_unpinned(cfg_now):
-            # A wrong-but-valid session inherited from ≤0.3.0 must not reach
-            # any Substack-facing tool (reads included — acting as the wrong
-            # identity is misleading either way) before refresh_cookie runs.
-            raise RuntimeError(
-                "this config has a pre-0.4.0 standard-install cookie_file with no "
-                "identity pin — the stored session (currently logged in as %r) may "
-                "be the wrong login. Run refresh_cookie (it re-validates via the "
-                'profile scan) or refresh_cookie with profile: "<login>" before '
-                "reading or writing as this account. Config: %s"
-                % (probe.get("handle"), CONFIG_PATH)
-            )
+            raise PublicationMismatch(slug, expected_host, registry_host, accessible_publications(probe))
         if not identity_matches(probe, act_as):
-            # The pin gates every write tool here, not just refresh_cookie — a
-            # stale, hand-pasted, or env-injected cookie must not act as the
-            # wrong account just because it can reach the publication.
-            raise RuntimeError(
-                "the session is logged in as %r, not the pinned act_as=%r — run "
-                "refresh_cookie (optionally with profile:, see list_profiles), or "
-                "change/remove act_as in %s." % (probe["handle"], act_as, CONFIG_PATH)
+            raise ClientError(
+                "client %r: the session is logged in as %r, not the pinned act_as=%r; run "
+                "refresh_session(client) (the bound source changed login?) or bind_client with "
+                "confirm_switch to re-pin deliberately" % (slug, probe.get("handle"), act_as)
             )
+        if refreshed and not os.environ.get("SUBSTACK_SESSION_TOKEN"):
+            save_session(slug, cookies, probe, cf)
         from substack import Api  # noqa: PLC0415
 
         if not hasattr(Api, "create_draft_from_markdown"):
             raise RuntimeError(
-                "the installed python-substack library is too old for this server "
-                "(no Api.create_draft_from_markdown — typically a venv built on "
-                "Python < 3.10, where pip silently resolves the 2023-era library). "
-                "Fix: re-run the installer, which now requires Python 3.10+ and a "
-                "pinned library: bash -c \"$(curl -fsSL https://raw.github"
-                "usercontent.com/wearevolt/tie-substack/main/install.command)\""
+                "the installed python-substack library is too old for this server (no "
+                "Api.create_draft_from_markdown); re-run the installer, which requires Python "
+                "3.10+ and a pinned library"
             )
-        api = Api(cookies_string=cookies_string(cookies), publication_url=url)
-        _api_cache["api"] = api
-        # Remember whose session this client wraps, so cache hits can re-check
-        # the act_as pin without a network probe.
-        _api_cache["handle"] = probe.get("handle")
-        _api_cache["email"] = probe.get("email")
-        return api
+        api = Api(cookies_string=cookies_string(cookies), publication_url=pub_url)
+        _api_cache[slug] = {
+            "api": api, "handle": probe.get("handle"), "email": probe.get("email"),
+            "sid": cookies.get("substack.sid"), "validated_at": time.time(),
+        }
+        return api, _context(slug, rec, probe)
 
 
-def reset_api():
-    with _api_lock:
-        _api_cache["api"] = None
-        _api_cache["handle"] = None
-        _api_cache["email"] = None
+class ProbeFacade:
+    """What probe-scoped tools may do: look at one client's registry record, probe a
+    session's identity and access, read the bound cookie source, persist a session or a
+    binding. No drafts, no posts, no settings; there is no attribute for them."""
+
+    def __init__(self, slug):
+        self.slug, self.record = client_record(slug)
+
+    def subdomain(self):
+        return subdomain_of(self.record.get("publication_url"))
+
+    def stored_cookies(self):
+        return session_cookies(self.slug)
+
+    def identity(self, cookies):
+        if not cookies or "substack.sid" not in cookies:
+            return False, {"reason": "no_session"}
+        try:
+            return probe_session(cookies)
+        except Exception as e:  # noqa: BLE001
+            return False, {"reason": "unreachable", "error": str(e)[:200]}
+
+    def reaches(self, probe):
+        return publication_accessible(probe, self.subdomain())
+
+    def read_source(self, source):
+        return read_source_cookies(source)
+
+    def persist(self, cookies, probe, source_path, **record_fields):
+        save_session(self.slug, cookies, probe, source_path)
+        if record_fields:
+            update_client(self.slug, **record_fields)
+        reset_api(self.slug)
+        self.slug, self.record = client_record(self.slug)
 
 
-# ---------------------------------------------------------------- helpers
+# ---------------------------------------------------------------- substack helpers
 
 
 def publication_capabilities(api):
-    """What this publication can actually do — so choices offered are real ones.
-
-    Verified against a live personal-mode publication: `payments_state` is the
-    paid-subscription signal, and get_sections() raises APIError(400) when the
-    publication has none rather than returning an empty list.
-    """
+    """What this publication can actually do, so choices offered are real ones."""
     pub = api.get_user_primary_publication() or {}
     state = pub.get("payments_state")
     caps = {
@@ -534,9 +653,7 @@ def publication_capabilities(api):
     try:
         sections = api.get_sections() or []
         caps["sections"] = [
-            {"id": s.get("id"), "name": s.get("name")}
-            for s in sections
-            if isinstance(s, dict)
+            {"id": s.get("id"), "name": s.get("name")} for s in sections if isinstance(s, dict)
         ]
     except Exception as e:  # noqa: BLE001
         caps["sections"] = []
@@ -555,40 +672,36 @@ def publication_capabilities(api):
             "comment_permissions": ["only_paid"],
             "reason": "publication has no paid subscriptions (payments_state=%r)" % state,
         }
-    # Substack's publication payload carries no timezone, so every scheduling
-    # call must pass an explicit UTC offset (the tools enforce that).
-    caps["timezone"] = None
+    caps["timezone"] = None  # Substack's payload carries none; every schedule passes an offset
     return caps
 
 
 def validate_settings(audience, comments, caps):
     if audience not in AUDIENCE_VALUES:
         raise ValueError(
-            "audience %r is invalid — choose one of %s" % (audience, list(AUDIENCE_VALUES))
+            "audience %r is invalid; choose one of %s" % (audience, list(AUDIENCE_VALUES))
         )
     if comments not in COMMENT_VALUES:
         raise ValueError(
-            "comment_permissions %r is invalid — choose one of %s ('none' disables comments)"
+            "comment_permissions %r is invalid; choose one of %s ('none' disables comments)"
             % (comments, list(COMMENT_VALUES))
         )
     if not caps.get("paid_enabled"):
         if audience in PAID_AUDIENCE_VALUES:
             raise ValueError(
                 "audience %r needs paid subscriptions, which this publication does not have "
-                "(payments_state=%r) — use 'everyone'"
-                % (audience, caps.get("payments_state"))
+                "(payments_state=%r); use 'everyone'" % (audience, caps.get("payments_state"))
             )
         if comments == "only_paid":
             raise ValueError(
                 "comment_permissions 'only_paid' needs paid subscriptions, which this "
-                "publication does not have — use 'everyone' or 'none'"
+                "publication does not have; use 'everyone' or 'none'"
             )
 
 
 def resolve_tags(api, wanted, caps=None):
-    """Split requested tags into existing vs new. Tags are PUBLICATION-level
-    objects: applying an unknown one creates it permanently, so the caller must
-    opt in to that."""
+    """Split requested tags into existing vs new (tags are publication-level objects:
+    applying an unknown one creates it permanently, so the caller opts in)."""
     existing = {
         (t.get("name") or "").strip().lower(): t
         for t in ((caps or {}).get("existing_tags") or [])
@@ -616,14 +729,8 @@ def resolve_tags(api, wanted, caps=None):
 
 
 def read_post_tags(api, post_id):
-    """Tags actually attached, read from the association endpoint.
-
-    The draft payload has NO postTags field (verified: the key is absent, not
-    null), so a request echo would be the only alternative — and this is the last
-    place where that would still be the case. `GET post/<id>/tag` returns
-    association rows carrying post_tag_id (a UUID string), which we map to names
-    via the publication's tag list.
-    """
+    """Tags actually attached, from the association endpoint (the draft payload has no
+    postTags field)."""
     rows = api.call("post/%s/tag" % post_id, "GET") or []
     if not isinstance(rows, list):
         return {"names": [], "note": "unexpected response shape from post/<id>/tag"}
@@ -643,17 +750,13 @@ def read_post_tags(api, post_id):
     return {"names": names}
 
 
-def post_url_for_slug(slug):
-    if not slug:
+def post_url_for_slug(pub_url, slug):
+    if not slug or not pub_url:
         return None
-    try:
-        return "%s/p/%s" % (publication_url(), slug)
-    except RuntimeError:
-        return None
+    return "%s/p/%s" % (normalize_publication_url(pub_url), slug)
 
 
 def unwrap_items(raw, *keys):
-    """Substack wraps collections in an object (e.g. {"posts": [...]}) — unwrap it."""
     if isinstance(raw, dict):
         for k in keys:
             v = raw.get(k)
@@ -663,7 +766,7 @@ def unwrap_items(raw, *keys):
     return raw or []
 
 
-def draft_summary(draft):
+def draft_summary(draft, pub_url=None):
     """Public, cookie-free summary of a draft dict returned by the API."""
     if not isinstance(draft, dict):
         return {"warning": "unexpected draft payload shape", "raw": str(draft)[:200]}
@@ -674,26 +777,19 @@ def draft_summary(draft):
     draft_id = draft.get("id")
     summary = {
         "draft_id": draft_id,
-        # Unpublished drafts keep the working title in draft_title and leave title null.
         "title": draft.get("draft_title") or draft.get("title") or "(untitled draft)",
         "slug": slug,
-        "post_url": post_url_for_slug(slug),
+        "post_url": post_url_for_slug(pub_url, slug),
         "is_published": bool(published),
         "updated_at": draft.get("draft_updated_at") or draft.get("updated_at"),
-        # Settings as STORED by Substack (never as requested) — the caller shows
-        # these to the user, so an echo of our own payload would be misleading.
         "audience": draft.get("audience"),
         "comment_permissions": draft.get("write_comment_permissions"),
         "send_email": draft.get("should_send_email"),
     }
-    # The list payload is a narrower projection than get_draft: subtitle, SEO,
-    # section and free-preview keys are ABSENT there (not null). Reporting null
-    # for an absent key would read as "empty", so only report what the payload
-    # actually carries.
     if "draft_subtitle" in draft or "subtitle" in draft:
         summary["subtitle"] = draft.get("draft_subtitle") or draft.get("subtitle")
     else:
-        summary["subtitle_note"] = "not in this payload — call get_draft to read it"
+        summary["subtitle_note"] = "not in this payload; call get_draft to read it"
     for key, field in (
         ("send_free_preview", "should_send_free_preview"),
         ("section_id", "draft_section_id"),
@@ -704,31 +800,23 @@ def draft_summary(draft):
             summary[key] = draft.get(field)
     if draft.get("email_sent_at"):
         summary["email_already_sent_at"] = draft["email_sent_at"]
-    # trigger_at lives in postSchedules, and ONLY on the single-draft payload —
-    # the list payload omits the key entirely, so absence != "not scheduled".
     if "postSchedules" in draft:
-        schedules = draft.get("postSchedules") or []
         trigger = None
-        for s in schedules:
+        for s in draft.get("postSchedules") or []:
             if isinstance(s, dict) and s.get("trigger_at"):
                 trigger = s["trigger_at"]
                 break
         summary["scheduled_for"] = trigger
     else:
-        summary["scheduled_for_note"] = "not in this payload — call get_draft to read it"
-    try:
-        summary["editor_url"] = "%s/publish/post/%s" % (publication_url(), draft_id)
-    except RuntimeError:
-        pass
+        summary["scheduled_for_note"] = "not in this payload; call get_draft to read it"
+    if pub_url:
+        summary["editor_url"] = "%s/publish/post/%s" % (normalize_publication_url(pub_url), draft_id)
     if not slug:
-        summary["post_url_note"] = (
-            "no slug set on this draft yet — call set_slug to pin the public URL"
-        )
+        summary["post_url_note"] = "no slug set on this draft yet; call set_slug to pin the public URL"
     return summary
 
 
 def parse_iso_aware(value):
-    """Parse an ISO 8601 timestamp and REQUIRE timezone info (naive = silent UTC bug)."""
     v = (value or "").strip()
     if v.endswith("Z"):
         v = v[:-1] + "+00:00"
@@ -738,873 +826,534 @@ def parse_iso_aware(value):
         raise ValueError("invalid ISO 8601 datetime: %r" % value)
     if dt.tzinfo is None:
         raise ValueError(
-            "datetime %r has no timezone — pass an offset (e.g. 2026-08-03T09:00:00-04:00) "
+            "datetime %r has no timezone; pass an offset (e.g. 2026-08-03T09:00:00-04:00) "
             "so the schedule can't silently shift" % value
         )
     return dt
 
 
-SLUG_RE = re.compile(r"^[a-z0-9]+(?:-[a-z0-9]+)*$")
-
-
 def validate_slug(slug):
     if not SLUG_RE.match(slug or ""):
         raise ValueError(
-            "slug %r is invalid — use lowercase words separated by single hyphens, "
-            "e.g. 'program-management-another-year-another-obituary'" % slug
+            "slug %r is invalid; use lowercase words separated by single hyphens" % slug
         )
     return slug
 
 
-def text_result(payload):
+def text_result(payload, ctx=None):
+    if ctx:
+        if isinstance(payload, dict):
+            payload = dict(payload)
+            for k in ("client", "publication", "act_as", "logged_in_as"):
+                payload.setdefault(k, ctx.get(k))
+        elif isinstance(payload, list):
+            payload = {"client": ctx.get("client"), "publication": ctx.get("publication"),
+                       "act_as": ctx.get("act_as"), "logged_in_as": ctx.get("logged_in_as"),
+                       "items": payload}
     return {"content": [{"type": "text", "text": json.dumps(payload, indent=2)}]}
 
 
-# ---------------------------------------------------------------- tools
+# ---------------------------------------------------------------- tool schemas
+
+CLIENT_PROP = {
+    "client": {
+        "type": "string",
+        "description": "The client slug (tie-social brand identity.slug / brand.json substack.client). Required; there is no current client.",
+    }
+}
+EXPECTED_PROP = {
+    "expected_publication": {
+        "type": "string",
+        "description": "The publication this call is for (brand.json publication.domain, e.g. name.substack.com). The server refuses when it differs from the registry or from the live session.",
+    }
+}
+DRAFT_ID = {"draft_id": {"type": ["integer", "string"]}}
+
+
+def _schema(props, required):
+    return {"type": "object", "properties": props, "required": required}
+
+
+def _pub_schema(extra_props, extra_required=()):
+    props = dict(CLIENT_PROP)
+    props.update(EXPECTED_PROP)
+    props.update(extra_props)
+    return _schema(props, ["client", "expected_publication"] + list(extra_required))
+
 
 TOOLS = [
+    # ---- registry scope (local only)
     {
-        "name": "substack_status",
-        "description": (
-            "Health check: is a session cookie configured and still valid, which user and "
-            "publication it maps to, python-substack/pycookiecheat availability. Run this "
-            "first; if the cookie is dead it says so and points at refresh_cookie."
-        ),
-        "inputSchema": {"type": "object", "properties": {}},
+        "name": "list_clients",
+        "scope": "registry",
+        "description": "The configured clients: slug, publication, bound cookie source, pinned identity, whether a session is stored. Local only, no network.",
+        "inputSchema": _schema({}, []),
     },
     {
-        "name": "refresh_cookie",
-        "description": (
-            "Pull the current substack.com session cookies from the LOCAL browser profile "
-            "(via pycookiecheat; macOS will prompt for Keychain access) and store them in "
-            "the server's 0600 config file. When a publication is configured (and no "
-            "cookie_file is set), ALL of the browser's standard profiles are scanned — "
-            "the default profile gets no special trust; when EXACTLY ONE login reaches "
-            "the publication it is chosen, persisted, and pinned as act_as, and with "
-            "several distinct logins nothing is stored and the error lists the "
-            "candidates so you re-run with `profile`. An `act_as` config pin restricts which logged-in identity "
-            "qualifies at all. The cookie value is never returned or shown — the result "
-            "only lists cookie NAMES, profile names/handles, and the validation outcome. "
-            "Requires the user to be logged in to Substack in that browser. Run only when "
-            "the user asks to refresh/repair Substack auth."
-        ),
-        "inputSchema": {
-            "type": "object",
-            "properties": {
-                "browser": {
-                    "type": "string",
-                    "enum": ["chrome", "chromium", "brave", "firefox"],
-                    "default": "chrome",
-                    "description": "Which local browser profile to read the cookie from.",
-                },
-                "cookie_file": {
-                    "type": "string",
-                    "description": (
-                        "Absolute path to a specific Chrome-family 'Cookies' SQLite file "
-                        "to read INSTEAD of the browser's default profile — the "
-                        "multi-client setup points this at a dedicated per-client "
-                        "browser, e.g. ~/TIE-Browsers/<client>/Default/Cookies. Omit to "
-                        "use this server config's stored 'cookie_file' (if any), else "
-                        "the default profile. Not supported with browser=firefox."
-                    ),
-                },
-                "profile": {
-                    "type": "string",
-                    "description": (
-                        "Pick ONE profile of the standard browser install by directory "
-                        "name ('Profile 2'), display name, or signed-in email — "
-                        "case-insensitive, exact or unique substring (run list_profiles "
-                        "first). Use when several logins reach the same publication. "
-                        "Mutually exclusive with cookie_file; not supported with "
-                        "browser=firefox."
-                    ),
-                },
-                "confirm_switch": {
-                    "type": "boolean",
-                    "description": (
-                        "Required true to SWITCH the pinned identity: when `profile` "
-                        "resolves to a login different from the configured act_as, the "
-                        "call refuses unless this is set, and on success the pin is "
-                        "rewritten to the new login. Only meaningful together with "
-                        "`profile`. Pass it ONLY when the user explicitly asked to act "
-                        "as a different account — never on your own initiative."
-                    ),
-                },
-            },
-        },
+        "name": "add_client",
+        "scope": "registry",
+        "description": "Register a client publication under its brand slug (https://<name>.substack.com). Local only; bind_client then attaches a browser session.",
+        "inputSchema": _schema(dict(CLIENT_PROP, publication_url={"type": "string"}), ["client", "publication_url"]),
     },
     {
-        "name": "list_profiles",
-        "description": (
-            "List the local Chrome-family browser's profiles (directory, display name, "
-            "signed-in email) by parsing the browser's plaintext 'Local State' file. "
-            "Reads NO cookie data and triggers NO Keychain prompt — use it to pick the "
-            "`profile` argument for refresh_cookie when several Substack logins reach "
-            "the same publication."
-        ),
-        "inputSchema": {
-            "type": "object",
-            "properties": {
-                "browser": {
-                    "type": "string",
-                    "enum": ["chrome", "chromium", "brave"],
-                    "default": "chrome",
-                    "description": "Which browser's profiles to list.",
-                },
-                "root": {
-                    "type": "string",
-                    "description": (
-                        "Override the browser user-data directory (e.g. a dedicated "
-                        "per-client browser like ~/TIE-Browsers/<client>). Default: "
-                        "the standard install location for `browser`."
-                    ),
-                },
-            },
-        },
+        "name": "list_browser_profiles",
+        "scope": "registry",
+        "description": "Chrome-family browser profiles (directory, display name, signed-in email) from the browser's plaintext 'Local State', plus the dedicated browsers registered clients are bound to. Reads NO cookies, triggers NO Keychain prompt.",
+        "inputSchema": _schema({
+            "browser": {"type": "string", "enum": ["chrome", "chromium", "brave"], "default": "chrome"},
+            "root": {"type": "string", "description": "Override the user-data directory (a dedicated browser)."},
+        }, []),
     },
+    {
+        "name": "open_client_browser",
+        "scope": "registry",
+        "description": "OPTIONAL. Launch the client's dedicated browser (its bound user_data_dir) for a one-time Substack login. macOS only.",
+        "inputSchema": _schema(dict(CLIENT_PROP), ["client"]),
+    },
+    # ---- probe scope (identity and access only)
+    {
+        "name": "clients_status",
+        "scope": "probe",
+        "description": "One table for every client (or one client): bound?, session valid / expired / missing, identity matches the pin?, publication reachable?, logged_in_as. The readiness signal; the per-call check guards each write.",
+        "inputSchema": _schema(dict(CLIENT_PROP), []),
+    },
+    {
+        "name": "bind_client",
+        "scope": "probe",
+        "description": "Bind a client to a cookie source and pin its identity: a standard browser profile (`profile`, by directory name / display name / email), a dedicated browser (`user_data_dir`), or an explicit `cookie_file`. With none of them, every standard profile of `browser` is scanned and exactly ONE login reaching the publication is accepted (several: refuses with the candidates). The session is validated against the publication and stored; `act_as` is pinned to that login. Rebinding to a DIFFERENT identity needs confirm_switch=true, only on the user's explicit ask. Cookie values never surface.",
+        "inputSchema": _schema(dict(CLIENT_PROP, **{
+            "profile": {"type": "string"},
+            "user_data_dir": {"type": "string"},
+            "cookie_file": {"type": "string"},
+            "browser": {"type": "string", "enum": ["chrome", "chromium", "brave"], "default": "chrome"},
+            "confirm_switch": {"type": "boolean", "default": False},
+        }), ["client"]),
+    },
+    {
+        "name": "refresh_session",
+        "scope": "probe",
+        "description": "Re-read the client's bound cookie source, validate the session against the publication and the pinned identity, store it. Routine after a Substack logout/expiry; refuses for an unbound client (bind_client first). Names only, never values.",
+        "inputSchema": _schema(dict(CLIENT_PROP), ["client"]),
+    },
+    # ---- publication scope (full client, after the expected_publication check)
     {
         "name": "get_publication_settings",
-        "description": (
-            "Read what the publication can actually do, so you only offer valid choices: "
-            "paid subscriptions enabled?, available sections, existing publication tags, "
-            "and which audience/comment values are therefore unavailable. Call this BEFORE "
-            "assembling a settings proposal for the user."
-        ),
-        "inputSchema": {"type": "object", "properties": {}},
+        "scope": "publication",
+        "description": "What the publication can actually do: paid subscriptions enabled?, sections, existing tags, and which audience/comment values are unavailable. Call BEFORE proposing settings.",
+        "inputSchema": _pub_schema({}),
     },
     {
         "name": "create_draft",
+        "scope": "publication",
         "description": (
             "Create a Substack draft from Markdown with the slug pinned, so the public URL "
-            "(<publication>/p/<slug>) is known before publication. Returns draft_id, slug, "
-            "post_url, editor_url and the settings AS STORED by Substack. Body images "
-            "referenced as local paths/URLs are uploaded by the library. Does NOT publish "
-            "or schedule.\n\n"
-            "Every Publish-dialog setting gets a value whether or not you pass one, so the "
-            "defaults here are explicit and visible. Show them to the user before "
-            "scheduling. Note: comment_permissions is ALWAYS sent explicitly, because the "
-            "underlying library silently copies `audience` into it when omitted (so an "
-            "only_paid audience would quietly make comments paid-only). Validate choices "
-            "against get_publication_settings first — paid-only values fail on a "
-            "publication without paid subscriptions."
+            "(<publication>/p/<slug>) is known before publication. Returns draft_id, slug, post_url, "
+            "editor_url and the settings AS STORED by Substack. Does NOT publish or schedule. Every "
+            "Publish-dialog setting gets a value whether or not you pass one; comment_permissions is "
+            "ALWAYS sent explicitly (the library otherwise copies `audience` into it). Validate against "
+            "get_publication_settings first."
         ),
-        "inputSchema": {
-            "type": "object",
-            "properties": {
-                "title": {"type": "string"},
-                "subtitle": {"type": "string", "default": ""},
-                "body_markdown": {
-                    "type": "string",
-                    "description": (
-                        "Full post body as Markdown. Can be a short placeholder — the team "
-                        "usually pastes/polishes the real text in the Substack editor; the "
-                        "point of creating the draft here is pinning the slug + schedule."
-                    ),
-                },
-                "slug": {
-                    "type": "string",
-                    "description": "The post URL slug to pin (lowercase-hyphenated).",
-                },
-                "audience": {
-                    "type": "string",
-                    "enum": list(AUDIENCE_VALUES),
-                    "default": "everyone",
-                    "description": "Who can read it. Non-'everyone' values need paid subs.",
-                },
-                "comment_permissions": {
-                    "type": "string",
-                    "enum": list(COMMENT_VALUES),
-                    "default": "everyone",
-                    "description": "Who may comment; 'none' disables comments.",
-                },
-                "send_email": {
-                    "type": "boolean",
-                    "default": True,
-                    "description": (
-                        "Whether publishing emails subscribers. Sending is IRREVERSIBLE; "
-                        "schedule_draft/publish_draft additionally require an explicit "
-                        "confirm_send_email when this is true."
-                    ),
-                },
-                "tags": {
-                    "type": "array",
-                    "items": {"type": "string"},
-                    "description": (
-                        "Publication-level tags. Applying an unknown tag CREATES it "
-                        "permanently, so new tags are refused unless allow_new_tags is true."
-                    ),
-                },
-                "allow_new_tags": {"type": "boolean", "default": False},
-                "section_id": {
-                    "type": ["integer", "string", "null"],
-                    "description": "Publication section id (see get_publication_settings).",
-                },
-                "seo_title": {"type": "string", "description": "Defaults to title."},
-                "seo_description": {
-                    "type": "string",
-                    "description": "Defaults to subtitle.",
-                },
-            },
-            "required": ["title", "body_markdown", "slug"],
-        },
+        "inputSchema": _pub_schema({
+            "title": {"type": "string"},
+            "subtitle": {"type": "string", "default": ""},
+            "body_markdown": {"type": "string", "description": "Full post body as Markdown (a short placeholder is fine; the team polishes in the editor)."},
+            "slug": {"type": "string", "description": "The post URL slug to pin (lowercase-hyphenated)."},
+            "audience": {"type": "string", "enum": list(AUDIENCE_VALUES), "default": "everyone"},
+            "comment_permissions": {"type": "string", "enum": list(COMMENT_VALUES), "default": "everyone"},
+            "send_email": {"type": "boolean", "default": True, "description": "Whether publishing emails subscribers (irreversible; schedule/publish additionally need confirm_send_email)."},
+            "tags": {"type": "array", "items": {"type": "string"}},
+            "allow_new_tags": {"type": "boolean", "default": False},
+            "section_id": {"type": ["integer", "string", "null"]},
+            "seo_title": {"type": "string"},
+            "seo_description": {"type": "string"},
+        }, ["title", "body_markdown", "slug"]),
     },
     {
         "name": "update_post_settings",
-        "description": (
-            "Change settings on an existing draft without recreating it: audience, "
-            "comment_permissions, send_email, send_free_preview, section_id, seo_title, "
-            "seo_description, title, subtitle. Returns the settings as stored afterwards."
-        ),
-        "inputSchema": {
-            "type": "object",
-            "properties": {
-                "draft_id": {"type": ["integer", "string"]},
-                "audience": {"type": "string", "enum": list(AUDIENCE_VALUES)},
-                "comment_permissions": {"type": "string", "enum": list(COMMENT_VALUES)},
-                "send_email": {"type": "boolean"},
-                "send_free_preview": {"type": "boolean"},
-                "section_id": {"type": ["integer", "string", "null"]},
-                "seo_title": {"type": "string"},
-                "seo_description": {"type": "string"},
-                "title": {"type": "string"},
-                "subtitle": {"type": "string"},
-            },
-            "required": ["draft_id"],
-        },
+        "scope": "publication",
+        "description": "Change settings on an existing draft: audience, comment_permissions, send_email, send_free_preview, section_id, seo_title, seo_description, title, subtitle. Returns the settings as stored.",
+        "inputSchema": _pub_schema(dict(DRAFT_ID, **{
+            "audience": {"type": "string", "enum": list(AUDIENCE_VALUES)},
+            "comment_permissions": {"type": "string", "enum": list(COMMENT_VALUES)},
+            "send_email": {"type": "boolean"},
+            "send_free_preview": {"type": "boolean"},
+            "section_id": {"type": ["integer", "string", "null"]},
+            "seo_title": {"type": "string"},
+            "seo_description": {"type": "string"},
+            "title": {"type": "string"},
+            "subtitle": {"type": "string"},
+        }), ["draft_id"]),
     },
     {
         "name": "apply_tags",
-        "description": (
-            "Attach publication tags to a draft. Tags are publication-level objects: an "
-            "unknown tag is CREATED permanently and typos are durable, so this reports "
-            "which tags are existing vs new and refuses to create new ones unless "
-            "allow_new is true. Call it as its own confirmed step, not silently."
-        ),
-        "inputSchema": {
-            "type": "object",
-            "properties": {
-                "draft_id": {"type": ["integer", "string"]},
-                "tags": {"type": "array", "items": {"type": "string"}},
-                "allow_new": {"type": "boolean", "default": False},
-            },
-            "required": ["draft_id", "tags"],
-        },
+        "scope": "publication",
+        "description": "Attach publication tags to a draft; reports existing vs new and refuses to CREATE new ones unless allow_new is true (tags are permanent publication objects).",
+        "inputSchema": _pub_schema(dict(DRAFT_ID, tags={"type": "array", "items": {"type": "string"}}, allow_new={"type": "boolean", "default": False}), ["draft_id", "tags"]),
     },
     {
         "name": "set_slug",
-        "description": (
-            "Set/replace the URL slug of an existing draft. Returns the updated slug and "
-            "post_url. Fails on already-published posts."
-        ),
-        "inputSchema": {
-            "type": "object",
-            "properties": {
-                "draft_id": {"type": ["integer", "string"]},
-                "slug": {"type": "string"},
-            },
-            "required": ["draft_id", "slug"],
-        },
+        "scope": "publication",
+        "description": "Set/replace the URL slug of an existing draft. Returns the stored slug and post_url.",
+        "inputSchema": _pub_schema(dict(DRAFT_ID, slug={"type": "string"}), ["draft_id", "slug"]),
     },
     {
         "name": "schedule_draft",
-        "description": (
-            "Schedule a draft to publish at an exact instant. datetime_iso MUST carry a "
-            "timezone offset (e.g. 2026-08-03T09:00:00-04:00); naive timestamps and past "
-            "times are rejected. Returns the schedule AS STORED by Substack (read back "
-            "from postSchedules), never an echo of the request.\n\n"
-            "If the draft is set to email subscribers, this call REFUSES unless "
-            "confirm_send_email is true — scheduling is a time-triggered public action and "
-            "the email cannot be unsent. Show the user the full settings summary first."
-        ),
-        "inputSchema": {
-            "type": "object",
-            "properties": {
-                "draft_id": {"type": ["integer", "string"]},
-                "datetime_iso": {"type": "string"},
-                "confirm_send_email": {
-                    "type": "boolean",
-                    "default": False,
-                    "description": (
-                        "Set true ONLY after the user has confirmed that publishing will "
-                        "email subscribers. Ignored when the draft has send_email false."
-                    ),
-                },
-            },
-            "required": ["draft_id", "datetime_iso"],
-        },
+        "scope": "publication",
+        "description": "Schedule a draft to publish at an exact instant (datetime_iso MUST carry an offset; past times rejected). Returns the schedule AS STORED. REFUSES without confirm_send_email when the post emails subscribers.",
+        "inputSchema": _pub_schema(dict(DRAFT_ID, datetime_iso={"type": "string"}, confirm_send_email={"type": "boolean", "default": False}), ["draft_id", "datetime_iso"]),
     },
     {
         "name": "unschedule_draft",
+        "scope": "publication",
         "description": "Cancel a draft's scheduled publication (it stays a draft).",
-        "inputSchema": {
-            "type": "object",
-            "properties": {"draft_id": {"type": ["integer", "string"]}},
-            "required": ["draft_id"],
-        },
+        "inputSchema": _pub_schema(dict(DRAFT_ID), ["draft_id"]),
     },
     {
         "name": "get_draft",
-        "description": (
-            "Fetch one draft/post by id — the COMPLETE view: title, subtitle, slug, "
-            "post_url, settings, attached tags (read from the association endpoint) and "
-            "scheduled_for. Use this rather than list_drafts when the details matter."
-        ),
-        "inputSchema": {
-            "type": "object",
-            "properties": {"draft_id": {"type": ["integer", "string"]}},
-            "required": ["draft_id"],
-        },
+        "scope": "publication",
+        "description": "One draft/post, the COMPLETE view: title, subtitle, slug, post_url, settings, attached tags, scheduled_for.",
+        "inputSchema": _pub_schema(dict(DRAFT_ID), ["draft_id"]),
     },
     {
         "name": "list_drafts",
-        "description": (
-            "List recent DRAFTS ONLY (id, title, slug, post_url, audience, comments, "
-            "send_email), newest first; published posts are excluded. limit is capped "
-            "at 25 — Substack rejects more with a bare 400. Substack's list payload is "
-            "a NARROWER projection than get_draft: subtitle, SEO fields, section, tags "
-            "and the schedule are not in it, and the response says so per field "
-            "instead of reporting null — call get_draft for those."
-        ),
-        "inputSchema": {
-            "type": "object",
-            "properties": {
-                "limit": {"type": "integer", "default": 10, "minimum": 1, "maximum": 25}
-            },
-        },
+        "scope": "publication",
+        "description": "Recent DRAFTS only, newest first (limit <= 25). A narrower projection than get_draft; per-field notes say what is absent.",
+        "inputSchema": _pub_schema({"limit": {"type": "integer", "default": 10, "minimum": 1, "maximum": 25}}),
     },
     {
         "name": "publish_draft",
-        "description": (
-            "PUBLISH a draft immediately, optionally emailing subscribers. The email cannot "
-            "be unsent, so send_email=true additionally requires confirm_send_email=true. "
-            "Call ONLY on an explicit user instruction to publish right now — the normal "
-            "flow is schedule_draft."
-        ),
-        "inputSchema": {
-            "type": "object",
-            "properties": {
-                "draft_id": {"type": ["integer", "string"]},
-                "send_email": {"type": "boolean", "default": True},
-                "confirm_send_email": {
-                    "type": "boolean",
-                    "default": False,
-                    "description": "Required when send_email is true; user must have agreed.",
-                },
-                "share_automatically": {
-                    "type": "boolean",
-                    "default": False,
-                    "description": (
-                        "Auto-share to connected social accounts. Posts publicly elsewhere — "
-                        "never enable without asking."
-                    ),
-                },
-            },
-            "required": ["draft_id"],
-        },
+        "scope": "publication",
+        "description": "PUBLISH a draft now (needs confirm_send_email when emailing). Only on an explicit user instruction; the normal flow is schedule_draft.",
+        "inputSchema": _pub_schema(dict(DRAFT_ID, send_email={"type": "boolean", "default": True}, confirm_send_email={"type": "boolean", "default": False}, share_automatically={"type": "boolean", "default": False}), ["draft_id"]),
     },
     {
         "name": "delete_draft",
-        "description": "Delete a draft by id (published posts cannot be deleted here).",
-        "inputSchema": {
-            "type": "object",
-            "properties": {"draft_id": {"type": ["integer", "string"]}},
-            "required": ["draft_id"],
-        },
+        "scope": "publication",
+        "description": "Delete a draft by id.",
+        "inputSchema": _pub_schema(dict(DRAFT_ID), ["draft_id"]),
     },
 ]
+TOOL_SCOPES = {t["name"]: t["scope"] for t in TOOLS}
+PUBLIC_TOOLS = [{k: v for k, v in t.items() if k != "scope"} for t in TOOLS]
 
 
-def tool_substack_status(_args):
-    """Layered diagnosis: deps → config → session → publication access → Api ready."""
-    info = {"config_path": CONFIG_PATH, "server_version": SERVER_VERSION}
-    raw = raw_publication_url()
-    try:
-        info["publication_url"] = publication_url()
-        if raw and raw.strip().rstrip("/") != info["publication_url"]:
-            info["publication_url_note"] = (
-                "normalized from %r — python-substack only resolves the "
-                "https://<name>.substack.com form; consider fixing it in the config" % raw
-            )
-    except RuntimeError as e:
-        info["publication_url"] = "NOT CONFIGURED: %s" % e
-    try:
-        import substack  # noqa: PLC0415
-
-        info["python_substack"] = getattr(substack, "__version__", "installed")
-    except ImportError:
-        info["python_substack"] = "NOT INSTALLED — pip install python-substack"
-    try:
-        import pycookiecheat  # noqa: PLC0415,F401
-
-        info["pycookiecheat"] = "installed (refresh_cookie available)"
-    except ImportError:
-        info["pycookiecheat"] = "not installed — refresh_cookie unavailable"
-    cfg = load_config()
-    configured_cf = cfg.get("cookie_file")
-    if configured_cf:
-        info["cookie_file"] = configured_cf  # per-client browser this config reads from
-    act_as = (cfg.get("act_as") or "").strip()
-    if act_as:
-        info["act_as"] = act_as  # identity pin — refresh_cookie only accepts this login
-    elif configured_cf and in_standard_install(configured_cf):
-        info["identity_note"] = (
-            "standard-install cookie_file with no identity pin (pre-0.4.0 state) — "
-            "with several logins the wrong account can persist silently; the next "
-            "no-arg refresh_cookie re-validates via the scan, or pin explicitly with "
-            "refresh_cookie profile:"
-        )
-
-    cookies = current_cookies()
-    info["cookie_configured"] = bool(cookies.get("substack.sid"))
-    # Names only, and only the auth-relevant ones — analytics cookies are noise here,
-    # and no cookie VALUE is ever reported.
-    info["auth_cookies_present"] = sorted(
-        k for k in cookies if k.startswith("substack.") or k == "cf_clearance"
-    )
-    info["cookies_stored"] = len(cookies)
-    if not info["cookie_configured"]:
-        info["api_ready"] = False
-        info["fix"] = (
-            "no substack.sid — run refresh_cookie, or paste it into %s" % CONFIG_PATH
-        )
-        return text_result(info)
-
-    # 1) Session validity, independent of any publication resolution.
-    try:
-        ok, probe = probe_session(cookies)
-    except Exception as e:  # noqa: BLE001
-        info["session_valid"] = "unknown"
-        info["api_ready"] = False
-        info["session_error"] = "could not reach Substack: %s" % str(e)[:200]
-        return text_result(info)
-    info["session_valid"] = ok
-    if not ok:
-        info["api_ready"] = False
-        info["fix"] = "session cookie is invalid or expired — run refresh_cookie"
-        return text_result(info)
-    info["logged_in_as"] = probe["handle"]
-    info["primary_publication"] = probe["primary"]
-    info["available_publications"] = probe["subdomains"]
-    if act_as:
-        info["act_as_matches"] = identity_matches(probe, act_as)
-        if not info["act_as_matches"]:
-            # Same gate as get_api — a wrong-identity session must not report
-            # api_ready, or the caller would draft/publish as the wrong account.
-            info["api_ready"] = False
-            info["fix"] = (
-                "session is logged in as %r, not the pinned act_as=%r — run "
-                "refresh_cookie (optionally with profile:, see list_profiles), "
-                "or change/remove act_as in %s" % (probe["handle"], act_as, CONFIG_PATH)
-            )
-            return text_result(info)
-    elif legacy_unpinned(cfg):
-        # Mirror get_api's write block: the legacy state must never report
-        # api_ready — logged_in_as above shows WHO the stale session really is.
-        info["api_ready"] = False
-        info["fix"] = (
-            "pre-0.4.0 standard-install cookie_file with no identity pin — the "
-            "stored session (logged_in_as above) may be the wrong login; run "
-            "refresh_cookie (re-validates via the profile scan) or refresh_cookie "
-            "profile: before reading or writing as this account"
-        )
-        return text_result(info)
-
-    # 2) Does the configured publication belong to this account?
-    try:
-        sub = configured_subdomain()
-    except RuntimeError:
-        info["api_ready"] = False
-        info["fix"] = "configure publication_url in %s" % CONFIG_PATH
-        return text_result(info)
-    if not sub:
-        info["api_ready"] = False
-        info["fix"] = (
-            "publication_url must be https://<name>.substack.com (custom domains are not "
-            "resolvable by python-substack)"
-        )
-        return text_result(info)
-    info["configured_publication"] = sub
-    if not publication_accessible(probe, sub):
-        info["api_ready"] = False
-        info["fix"] = (
-            "account %s has no access to %r — fix publication_url (available: %s) or refresh "
-            "the cookie from a session that owns it"
-            % (probe["handle"], sub, accessible_publications(probe) or "(none)")
-        )
-        return text_result(info)
-
-    # 3) Full client construction (the step that used to fail opaquely).
-    try:
-        get_api(fresh=True)
-        info["api_ready"] = True
-    except Exception as e:  # noqa: BLE001
-        reset_api()
-        info["api_ready"] = False
-        info["api_error"] = str(e)[:300]
-    return text_result(info)
+# ---------------------------------------------------------------- registry tools
 
 
-def tool_refresh_cookie(args):
-    try:
-        import pycookiecheat  # noqa: PLC0415
-    except ImportError:
-        raise RuntimeError(
-            "pycookiecheat is not installed in the server's environment — "
-            "pip install pycookiecheat, or paste the cookie into %s manually" % CONFIG_PATH
-        )
+def tool_list_clients(_args):
+    clients = load_clients()["clients"]
+    out = []
+    for slug in sorted(clients):
+        rec = clients[slug]
+        out.append({
+            "client": slug,
+            "publication": canonical_host(rec.get("publication_url")),
+            "cookie_source": describe_source(rec.get("cookie_source")),
+            "act_as": rec.get("act_as"),
+            "session_stored": bool((load_session(slug).get("cookies") or {}).get("substack.sid")),
+            "bound": bool(rec.get("act_as") and rec.get("cookie_source")),
+        })
+    return text_result({"clients": out, "count": len(out), "registry": clients_path()})
 
-    raw_browser = (args.get("browser") or "").strip().lower()
-    browser = raw_browser or "chrome"
-    act_as = (load_config().get("act_as") or "").strip()
-    profile_arg = (args.get("profile") or "").strip()
-    if profile_arg and args.get("cookie_file"):
-        raise ValueError(
-            "pass either profile or cookie_file, not both — profile selects a standard-"
-            "install browser profile, cookie_file targets an arbitrary Cookies DB"
-        )
-    if args.get("confirm_switch") and not profile_arg:
-        raise ValueError(
-            "confirm_switch only applies to an explicit profile choice — pass it "
-            "together with profile"
-        )
-    if profile_arg and browser == "firefox":
-        raise RuntimeError(
-            "profile selection reads Chrome-family profiles and cannot be combined "
-            "with browser=firefox"
-        )
-    legacy_revalidated = False
-    if profile_arg:
-        # An explicit profile deliberately bypasses a config-persisted cookie_file —
-        # it is the only way to correct a stored path that points at the wrong login.
-        prof = resolve_profile_selector(profile_arg, browser)
-        cookie_file = dict(chrome_profile_cookie_files(browser)).get(prof["dir"])
-        if not cookie_file:
-            raise RuntimeError(
-                "profile %r (%s) has no Cookies database — launch the browser with "
-                "that profile and log in to substack.com there first"
-                % (prof["name"] or prof["dir"], prof["dir"])
-            )
-        chosen_profile = prof["dir"]
-    else:
-        cookie_file = resolve_cookie_file(args.get("cookie_file"))
-        if cookie_file and browser == "firefox":
-            raise RuntimeError(
-                "cookie_file targets a Chrome-family Cookies SQLite file and cannot be "
-                "combined with browser=firefox"
-            )
-        legacy_family = (
-            standard_install_browser(cookie_file)
-            if cookie_file and not args.get("cookie_file") and not act_as
-            else None
-        )
-        if legacy_family and (not raw_browser or raw_browser == legacy_family):
-            # Legacy-unpinned state: a standard-install path persisted by a
-            # pre-0.4.0 scan (or first-match pick) with no identity pin — the
-            # explicit-profile flow always pins, so this combination can only
-            # be inherited. A wrong login persisted back then would otherwise
-            # survive every guard (pin skips the scan, no act_as to fail), so
-            # ignore the stored path once and re-validate via the scan below —
-            # scanning the family that produced the path (a Brave/Chromium pin
-            # must not be "re-validated" against Chrome's profiles). An
-            # EXPLICIT browser argument naming a different family wins: the
-            # stored path is honored as-is.
-            browser = legacy_family
-            cookie_file = None
-            legacy_revalidated = True
-        if cookie_file and not os.path.isfile(cookie_file):
-            raise RuntimeError(
-                "cookie_file %s does not exist — for a dedicated per-client browser the "
-                "path is <user-data-dir>/Default/Cookies, and the browser must have been "
-                "launched (and logged in to Substack) at least once" % cookie_file
-            )
-        chosen_profile = cookie_file or "(default profile)"
-    errors = []
-    cookies = read_browser_cookies(pycookiecheat, browser, cookie_file, errors)
-    try:
-        target = configured_subdomain()
-    except RuntimeError:
-        target = None
 
-    profiles_scanned = []
-    matched_pub, probe = session_reaches(cookies, target)
-    matched = matched_pub and identity_matches(probe, act_as)
-    act_as_switch = False
-    if (profile_arg and act_as and matched_pub and not matched
-            and args.get("confirm_switch")):
-        # The human explicitly confirmed acting as this other login (same trust
-        # contract as schedule_draft's confirm_send_email) — accept the session
-        # now; the pin is rewritten in the persistence block below.
-        matched = True
-        act_as_switch = True
-    if (target or act_as) and not cookie_file and browser != "firefox":
-        # The scan (deterministic code — cookie values never surface, the model only
-        # sees profile names + handles): check EVERY profile of the standard browser
-        # install, even when the default profile qualifies — "the default reaches
-        # the publication" is not identity, and trusting it silently is exactly the
-        # wrong-account pick this exists to prevent. One qualifying IDENTITY
-        # proceeds; several mean the choice is the operator's, not directory-sort
-        # order's. A dedicated per-client browser is NOT discoverable this way —
-        # that's what cookie_file is for.
-        # Human-readable names for every scanned profile, so profiles_scanned and
-        # the refusal/no-access errors are self-sufficient (the profile argument
-        # accepts dir name, display name, or email — don't force a list_profiles
-        # round-trip to tell 'Profile 2' from 'Juliet — TIE'). Best-effort: a
-        # missing Local State just leaves names blank, never blocks the scan.
-        ls_meta = {}
-        try:
-            ls_meta = {p["dir"]: p for p in local_state_profiles(browser)}
-        except Exception:  # noqa: BLE001
-            pass
-        hits = []
-        for name, cf in chrome_profile_cookie_files(browser):
-            if name == "Default":
-                # The scan only runs with no cookie_file, so the initial read
-                # above WAS this profile (pycookiecheat's default) — reuse it
-                # rather than decrypting the same DB again (each decrypt is a
-                # separate macOS Keychain prompt).
-                c, got_pub, p = cookies, matched_pub, probe
-            else:
-                c = read_browser_cookies(pycookiecheat, browser, cf, errors)
-                got_pub, p = session_reaches(c, target)
-            got = got_pub and identity_matches(p, act_as)
-            meta = ls_meta.get(name) or {}
-            entry = {"profile": name, "reaches_publication": got_pub,
-                     "logged_in_as": (p or {}).get("handle")}
-            if meta.get("name"):
-                entry["name"] = meta["name"]
-            if meta.get("email"):
-                entry["email"] = meta["email"]
-            if act_as:
-                entry["matches_act_as"] = got
-            profiles_scanned.append(entry)
-            if got:
-                hits.append((name, cf, c, p))
-        # Group by identity: two profiles logged into the SAME account are not an
-        # ambiguity (either acts as that identity); two different handles are —
-        # no matter which of them the default profile happens to be.
-        idents = {}
-        for h in hits:
-            idents.setdefault((h[3] or {}).get("handle") or h[0], []).append(h)
-        default_handle = (probe or {}).get("handle")
-        if matched and default_handle not in idents:
-            idents[default_handle or "(default profile)"] = []
-        if len(idents) > 1:
-            cands = [{"profile": n, "name": (ls_meta.get(n) or {}).get("name", ""),
-                      "email": (ls_meta.get(n) or {}).get("email", ""),
-                      "logged_in_as": (p or {}).get("handle")} for n, cf, c, p in hits]
-            if matched and default_handle not in {c["logged_in_as"] for c in cands}:
-                cands.insert(0, {"profile": "(default profile)", "name": "",
-                                 "logged_in_as": default_handle})
-            raise RuntimeError(
-                "%d Substack logins reach %r — refusing to guess between accounts, "
-                "nothing was stored. Candidates: %s. Re-run refresh_cookie with "
-                'profile: "<name>" (or set act_as in %s to pin an identity).'
-                % (len(idents), target, cands, CONFIG_PATH)
-            )
-        if hits and not matched:
-            # A single qualifying identity, found by the scan: prefer its Default-
-            # dir session when it has several, for continuity with older behavior.
-            only = next(iter(idents.values()))
-            pick = next((h for h in only if h[0] == "Default"), only[0])
-            chosen_profile, cookie_file, cookies, probe = pick
-            matched = True
-    if not cookies:
-        raise RuntimeError(
-            "could not read cookies from %s (is the browser installed, are you logged in "
-            "to substack.com there, was Keychain access granted?): %s"
-            % (chosen_profile, " | ".join(errors)[:400])
+def tool_add_client(args):
+    slug = validate_client_slug(args.get("client"))
+    url = normalize_publication_url(args.get("publication_url"))
+    if not subdomain_of(url):
+        raise ClientError(
+            "publication_url %r must be https://<name>.substack.com (custom domains cannot be "
+            "resolved by python-substack)" % args.get("publication_url")
         )
-    if "substack.sid" not in cookies:
-        raise RuntimeError(
-            "no substack.sid among %s cookies for substack.com — log in to Substack in "
-            "that browser first (found: %s)%s"
-            % (chosen_profile, sorted(cookies.keys()),
-               "; profiles scanned: %s" % profiles_scanned if profiles_scanned else "")
+    data = load_clients()
+    if slug in data["clients"]:
+        raise ClientError(
+            "client %r already exists (publication %s); use bind_client / refresh_session, or edit "
+            "%s by hand to change its publication" % (slug, data["clients"][slug].get("publication_url"), clients_path())
         )
-    if not matched and act_as and (
-        matched_pub or any(e.get("reaches_publication") for e in profiles_scanned)
-    ):
-        if profile_arg:
-            raise RuntimeError(
-                "profile %r is logged in as %r, but the config pins act_as=%r — "
-                "re-run with confirm_switch: true to SWITCH the pinned identity "
-                "(only on the user's explicit ask), pick a profile matching the "
-                "pin (list_profiles), or edit act_as in %s."
-                % (chosen_profile, (probe or {}).get("handle"), act_as, CONFIG_PATH)
-            )
-        raise RuntimeError(
-            "found Substack session(s) reaching %r, but none logged in as the pinned "
-            "act_as=%r (found: %s). Log in as that identity, pick a profile explicitly "
-            "(list_profiles), or change/remove act_as in %s. Note: act_as matches the "
-            "Substack handle — if you configured an email that never matches, use the "
-            "handle."
-            % (target, act_as,
-               profiles_scanned
-               or [{"profile": chosen_profile,
-                    "logged_in_as": (probe or {}).get("handle")}],
-               CONFIG_PATH)
-        )
-    if (target or act_as) and not matched:
-        raise RuntimeError(
-            "found Substack session(s), but none that can access %r. Checked: %s. "
-            "Log in to that publication's account in one of this browser's profiles, "
-            "pass profile to pick a specific login, or pass cookie_file pointing at "
-            "the right (e.g. dedicated per-client) browser."
-            % (target, profiles_scanned or [chosen_profile])
-        )
-
-    cfg = load_config()
-    cfg["cookies"] = cookies
-    cfg.setdefault("publication_url", os.environ.get("SUBSTACK_PUBLICATION_URL", ""))
-    if args.get("cookie_file") or profile_arg or (profiles_scanned and matched and cookie_file):
-        # Persist the path that worked — explicitly passed, chosen by profile, or
-        # found by the scan — so the next no-arg refresh reads the same profile.
-        cfg["cookie_file"] = cookie_file
-    elif legacy_revalidated and matched and not cookie_file:
-        # The re-validation was won by the DEFAULT profile, not the stale
-        # pre-0.4.0 path — drop that path, or the config would loop in the
-        # legacy write-blocked state forever.
-        cfg.pop("cookie_file", None)
-    act_as_persisted = False
-    act_as_prev = None
-    if profile_arg and (probe or {}).get("handle"):
-        if not cfg.get("act_as"):
-            # Pin the identity the user just chose explicitly, so later no-arg
-            # refreshes stay deterministic even if more logins appear.
-            cfg["act_as"] = probe["handle"]
-            act_as_persisted = True
-        elif act_as_switch:
-            # Confirmed switch: rewrite the pin to the newly chosen login.
-            act_as_prev = cfg["act_as"]
-            cfg["act_as"] = probe["handle"]
-    elif (profiles_scanned and matched
-          and not cfg.get("act_as") and (probe or {}).get("handle")):
-        # The scan validated exactly one identity — pin it, whether it was
-        # adopted from a profile hit or the default profile won. There was no
-        # choice to make, and the pin keeps "standard-install cookie_file with
-        # no act_as" an exclusively pre-0.4.0 state that write tools refuse.
-        cfg["act_as"] = probe["handle"]
-        act_as_persisted = True
-    save_config(cfg)
-    reset_api()
-
-    result = {
-        "saved_to": CONFIG_PATH,
-        # Names only — cookie VALUES never leave the server.
-        "auth_cookies_saved": sorted(
-            k for k in cookies if k.startswith("substack.") or k == "cf_clearance"
-        ),
-        "cookies_stored": len(cookies),
-        "browser": browser,
-        "cookie_file": cookie_file or "(default profile)",
-        "profile": chosen_profile,
+    data["clients"][slug] = {
+        "publication_url": url, "cookie_source": None, "act_as": None,
+        "added_at": datetime.now(timezone.utc).isoformat(timespec="seconds"), "bound_at": None,
     }
-    if cfg.get("act_as"):
-        result["act_as"] = cfg["act_as"]
-    if act_as_persisted:
-        result["act_as_persisted"] = True
-    if act_as_prev:
-        result["act_as_changed"] = {"from": act_as_prev, "to": cfg.get("act_as")}
-    if profiles_scanned:
-        result["profiles_scanned"] = profiles_scanned
+    save_clients(data)
+    return text_result({"added": slug, "publication": canonical_host(url), "next": "bind_client"})
+
+
+def tool_list_browser_profiles(args):
+    browser = (args.get("browser") or "chrome").lower()
+    root = os.path.expanduser(args["root"]) if args.get("root") else None
+    clients = load_clients()["clients"]
+    bound = {}
+    for slug, rec in clients.items():
+        src = rec.get("cookie_source") or {}
+        if src.get("type") == "profile":
+            bound[(src.get("browser") or "chrome", src.get("profile"))] = slug
+    path = local_state_path(browser, root)
+    profiles = local_state_profiles(browser, root) if path and os.path.isfile(path) else []
+    for p in profiles:
+        p["bound_to"] = bound.get((browser, p["dir"]))
+    dedicated = [
+        {"client": slug, "user_data_dir": rec["cookie_source"].get("path"),
+         "browser": rec["cookie_source"].get("browser") or "chrome"}
+        for slug, rec in sorted(clients.items())
+        if (rec.get("cookie_source") or {}).get("type") == "user_data_dir"
+    ]
+    out = {"browser": browser, "root": os.path.dirname(path) if path else None,
+           "profiles": profiles, "count": len(profiles), "dedicated_browsers": dedicated,
+           "note": "names/emails from the browser's plaintext profile cache; no cookies were read"}
+    if not profiles:
+        out["profiles_note"] = 'no "Local State" file at %s (is %s installed?)' % (path, browser)
+    return text_result(out)
+
+
+def tool_open_client_browser(args):
+    slug, rec = client_record(args.get("client"))
+    src = rec.get("cookie_source") or {}
+    if src.get("type") != "user_data_dir":
+        raise ClientError(
+            "client %r is not bound to a dedicated browser (%s); bind_client with user_data_dir "
+            "first" % (slug, describe_source(src))
+        )
+    app = BROWSER_APPS.get(src.get("browser") or "chrome", "Google Chrome")
+    path = os.path.expanduser(src["path"])
+    cmd = ["open", "-na", app, "--args", "--user-data-dir=%s" % path]
     try:
-        api = get_api(fresh=True)
-        profile = api.get_user_profile()
-        result["cookie_valid"] = True
-        result["logged_in_as"] = profile.get("handle") or profile.get("name")
+        subprocess.Popen(cmd)  # noqa: S603
     except Exception as e:  # noqa: BLE001
-        reset_api()
-        result["cookie_valid"] = False
-        result["validation_error"] = str(e)[:300]
+        raise RuntimeError("could not launch %s: %s (run: %s)" % (app, e, " ".join(cmd)))
+    return text_result({"launched": app, "user_data_dir": path, "client": slug,
+                        "next": "log in to Substack in that window, then refresh_session"})
+
+
+# ---------------------------------------------------------------- probe tools
+
+
+def _status_for(slug):
+    f = ProbeFacade(slug)
+    rec = f.record
+    row = {
+        "client": slug,
+        "publication": canonical_host(rec.get("publication_url")),
+        "cookie_source": describe_source(rec.get("cookie_source")),
+        "act_as": rec.get("act_as"),
+        "bound": bool(rec.get("act_as") and rec.get("cookie_source")),
+    }
+    cookies = f.stored_cookies()
+    if not cookies.get("substack.sid"):
+        row.update(session="missing", ready=False,
+                   fix="bind_client" if not row["bound"] else "refresh_session")
+        return row
+    ok, probe = f.identity(cookies)
+    if not ok:
+        row.update(session="expired" if probe.get("reason") == "session_invalid" else probe.get("reason", "unknown"),
+                   ready=False, fix="refresh_session")
+        return row
+    row["session"] = "valid"
+    row["logged_in_as"] = probe.get("handle")
+    row["identity_matches"] = identity_matches(probe, rec.get("act_as"))
+    row["publication_reachable"] = f.reaches(probe)
+    row["ready"] = bool(row["bound"] and row["identity_matches"] and row["publication_reachable"])
+    if not row["identity_matches"]:
+        row["fix"] = "refresh_session (or bind_client with confirm_switch to re-pin)"
+    elif not row["publication_reachable"]:
+        row["fix"] = "the session (%s) has no access to %s (reaches: %s); bind a login of that publication" % (
+            probe.get("handle"), row["publication"], accessible_publications(probe))
+    elif not row["bound"]:
+        row["fix"] = "bind_client"
+    return row
+
+
+def tool_clients_status(args, facade=None):
+    slugs = [facade.slug] if facade else sorted(load_clients()["clients"])
+    rows = [_status_for(s) for s in slugs]
+    return text_result({"clients": rows, "all_ready": all(r.get("ready") for r in rows) if rows else False,
+                        "count": len(rows)})
+
+
+def _scan_profiles(facade, browser, act_as):
+    """Every standard profile of `browser` whose session reaches the publication, grouped
+    by identity. Deterministic; cookie values never surface."""
+    pycookiecheat = import_pycookiecheat()
+    meta = {}
+    try:
+        meta = {p["dir"]: p for p in local_state_profiles(browser)}
+    except Exception:  # noqa: BLE001
+        pass
+    scanned, hits = [], {}
+    errors = []
+    for name, cf in chrome_profile_cookie_files(browser):
+        cookies = read_browser_cookies(pycookiecheat, browser, cf, errors)
+        ok, probe = facade.identity(cookies) if cookies else (False, {"reason": "no_session"})
+        reaches = bool(ok and facade.reaches(probe))
+        entry = {"profile": name, "reaches_publication": reaches,
+                 "logged_in_as": (probe or {}).get("handle") if ok else None}
+        if meta.get(name, {}).get("name"):
+            entry["name"] = meta[name]["name"]
+        if meta.get(name, {}).get("email"):
+            entry["email"] = meta[name]["email"]
+        if act_as:
+            entry["matches_act_as"] = bool(reaches and identity_matches(probe, act_as))
+        scanned.append(entry)
+        if reaches and identity_matches(probe, act_as):
+            hits.setdefault((probe or {}).get("handle") or name, []).append((name, cf, cookies, probe))
+    return scanned, hits, errors
+
+
+def tool_bind_client(args, facade):
+    slug, rec = facade.slug, facade.record
+    browser = (args.get("browser") or "chrome").lower()
+    chosen = [k for k in ("profile", "user_data_dir", "cookie_file") if args.get(k)]
+    if len(chosen) > 1:
+        raise ValueError("pass only one of profile, user_data_dir, cookie_file")
+    current_pin = (rec.get("act_as") or "").strip()
+    target = facade.subdomain()
+    if not target:
+        raise ClientError("client %r has no https://<name>.substack.com publication_url" % slug)
+
+    if chosen:
+        kind = chosen[0]
+        if kind == "profile":
+            prof = resolve_profile_selector(args["profile"], browser)
+            source = {"type": "profile", "browser": browser, "profile": prof["dir"]}
+        elif kind == "user_data_dir":
+            source = {"type": "user_data_dir", "browser": browser,
+                      "path": os.path.expanduser(args["user_data_dir"]).rstrip("/")}
+        else:
+            source = {"type": "cookie_file", "browser": browser,
+                      "path": os.path.expanduser(args["cookie_file"])}
+        cookies, cf = facade.read_source(source)
+        ok, probe = facade.identity(cookies)
+        if not ok:
+            raise ClientError("the session in %s is invalid or expired (%s); log in to Substack there first"
+                              % (describe_source(source), probe.get("reason")))
+        if not facade.reaches(probe):
+            raise ClientError(
+                "the login in %s (%s) has no access to publication %r (reaches: %s); log in as a "
+                "user of that publication" % (describe_source(source), probe.get("handle"), target,
+                                              accessible_publications(probe)))
+        scanned = None
+    else:
+        scanned, hits, errors = _scan_profiles(facade, browser, None)
+        if not hits:
+            raise ClientError(
+                "no %s profile holds a Substack login that reaches %r. Checked: %s. Log in to that "
+                "publication's account in one of the browser's profiles, pass profile:, or bind a "
+                "dedicated browser with user_data_dir:. Read errors: %s"
+                % (browser, target, scanned, " | ".join(errors)[:300]))
+        if len(hits) > 1:
+            raise ClientError(
+                "%d Substack logins reach %r; refusing to guess between accounts, nothing was stored. "
+                "Candidates: %s. Re-run bind_client with profile: \"<name>\"."
+                % (len(hits), target, [{"profile": n, "logged_in_as": (p or {}).get("handle"),
+                                         "name": next((e.get("name", "") for e in scanned if e["profile"] == n), "")}
+                                        for hs in hits.values() for n, cf, c, p in hs]))
+        only = next(iter(hits.values()))
+        name, cf, cookies, probe = next((h for h in only if h[0] == "Default"), only[0])
+        source = {"type": "profile", "browser": browser, "profile": name}
+
+    handle = probe.get("handle")
+    if current_pin and not identity_matches(probe, current_pin):
+        if not args.get("confirm_switch"):
+            raise ClientError(
+                "client %r is pinned to act_as=%r but %s is logged in as %r; re-run bind_client with "
+                "confirm_switch: true to SWITCH the pinned identity (only on the user's explicit ask)"
+                % (slug, current_pin, describe_source(source), handle))
+        switched = {"from": current_pin, "to": handle}
+    else:
+        switched = None
+    facade.persist(cookies, probe, cf, cookie_source=source, act_as=handle,
+                   bound_at=datetime.now(timezone.utc).isoformat(timespec="seconds"))
+    result = {
+        "client": slug, "publication": target, "cookie_source": describe_source(source),
+        "act_as": handle, "logged_in_as": handle, "session": "valid",
+        "auth_cookies_saved": sorted(k for k in cookies if k.startswith("substack.") or k == "cf_clearance"),
+        "cookies_stored": len(cookies),
+    }
+    if switched:
+        result["act_as_changed"] = switched
+    if scanned is not None:
+        result["profiles_scanned"] = scanned
     return text_result(result)
 
 
-def tool_list_profiles(args):
-    """Names/emails from the browser's plaintext profile cache — reads no cookie
-    data and triggers no Keychain prompt."""
-    browser = (args.get("browser") or "chrome").lower()
-    root = args.get("root")
-    if root:
-        root = os.path.expanduser(root)
-    path = local_state_path(browser, root)
-    if not path or not os.path.isfile(path):
-        raise RuntimeError(
-            'no "Local State" file at %s — is %s installed? For a dedicated '
-            "--user-data-dir browser pass root=<user-data-dir>."
-            % (path or "(unknown browser %r)" % browser, browser)
-        )
-    profiles = local_state_profiles(browser, root)
+def tool_refresh_session(args, facade):
+    slug, rec = facade.slug, facade.record
+    source = rec.get("cookie_source")
+    act_as = (rec.get("act_as") or "").strip()
+    if not source or not act_as:
+        raise ClientError("client %r is unbound; run bind_client first" % slug)
+    cookies, cf = facade.read_source(source)
+    ok, probe = facade.identity(cookies)
+    if not ok:
+        raise ClientError(
+            "the session in %s is invalid or expired (%s); log in to Substack in that browser, "
+            "then refresh_session again" % (describe_source(source), probe.get("reason")))
+    if not facade.reaches(probe):
+        raise ClientError(
+            "the login in %s (%s) no longer reaches %r (reaches: %s)"
+            % (describe_source(source), probe.get("handle"), facade.subdomain(), accessible_publications(probe)))
+    if not identity_matches(probe, act_as):
+        raise ClientError(
+            "%s is now logged in as %r, not the pinned act_as=%r; nothing stored. Log back in as the "
+            "pinned account, or bind_client with confirm_switch to re-pin deliberately"
+            % (describe_source(source), probe.get("handle"), act_as))
+    facade.persist(cookies, probe, cf)
     return text_result({
-        "browser": browser,
-        "root": os.path.dirname(path),
-        "profiles": profiles,
-        "count": len(profiles),
-        "note": ("names/emails from the browser's plaintext profile cache — "
-                 "no cookies were read"),
+        "client": slug, "publication": facade.subdomain(), "act_as": act_as,
+        "logged_in_as": probe.get("handle"), "session": "valid",
+        "cookie_source": describe_source(source),
+        "auth_cookies_saved": sorted(k for k in cookies if k.startswith("substack.") or k == "cf_clearance"),
+        "cookies_stored": len(cookies),
     })
 
 
-def tool_get_publication_settings(_args):
-    return text_result(publication_capabilities(get_api()))
+# ---------------------------------------------------------------- publication tools
 
 
-def tool_create_draft(args):
+def tool_get_publication_settings(_args, api, ctx):
+    return text_result(publication_capabilities(api), ctx)
+
+
+def tool_create_draft(args, api, ctx):
+    pub_url = ctx["publication"]
     title = (args.get("title") or "").strip()
     body = args.get("body_markdown") or ""
     slug = validate_slug((args.get("slug") or "").strip())
     if not title or not body:
         raise ValueError("title and body_markdown are required")
-    api = get_api()
     caps = publication_capabilities(api)
     audience = args.get("audience") or "everyone"
-    # ALWAYS explicit: python-substack copies `audience` into this when it is None,
-    # which would silently restrict comments on a paid-audience post.
     comments = args.get("comment_permissions") or "everyone"
     validate_settings(audience, comments, caps)
-
     section_id = args.get("section_id")
     if section_id not in (None, ""):
         known = {str(s.get("id")) for s in caps.get("sections") or []}
         if known and str(section_id) not in known:
-            raise ValueError(
-                "section_id %r is not one of this publication's sections %s"
-                % (section_id, sorted(known))
-            )
-
+            raise ValueError("section_id %r is not one of this publication's sections %s"
+                             % (section_id, sorted(known)))
     tag_plan = resolve_tags(api, args.get("tags"), caps)
     if tag_plan["new"] and not args.get("allow_new_tags"):
         raise ValueError(
-            "these tags do not exist on the publication and would be created permanently: "
-            "%s (existing: %s). Confirm with the user, then retry with allow_new_tags=true "
-            "or reuse existing tags." % (tag_plan["new"], tag_plan["existing"])
-        )
-
+            "these tags do not exist on the publication and would be created permanently: %s "
+            "(existing: %s). Confirm with the user, then retry with allow_new_tags=true or reuse "
+            "existing tags." % (tag_plan["new"], tag_plan["existing"]))
     subtitle = (args.get("subtitle") or "").strip()
     out = api.create_draft_from_markdown(
-        title=title,
-        markdown=body,
-        subtitle=subtitle,
-        slug=slug,
-        audience=audience,
+        title=title, markdown=body, subtitle=subtitle, slug=slug, audience=audience,
         write_comment_permissions=comments,
         search_engine_title=args.get("seo_title") or title,
         search_engine_description=args.get("seo_description") or subtitle or None,
         draft_section_id=section_id if section_id not in (None, "") else None,
-        tags=None,  # applied below so new-tag creation stays opt-in
+        tags=None,
     )
     draft = out["draft"]
     draft_id = draft.get("id")
-
-    # should_send_email isn't a create parameter — set it via put_draft.
     send_email = args.get("send_email", True)
     if send_email is not True:
         api.put_draft(draft_id, should_send_email=bool(send_email))
     if tag_plan["normalized"]:
         api.add_tags_to_post(draft_id, tag_plan["normalized"])
-
-    # Report what Substack STORED, not what we asked for.
     draft = api.get_draft(draft_id)
-    summary = draft_summary(draft)
+    summary = draft_summary(draft, pub_url)
     if tag_plan["normalized"]:
         attached = read_post_tags(api, draft_id)
         summary["tags"] = attached["names"]
@@ -1612,92 +1361,60 @@ def tool_create_draft(args):
         missing = [t for t in tag_plan["normalized"] if t not in attached["names"]]
         if missing:
             summary["tags_not_attached"] = missing
-    requested = {
-        "audience": audience,
-        "comment_permissions": comments,
-        "send_email": bool(send_email),
-    }
-    drift = {
-        k: {"requested": v, "stored": summary.get(k)}
-        for k, v in requested.items()
-        if summary.get(k) is not None and summary.get(k) != v
-    }
+    requested = {"audience": audience, "comment_permissions": comments, "send_email": bool(send_email)}
+    drift = {k: {"requested": v, "stored": summary.get(k)}
+             for k, v in requested.items() if summary.get(k) is not None and summary.get(k) != v}
     if drift:
         summary["settings_drift"] = drift
-        summary["settings_drift_note"] = (
-            "Substack stored different values than requested — report the STORED ones"
-        )
+        summary["settings_drift_note"] = "Substack stored different values than requested; report the STORED ones"
     got = summary.get("slug")
     if got and got != slug:
-        summary["warning"] = (
-            "requested slug %r but Substack stored %r (taken or normalized) — the post_url "
-            "above reflects what was STORED; update social copy accordingly or set_slug again"
-            % (slug, got)
-        )
+        summary["warning"] = ("requested slug %r but Substack stored %r (taken or normalized); the "
+                              "post_url above reflects what was STORED" % (slug, got))
     elif not got:
-        summary["warning"] = (
-            "the draft was created but the response did not confirm slug %r — verify with "
-            "get_draft (or re-apply via set_slug) before using any post URL in social copy"
-            % slug
-        )
-    return text_result(summary)
+        summary["warning"] = ("the draft was created but the response did not confirm slug %r; verify "
+                              "with get_draft before using any post URL in social copy" % slug)
+    return text_result(summary, ctx)
 
 
-def tool_set_slug(args):
+def tool_set_slug(args, api, ctx):
     slug = validate_slug((args.get("slug") or "").strip())
-    api = get_api()
     draft = api.put_draft(args["draft_id"], slug=slug)
-    summary = draft_summary(draft)
+    summary = draft_summary(draft, ctx["publication"])
     if summary.get("slug") != slug:
         summary["warning"] = "Substack stored slug %r, not %r" % (summary.get("slug"), slug)
-    return text_result(summary)
+    return text_result(summary, ctx)
 
 
-def tool_update_post_settings(args):
-    api = get_api()
+def tool_update_post_settings(args, api, ctx):
     draft_id = args["draft_id"]
     caps = publication_capabilities(api)
     current = api.get_draft(draft_id)
     audience = args.get("audience") or current.get("audience") or "everyone"
-    comments = (
-        args.get("comment_permissions")
-        or current.get("write_comment_permissions")
-        or "everyone"
-    )
+    comments = args.get("comment_permissions") or current.get("write_comment_permissions") or "everyone"
     validate_settings(audience, comments, caps)
-
     payload = {"audience": audience, "write_comment_permissions": comments}
-    for arg, field in (
-        ("send_email", "should_send_email"),
-        ("send_free_preview", "should_send_free_preview"),
-        ("seo_title", "search_engine_title"),
-        ("seo_description", "search_engine_description"),
-        ("title", "draft_title"),
-        ("subtitle", "draft_subtitle"),
-    ):
+    for arg, field in (("send_email", "should_send_email"), ("send_free_preview", "should_send_free_preview"),
+                       ("seo_title", "search_engine_title"), ("seo_description", "search_engine_description"),
+                       ("title", "draft_title"), ("subtitle", "draft_subtitle")):
         if arg in args and args[arg] is not None:
             payload[field] = args[arg]
     if "section_id" in args:
         payload["draft_section_id"] = args["section_id"] or None
     api.put_draft(draft_id, **payload)
-    return text_result(draft_summary(api.get_draft(draft_id)))
+    return text_result(draft_summary(api.get_draft(draft_id), ctx["publication"]), ctx)
 
 
-def tool_apply_tags(args):
-    api = get_api()
+def tool_apply_tags(args, api, ctx):
     draft_id = args["draft_id"]
     plan = resolve_tags(api, args.get("tags"), publication_capabilities(api))
     if not plan["normalized"]:
         raise ValueError("no usable tags after normalization")
     if plan["new"] and not args.get("allow_new"):
-        raise ValueError(
-            "these tags would be CREATED on the publication permanently: %s (existing: %s). "
-            "Confirm with the user, then retry with allow_new=true."
-            % (plan["new"], plan["existing"])
-        )
+        raise ValueError("these tags would be CREATED on the publication permanently: %s (existing: %s). "
+                         "Confirm with the user, then retry with allow_new=true." % (plan["new"], plan["existing"]))
     api.add_tags_to_post(draft_id, plan["normalized"])
-    summary = draft_summary(api.get_draft(draft_id))
-    # Report the attachments Substack stored, not the list we just sent.
+    summary = draft_summary(api.get_draft(draft_id), ctx["publication"])
     attached = read_post_tags(api, draft_id)
     summary["tags"] = attached["names"]
     summary["tags_requested"] = plan["normalized"]
@@ -1706,71 +1423,49 @@ def tool_apply_tags(args):
     missing = [t for t in plan["normalized"] if t not in attached["names"]]
     if missing:
         summary["tags_not_attached"] = missing
-        summary["warning"] = (
-            "these tags were requested but are not attached according to the server: %s"
-            % missing
-        )
-    return text_result(summary)
+        summary["warning"] = "these tags were requested but are not attached according to the server: %s" % missing
+    return text_result(summary, ctx)
 
 
-def tool_schedule_draft(args):
+def tool_schedule_draft(args, api, ctx):
     dt = parse_iso_aware(args.get("datetime_iso"))
     if dt <= datetime.now(timezone.utc):
-        raise ValueError(
-            "datetime_iso %s is in the past (now %s UTC)"
-            % (args.get("datetime_iso"), datetime.now(timezone.utc).isoformat(timespec="seconds"))
-        )
-    api = get_api()
+        raise ValueError("datetime_iso %s is in the past (now %s UTC)"
+                         % (args.get("datetime_iso"), datetime.now(timezone.utc).isoformat(timespec="seconds")))
     draft_id = args["draft_id"]
     before = api.get_draft(draft_id)
     if before.get("is_published"):
-        raise ValueError("draft %s is already published — cannot schedule it" % draft_id)
-    # Scheduling is a time-triggered public action, and the email cannot be unsent.
+        raise ValueError("draft %s is already published; cannot schedule it" % draft_id)
     if before.get("should_send_email") and not args.get("confirm_send_email"):
         raise ValueError(
-            "this post is set to EMAIL SUBSCRIBERS when it publishes, which cannot be "
-            "undone. Show the user the settings summary (audience=%r, comments=%r, "
-            "send_email=True, publish at %s) and get an explicit yes, then retry with "
-            "confirm_send_email=true — or call update_post_settings(send_email=false) first."
-            % (
-                before.get("audience"),
-                before.get("write_comment_permissions"),
-                dt.isoformat(),
-            )
-        )
+            "this post is set to EMAIL SUBSCRIBERS when it publishes, which cannot be undone. Show the "
+            "user the settings summary (audience=%r, comments=%r, send_email=True, publish at %s) and "
+            "get an explicit yes, then retry with confirm_send_email=true, or call "
+            "update_post_settings(send_email=false) first."
+            % (before.get("audience"), before.get("write_comment_permissions"), dt.isoformat()))
     api.schedule_draft(draft_id, dt)
-    # Read the schedule back from the server — postSchedules is the only place it
-    # lives, and echoing the request would defeat the point of verifying.
-    summary = draft_summary(api.get_draft(draft_id))
+    summary = draft_summary(api.get_draft(draft_id), ctx["publication"])
     stored = summary.get("scheduled_for")
     summary["requested_for"] = dt.isoformat()
     summary["utc_equivalent"] = dt.astimezone(timezone.utc).isoformat(timespec="seconds")
     if not stored:
-        summary["warning"] = (
-            "Substack did not report a schedule after the call — verify in the editor "
-            "(%s) before relying on it" % summary.get("editor_url")
-        )
+        summary["warning"] = ("Substack did not report a schedule after the call; verify in the editor "
+                              "(%s) before relying on it" % summary.get("editor_url"))
     elif parse_iso_aware(stored) != dt:
-        summary["warning"] = (
-            "stored schedule %s differs from the requested %s — the STORED value is what "
-            "will fire" % (stored, dt.isoformat())
-        )
+        summary["warning"] = ("stored schedule %s differs from the requested %s; the STORED value is what "
+                              "will fire" % (stored, dt.isoformat()))
     summary["undo"] = "call unschedule_draft to cancel while it is still pending"
-    return text_result(summary)
+    return text_result(summary, ctx)
 
 
-def tool_unschedule_draft(args):
-    api = get_api()
+def tool_unschedule_draft(args, api, ctx):
     api.unschedule_draft(args["draft_id"])
-    return text_result(draft_summary(api.get_draft(args["draft_id"])))
+    return text_result(draft_summary(api.get_draft(args["draft_id"]), ctx["publication"]), ctx)
 
 
-def tool_get_draft(args):
-    api = get_api()
+def tool_get_draft(args, api, ctx):
     draft_id = args["draft_id"]
-    summary = draft_summary(api.get_draft(draft_id))
-    # Tags live only in the association endpoint, so read them here (one extra
-    # call). list_drafts deliberately skips this to avoid N+1 requests.
+    summary = draft_summary(api.get_draft(draft_id), ctx["publication"])
     try:
         attached = read_post_tags(api, draft_id)
         summary["tags"] = attached["names"]
@@ -1778,59 +1473,45 @@ def tool_get_draft(args):
             summary["tags_note"] = attached["note"]
     except Exception as e:  # noqa: BLE001
         summary["tags_note"] = "could not read attached tags: %s" % str(e)[:150]
-    return text_result(summary)
+    return text_result(summary, ctx)
 
 
-def tool_list_drafts(args):
-    api = get_api()
-    # Substack rejects limit > 25 with a bare APIError(400): Invalid value.
+def tool_list_drafts(args, api, ctx):
     limit = max(1, min(25, int(args.get("limit") or 10)))
-    # Without filter="draft" the endpoint ALSO returns published posts, so on an
-    # old publication the page fills with years-old articles and real drafts
-    # never surface (operator-reported 2026-08-25; verified live).
-    drafts = unwrap_items(
-        api.get_drafts(filter="draft", limit=limit), "posts", "drafts", "results"
-    )
-    drafts.sort(
-        key=lambda d: (
-            (d.get("draft_updated_at") or d.get("draft_created_at") or "")
-            if isinstance(d, dict) else ""
-        ),
-        reverse=True,
-    )
-    return text_result([draft_summary(d) for d in drafts])
+    drafts = unwrap_items(api.get_drafts(filter="draft", limit=limit), "posts", "drafts", "results")
+    drafts.sort(key=lambda d: ((d.get("draft_updated_at") or d.get("draft_created_at") or "")
+                               if isinstance(d, dict) else ""), reverse=True)
+    return text_result([draft_summary(d, ctx["publication"]) for d in drafts], ctx)
 
 
-def tool_publish_draft(args):
-    api = get_api()
+def tool_publish_draft(args, api, ctx):
     draft_id = args["draft_id"]
     send = bool(args.get("send_email", True))
     if send and not args.get("confirm_send_email"):
-        raise ValueError(
-            "publishing now with send_email=true emails every subscriber and cannot be "
-            "undone. Get an explicit yes from the user, then retry with "
-            "confirm_send_email=true — or pass send_email=false to publish without email."
-        )
+        raise ValueError("publishing now with send_email=true emails every subscriber and cannot be undone. "
+                         "Get an explicit yes from the user, then retry with confirm_send_email=true, or pass "
+                         "send_email=false to publish without email.")
     share = bool(args.get("share_automatically", False))
     api.prepublish_draft(draft_id)
     api.publish_draft(draft_id, send=send, share_automatically=share)
-    summary = draft_summary(api.get_draft(draft_id))
-    summary["published"] = True
-    summary["emailed_subscribers"] = send
-    summary["shared_automatically"] = share
-    return text_result(summary)
+    summary = draft_summary(api.get_draft(draft_id), ctx["publication"])
+    summary.update(published=True, emailed_subscribers=send, shared_automatically=share)
+    return text_result(summary, ctx)
 
 
-def tool_delete_draft(args):
-    api = get_api()
+def tool_delete_draft(args, api, ctx):
     api.delete_draft(args["draft_id"])
-    return text_result({"deleted": True, "draft_id": args["draft_id"]})
+    return text_result({"deleted": True, "draft_id": args["draft_id"]}, ctx)
 
 
 TOOL_HANDLERS = {
-    "substack_status": tool_substack_status,
-    "refresh_cookie": tool_refresh_cookie,
-    "list_profiles": tool_list_profiles,
+    "list_clients": tool_list_clients,
+    "add_client": tool_add_client,
+    "list_browser_profiles": tool_list_browser_profiles,
+    "open_client_browser": tool_open_client_browser,
+    "clients_status": tool_clients_status,
+    "bind_client": tool_bind_client,
+    "refresh_session": tool_refresh_session,
     "get_publication_settings": tool_get_publication_settings,
     "create_draft": tool_create_draft,
     "update_post_settings": tool_update_post_settings,
@@ -1845,6 +1526,30 @@ TOOL_HANDLERS = {
 }
 
 
+def dispatch_tool(name, args):
+    """The one place a handler gets its facade. registry: nothing. probe: a ProbeFacade for the
+    named client (clients_status may run over all). publication: the full client, only after
+    `client` and `expected_publication` passed every check in get_api."""
+    handler = TOOL_HANDLERS.get(name)
+    scope = TOOL_SCOPES.get(name)
+    if handler is None or scope is None:
+        raise ClientError("unknown tool: %s" % name)
+    args = args or {}
+    if scope == "registry":
+        return handler(args)
+    if scope == "probe":
+        if name == "clients_status" and not args.get("client"):
+            return handler(args, None)
+        return handler(args, ProbeFacade(args.get("client")))
+    if not args.get("client"):
+        raise ClientError("`client` is required on every Substack-facing tool; configured clients: %s"
+                          % (", ".join(sorted(load_clients()["clients"])) or "(none)"))
+    if not args.get("expected_publication"):
+        raise ClientError("`expected_publication` is required on %s (the brand's publication.domain)" % name)
+    api, ctx = get_api(args["client"], args["expected_publication"])
+    return handler(args, api, ctx)
+
+
 # ---------------------------------------------------------------- rpc plumbing
 
 
@@ -1852,47 +1557,37 @@ def handle_request(msg):
     req_id = msg.get("id")
     method = msg.get("method")
     params = msg.get("params") or {}
-
     if method == "initialize":
-        client_proto = params.get("protocolVersion") or FALLBACK_PROTOCOL
-        reply(
-            req_id,
-            {
-                "protocolVersion": client_proto,
-                "capabilities": {"tools": {}},
-                "serverInfo": {"name": SERVER_NAME, "version": SERVER_VERSION},
-            },
-        )
+        reply(req_id, {
+            "protocolVersion": params.get("protocolVersion") or FALLBACK_PROTOCOL,
+            "capabilities": {"tools": {}},
+            "serverInfo": {"name": SERVER_NAME, "version": SERVER_VERSION},
+        })
     elif method == "ping":
         reply(req_id, {})
     elif method == "tools/list":
-        reply(req_id, {"tools": TOOLS})
+        reply(req_id, {"tools": PUBLIC_TOOLS})
     elif method == "resources/list":
         reply(req_id, {"resources": []})
     elif method == "prompts/list":
         reply(req_id, {"prompts": []})
     elif method == "tools/call":
         name = params.get("name")
-        handler = TOOL_HANDLERS.get(name)
-        if not handler:
+        if name not in TOOL_HANDLERS:
             reply_error(req_id, -32602, "unknown tool: %s" % name)
             return
         try:
-            reply(req_id, handler(params.get("arguments") or {}))
+            reply(req_id, dispatch_tool(name, params.get("arguments") or {}))
         except Exception as e:  # noqa: BLE001
             log("tool %s error: %s\n%s" % (name, e, traceback.format_exc()))
-            reply(
-                req_id,
-                {"content": [{"type": "text", "text": "ERROR: %s" % e}], "isError": True},
-            )
+            reply(req_id, {"content": [{"type": "text", "text": "ERROR: %s" % e}], "isError": True})
     else:
         if req_id is not None:
             reply_error(req_id, -32601, "method not found: %s" % method)
-        # notifications (initialized, cancelled, ...) are ignored
 
 
-def main():
-    log("%s v%s starting (config=%s)" % (SERVER_NAME, SERVER_VERSION, CONFIG_PATH))
+def serve():
+    log("%s v%s starting (home=%s)" % (SERVER_NAME, SERVER_VERSION, home()))
     workers = []
     for line in sys.stdin:
         line = line.strip()
@@ -1909,11 +1604,294 @@ def main():
             workers.append(t)
         else:
             handle_request(msg)
-    # stdin closed: let in-flight tool calls flush their replies before exiting
     deadline = time.time() + 30
     for t in workers:
         t.join(max(0, deadline - time.time()))
-    log("stdin closed — exiting")
+    log("stdin closed; exiting")
+
+
+# ---------------------------------------------------------------- 0.4 -> 0.5 migration (CLI)
+
+
+def sha256_file(path):
+    h = hashlib.sha256()
+    with open(path, "rb") as f:
+        for chunk in iter(lambda: f.read(65536), b""):
+            h.update(chunk)
+    return h.hexdigest()
+
+
+def is_reserved_path(path):
+    rel = os.path.relpath(os.path.expanduser(path), home())
+    if rel.startswith(".."):
+        return False
+    first = rel.split(os.sep)[0]
+    return first in RESERVED_NAMES or any(first == p or first.startswith(p) for p in RESERVED_DIR_PREFIXES)
+
+
+def is_legacy_config(data):
+    return isinstance(data, dict) and bool(data.get("publication_url")) and "clients" not in data
+
+
+def select_legacy_configs(desktop_config, default_slug):
+    """[(server_entry_name, slug, config_path)] for the v0.4 entries in claude_desktop_config.
+    Selection is by reference (each entry's TIE_SUBSTACK_CONFIG, else <home>/config.json),
+    never by glob; reserved v0.5 paths are never candidates."""
+    servers = (desktop_config or {}).get("mcpServers") or {}
+    out = []
+    for name, entry in servers.items():
+        if name != "tie-substack" and not name.startswith("tie-substack-"):
+            continue
+        if name == "tie-substack-legacy":
+            continue  # the kept-working 0.4 default entry after a partial switch, not a client
+        env = (entry or {}).get("env") or {}
+        if name == "tie-substack" and not env.get("TIE_SUBSTACK_CONFIG") and "TIE_SUBSTACK_HOME" in env:
+            continue  # already a v0.5 entry
+        path = os.path.expanduser(env.get("TIE_SUBSTACK_CONFIG") or os.path.join(home(), "config.json"))
+        if is_reserved_path(path) or not os.path.isfile(path):
+            continue
+        try:
+            data = read_json(path, None)
+        except RuntimeError:
+            continue
+        if not is_legacy_config(data):
+            continue
+        slug = name[len("tie-substack-"):] if name.startswith("tie-substack-") else (
+            os.environ.get("TIE_SUBSTACK_CLIENT") or default_slug)
+        out.append((name, validate_client_slug(slug), path, data, env.get("SUBSTACK_PUBLICATION_URL")))
+    return out
+
+
+def legacy_source_from(cfg):
+    cf = cfg.get("cookie_file")
+    if not cf:
+        return None
+    cf = os.path.expanduser(cf)
+    fam = standard_install_browser(cf)
+    if fam:
+        return {"type": "profile", "browser": fam, "profile": os.path.basename(os.path.dirname(cf))}
+    if os.path.basename(cf) == "Cookies" and os.path.basename(os.path.dirname(cf)) == "Default":
+        return {"type": "user_data_dir", "browser": "chrome", "path": os.path.dirname(os.path.dirname(cf))}
+    return {"type": "cookie_file", "browser": "chrome", "path": cf}
+
+
+def write_backup_original(desktop_config_path, legacy_paths, installed_server):
+    """The write-once pre-migration snapshot (backup-original/ + MANIFEST.json)."""
+    dest = os.path.join(home(), "backup-original")
+    if os.path.isdir(dest):
+        return {"backup_original": dest, "written": False}
+    os.makedirs(dest, mode=0o700)
+    files = {}
+    for src in [desktop_config_path] + list(legacy_paths) + ([installed_server] if installed_server else []):
+        if src and os.path.isfile(src):
+            name = os.path.basename(src)
+            if name in files:
+                name = "%s__%s" % (hashlib.sha256(src.encode()).hexdigest()[:8], name)
+            shutil.copy2(src, os.path.join(dest, name))
+            files[name] = {"source": src, "sha256": sha256_file(src)}
+    write_private_json(os.path.join(dest, "MANIFEST.json"), {
+        "written_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+        "source_version": "0.4.x", "files": files,
+    })
+    return {"backup_original": dest, "written": True}
+
+
+def write_run_backup(desktop_config_path, legacy_paths):
+    stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+    dest = os.path.join(home(), "backup-%s" % stamp)
+    os.makedirs(dest, mode=0o700, exist_ok=True)
+    files = {}
+    for src in [desktop_config_path] + list(legacy_paths):
+        if src and os.path.isfile(src):
+            name = os.path.basename(src)
+            if name in files:
+                name = "%s__%s" % (hashlib.sha256(src.encode()).hexdigest()[:8], name)
+            shutil.copy2(src, os.path.join(dest, name))
+            files[name] = {"source": src, "sha256": sha256_file(src)}
+    write_private_json(os.path.join(dest, "MANIFEST.json"), {
+        "written_at": datetime.now(timezone.utc).isoformat(timespec="seconds"), "files": files})
+    return dest
+
+
+def migrate_import(desktop_config_path, default_slug="tie", installed_server=None):
+    """Steps 1-3 of the migration: select legacy configs by reference, back up (original once,
+    plus per run), import idempotently into clients.json + sessions/ with a journal."""
+    desktop = read_json(desktop_config_path, {}) if desktop_config_path else {}
+    selected = select_legacy_configs(desktop, default_slug)
+    legacy_paths = [p for _, _, p, _, _ in selected]
+    journal = read_json(journal_path(), {"imports": {}})
+    pre_migration = not any(
+        n == "tie-substack" and "TIE_SUBSTACK_HOME" in ((e or {}).get("env") or {})
+        for n, e in ((desktop.get("mcpServers") or {}).items())
+    ) and not journal["imports"]
+    report = {"selected": [{"entry": n, "slug": s, "config": p} for n, s, p, _, _ in selected],
+              "imported": [], "skipped": [], "conflicts": [], "legacy_server": None}
+    if pre_migration and selected:
+        report.update(write_backup_original(desktop_config_path, legacy_paths, installed_server))
+    elif not os.path.isdir(os.path.join(home(), "backup-original")):
+        report["warning"] = ("no backup-original snapshot exists and this is not a pre-migration state; "
+                             "rollback can only restore the latest per-run backup")
+    report["run_backup"] = write_run_backup(desktop_config_path, legacy_paths)
+    if installed_server and os.path.isfile(installed_server):
+        legacy_dir = os.path.join(home(), "legacy")
+        os.makedirs(legacy_dir, mode=0o700, exist_ok=True)
+        dest = os.path.join(legacy_dir, "server.py")
+        if not os.path.isfile(dest):
+            shutil.copy2(installed_server, dest)
+        report["legacy_server"] = dest
+    clients = load_clients()
+    now = datetime.now(timezone.utc).isoformat(timespec="seconds")
+    for entry, slug, path, cfg, env_pub in selected:
+        digest = sha256_file(path)
+        prior = journal["imports"].get(path)
+        if prior and prior.get("sha256") == digest and prior.get("result") == "imported":
+            report["skipped"].append({"slug": slug, "config": path, "reason": "already imported, unchanged"})
+            continue
+        rec = clients["clients"].get(slug)
+        if prior and rec and (rec.get("bound_at") or "") > (prior.get("at") or ""):
+            report["conflicts"].append({
+                "slug": slug, "config": path,
+                "reason": "the source changed since import, but the registry record was rebound later "
+                          "(bind_client); the registry is kept"})
+            journal["imports"][path] = {"sha256": digest, "slug": slug, "result": "conflict", "at": now}
+            continue
+        pub = normalize_publication_url(env_pub or cfg.get("publication_url"))
+        source = legacy_source_from(cfg)
+        clients["clients"][slug] = {
+            "publication_url": pub, "cookie_source": source,
+            "act_as": (cfg.get("act_as") or "").strip() or None,
+            "added_at": (rec or {}).get("added_at") or now,
+            "bound_at": (rec or {}).get("bound_at") or (now if cfg.get("act_as") else None),
+            "migrated_from": path,
+        }
+        cookies = cfg.get("cookies") or {}
+        if cookies.get("substack.sid"):
+            save_session(slug, cookies, {"handle": cfg.get("act_as")}, os.path.expanduser(cfg.get("cookie_file") or "") or None)
+        journal["imports"][path] = {"sha256": digest, "slug": slug, "result": "imported", "at": now}
+        report["imported"].append({"slug": slug, "config": path, "publication": canonical_host(pub),
+                                   "cookie_source": describe_source(source),
+                                   "act_as": clients["clients"][slug]["act_as"],
+                                   "session": bool(cookies.get("substack.sid"))})
+    save_clients(clients)
+    write_private_json(journal_path(), journal)
+    return report
+
+
+def check_clients_report():
+    """Step 4: a per-client table (live network probes), no cookie values."""
+    rows = [_status_for(s) for s in sorted(load_clients()["clients"])]
+    return {"clients": rows, "all_ready": bool(rows) and all(r.get("ready") for r in rows)}
+
+
+def switch_entries(desktop_config_path, command, server, failed=(), legacy_server=None):
+    """Step 5: add the single `tie-substack` v0.5 entry; remove the per-client entries only
+    when every client verified, else keep them working on legacy/server.py."""
+    desktop = read_json(desktop_config_path, {})
+    servers = desktop.setdefault("mcpServers", {})
+    old = {n: e for n, e in list(servers.items())
+           if (n == "tie-substack" or n.startswith("tie-substack-"))
+           and "TIE_SUBSTACK_HOME" not in ((e or {}).get("env") or {})}
+    kept = []
+    for name, entry in old.items():
+        servers.pop(name, None)
+        if failed:
+            # Every 0.4 entry keeps working on the legacy server, under a name that cannot
+            # collide with the new single entry; the per-client env overrides stay intact.
+            entry = dict(entry or {})
+            if legacy_server:
+                entry["args"] = [legacy_server]
+            new_name = "tie-substack-legacy" if name == "tie-substack" else name
+            servers[new_name] = entry
+            kept.append(new_name)
+    servers["tie-substack"] = {"command": command, "args": [server], "env": {"TIE_SUBSTACK_HOME": home()}}
+    write_json_plain(desktop_config_path, desktop)
+    return {"switched": not failed, "kept_legacy_entries": kept, "failed": list(failed)}
+
+
+def write_json_plain(path, data):
+    os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+    tmp = path + ".tmp"
+    with open(tmp, "w") as f:
+        json.dump(data, f, indent=2)
+    os.replace(tmp, path)
+
+
+def rollback(desktop_config_path, last=False):
+    """Restore backup-original/ (the pure pre-migration state; manifest hashes verified) or,
+    with last=True, the latest per-run backup. clients.json, sessions/ and the journal stay."""
+    if last:
+        runs = sorted(
+            d for d in (os.listdir(home()) if os.path.isdir(home()) else [])
+            if d.startswith("backup-") and d != "backup-original"
+            and os.path.isfile(os.path.join(home(), d, "MANIFEST.json")))
+        if not runs:
+            raise RuntimeError("no per-run backup to restore")
+        src_dir = os.path.join(home(), runs[-1])
+    else:
+        src_dir = os.path.join(home(), "backup-original")
+        if not os.path.isdir(src_dir):
+            raise RuntimeError("no backup-original snapshot; use --last to restore the latest per-run backup")
+    manifest = read_json(os.path.join(src_dir, "MANIFEST.json"), None)
+    if not manifest or not isinstance(manifest.get("files"), dict):
+        raise RuntimeError("%s has no readable MANIFEST.json; refusing to restore" % src_dir)
+    for name, meta in manifest["files"].items():
+        p = os.path.join(src_dir, name)
+        if not os.path.isfile(p) or sha256_file(p) != meta.get("sha256"):
+            raise RuntimeError("snapshot file %s is missing or its hash differs from the manifest; refusing to "
+                               "restore a corrupted snapshot" % name)
+    restored = []
+    for name, meta in manifest["files"].items():
+        dest = meta["source"]
+        os.makedirs(os.path.dirname(dest) or ".", exist_ok=True)
+        shutil.copy2(os.path.join(src_dir, name), dest)
+        restored.append(dest)
+    return {"restored_from": src_dir, "restored": restored,
+            "note": "clients.json, sessions/ and migration.json are left in place (inert without the "
+                    "v0.5 server entry), so a later retry resumes from them"}
+
+
+def cli(argv):
+    import argparse  # noqa: PLC0415
+
+    ap = argparse.ArgumentParser(prog="server.py", description="tie-substack MCP server and migration CLI")
+    sub = ap.add_subparsers(dest="cmd")
+    m = sub.add_parser("migrate")
+    m.add_argument("--desktop-config", required=True)
+    m.add_argument("--default-slug", default="tie")
+    m.add_argument("--installed-server")
+    sub.add_parser("check-clients")
+    s = sub.add_parser("switch")
+    s.add_argument("--desktop-config", required=True)
+    s.add_argument("--command", required=True)
+    s.add_argument("--server", required=True)
+    s.add_argument("--failed", default="")
+    s.add_argument("--legacy-server")
+    r = sub.add_parser("rollback")
+    r.add_argument("--desktop-config", required=True)
+    r.add_argument("--last", action="store_true")
+    args = ap.parse_args(argv)
+    if args.cmd == "migrate":
+        out = migrate_import(args.desktop_config, args.default_slug, args.installed_server)
+    elif args.cmd == "check-clients":
+        out = check_clients_report()
+    elif args.cmd == "switch":
+        failed = [f for f in args.failed.split(",") if f]
+        out = switch_entries(args.desktop_config, args.command, args.server, failed, args.legacy_server)
+    elif args.cmd == "rollback":
+        out = rollback(args.desktop_config, args.last)
+    else:
+        ap.print_help()
+        return 2
+    print(json.dumps(out, indent=2))
+    if args.cmd == "check-clients":
+        return 0 if out["all_ready"] else 1
+    return 0
+
+
+def main():
+    if len(sys.argv) > 1:
+        sys.exit(cli(sys.argv[1:]))
+    serve()
 
 
 if __name__ == "__main__":
