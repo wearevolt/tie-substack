@@ -124,10 +124,12 @@ payload only); attached tags come from `GET post/<id>/tag`.
 
 1. **Selects the 0.4 configs by reference, not by glob**: the file each `tie-substack*` entry
    in `claude_desktop_config.json` points at (`TIE_SUBSTACK_CONFIG`), or `~/.tie-substack/config.json`
-   for the default entry. A file joins only if it parses as a 0.4 config; reserved 0.5 paths
-   (`clients.json`, `sessions/`, `backup-*/`, `migration.json`, `legacy/`) never do. The slug
+   for the default entry. The publication comes from `SUBSTACK_PUBLICATION_URL` in the entry's
+   env (the 0.4 server accepted that alone) or `publication_url` in the file; reserved 0.5 paths
+   (`clients.json`, `sessions/`, `backup-*/`, `migration.json`, `legacy/`) never join. The slug
    comes from the entry name (`tie-substack-<client>`); the default entry maps to
-   `TIE_SUBSTACK_DEFAULT_SLUG` (default `tie`).
+   `TIE_SUBSTACK_DEFAULT_SLUG` (default `tie`). An entry whose publication cannot be determined
+   is reported as *not imported* and left untouched.
 2. **Backs up**: `~/.tie-substack/backup-original/` (written once, on the first truly
    pre-migration run, with a `MANIFEST.json` of sha256 hashes: the desktop config, the
    selected configs, the 0.4 `server.py`), a per-run `backup-<timestamp>/`, and the 0.4
@@ -138,8 +140,9 @@ payload only); attached tags come from `GET post/<id>/tag`.
    registry record was rebound since (then the registry is kept and the conflict reported).
 4. **Verifies** with `server.py check-clients` (live): session valid, publication resolves,
    identity matches.
-5. **Switches only on full success**: the single `tie-substack` entry is added and the
-   per-client entries removed. If any client fails, the old entries keep working on
+5. **Switches per verified client**: the single `tie-substack` entry is added; a 0.4 entry is
+   removed only when its client was imported and verified ready. Every other 0.4 entry (a
+   client that is not ready, or an entry that could not be imported) keeps working on
    `legacy/server.py` (the old default entry as `tie-substack-legacy`), the new entry sits
    beside them, and the installer names the fix (usually `bind_client`). Re-running repeats
    steps 1–5; already-imported sources are skipped.

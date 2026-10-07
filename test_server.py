@@ -267,6 +267,92 @@ srv.reset_api()
 raises("source still stale -> actionable error", lambda: srv.dispatch_tool("get_draft", {
     "client": "alpha", "expected_publication": "alpha.substack.com", "draft_id": 1}), srv.ClientError, ["refresh_session"])
 
+print("401/403 during a tool call: refresh once, re-run a read, name the fix for a multi-step writer")
+DEAD_SIDS = set()
+
+
+class Refused(Exception):
+    """SubstackAPIException shape: python-substack raises (status_code, text)."""
+
+    def __init__(self, code):
+        super().__init__("APIError(code=%d): refused" % code)
+        self.status_code = code
+
+
+class SessionAwareApi(FakeApi):
+    """Answers 401/403 once the session it wraps has died server-side (DEAD_SIDS)."""
+
+    def _sid(self):
+        return self.cookies_string.split("=", 1)[-1]
+
+    def get_draft(self, i):
+        if self._sid() in DEAD_SIDS:
+            self.calls.append(("get_draft", i))
+            raise Refused(401)
+        return super().get_draft(i)
+
+    def create_draft_from_markdown(self, **kw):
+        if self._sid() in DEAD_SIDS:
+            raise Refused(403)
+        return super().create_draft_from_markdown(**kw)
+
+
+_by_sid_backup = dict(BY_SID)
+fake_sub.Api = SessionAwareApi
+reset_home()
+srv.dispatch_tool("add_client", {"client": "alpha", "publication_url": "alpha.substack.com"})
+srv.update_client("alpha", act_as="alpha-owner", cookie_source={"type": "user_data_dir", "browser": "chrome", "path": ded},
+                  bound_at="2026-10-06T10:00:00+00:00")
+srv.save_session("alpha", {"substack.sid": "sid-alpha"}, {"handle": "alpha-owner"})
+SOURCE_COOKIES[os.path.join(ded, "Default", "Cookies")] = {"substack.sid": "sid-alpha-2"}
+payload(srv.dispatch_tool("get_draft", {"client": "alpha", "expected_publication": "alpha.substack.com", "draft_id": 1}))
+# the validated, cached session dies server-side within the validation TTL
+DEAD_SIDS.add("sid-alpha")
+BY_SID["sid-alpha"] = (False, {"reason": "session_invalid", "status": 401})
+NET_CALLS.clear()
+FakeApi.instances.clear()
+out = payload(srv.dispatch_tool("get_draft", {"client": "alpha", "expected_publication": "alpha.substack.com", "draft_id": 1}))
+check("401 mid-call: session re-read from the bound source, the read re-run", out["logged_in_as"], "alpha-owner")
+check("the re-run used an Api on the fresh session", FakeApi.instances[-1].cookies_string, "substack.sid=sid-alpha-2")
+check("the fresh session was stored", srv.load_session("alpha")["cookies"]["substack.sid"], "sid-alpha-2")
+check("two probes: the dead session, then the fresh one", NET_CALLS.count("probe"), 2)
+# a multi-step writer is refreshed but not re-run; the error names the fix
+DEAD_SIDS.add("sid-alpha-2")
+BY_SID["sid-alpha-2"] = (False, {"reason": "session_invalid", "status": 401})
+BY_SID["sid-alpha-3"] = (True, {"handle": "alpha-owner", "email": "a@x.com", "subdomains": ["alpha"], "primary": "alpha"})
+SOURCE_COOKIES[os.path.join(ded, "Default", "Cookies")] = {"substack.sid": "sid-alpha-3"}
+raises("403 during create_draft: refreshed, not re-run, fix named",
+       lambda: srv.dispatch_tool("create_draft", {"client": "alpha", "expected_publication": "alpha.substack.com",
+                                                  "title": "T", "body_markdown": "b", "slug": "t"}),
+       srv.ClientError, ["HTTP 403", "create_draft", "run it again"])
+check("the session was refreshed anyway", srv.load_session("alpha")["cookies"]["substack.sid"], "sid-alpha-3")
+# the refresh itself failing gives the usual actionable error, and the handler is not re-run
+DEAD_SIDS.add("sid-alpha-3")
+BY_SID["sid-alpha-3"] = (False, {"reason": "session_invalid", "status": 401})
+FakeApi.instances.clear()
+raises("401 and the bound source still dead -> refresh_session named",
+       lambda: srv.dispatch_tool("get_draft", {"client": "alpha", "expected_publication": "alpha.substack.com", "draft_id": 1}),
+       srv.ClientError, ["refresh_session"])
+check("no Api built on a failed refresh", len(FakeApi.instances), 0)
+# what counts as an auth error
+check("SubstackAPIException-shaped 401/403/404", tuple(srv.auth_error_status(Refused(c)) for c in (401, 403, 404)), (401, 403, None))
+
+
+class HttpErr(Exception):
+    response = types.SimpleNamespace(status_code=403)
+
+
+check("requests.HTTPError shape", srv.auth_error_status(HttpErr("403 Client Error: Forbidden for url")), 403)
+check("text-only unauthorized", srv.auth_error_status(Exception("Unauthorized")), 401)
+check("a 404 that mentions 401 as a number is not", srv.auth_error_status(Exception("post 401 not found")), None)
+check("our own refusals never are", (srv.is_auth_error(srv.ClientError("forbidden")), srv.is_auth_error(ValueError("401 forbidden"))),
+      (False, False))
+BY_SID.clear()
+BY_SID.update(_by_sid_backup)
+DEAD_SIDS.clear()
+fake_sub.Api = FakeApi
+srv.reset_api()
+
 print("probe tools: bind_client, refresh_session, clients_status")
 reset_home()
 srv.dispatch_tool("add_client", {"client": "alpha", "publication_url": "alpha.substack.com"})
@@ -369,6 +455,8 @@ with open(installed_server, "w") as f:
     f.write("# v0.4.2 server stand-in\n")
 legacy_default = os.path.join(HOME, "config.json")
 legacy_acme = os.path.join(HOME, "acme.json")
+legacy_envpub = os.path.join(HOME, "envpub.json")   # publication only in the entry's env (0.4 accepted that alone)
+legacy_nopub = os.path.join(HOME, "nopub.json")     # no publication anywhere: cannot be imported, must survive
 stray = os.path.join(HOME, "stray.json")
 reserved_dir = os.path.join(HOME, "backup-old")
 os.makedirs(reserved_dir)
@@ -380,6 +468,8 @@ for path, data in ((legacy_default, {"publication_url": "https://tie-pub.substac
                    (legacy_acme, {"publication_url": "https://acme.substack.com", "act_as": "acme-owner",
                                   "cookie_file": os.path.join(acme_browser, "Default", "Cookies"),
                                   "cookies": {"substack.sid": "sid-acme"}}),
+                   (legacy_envpub, {"act_as": "envpub-owner", "cookies": {"substack.sid": "sid-envpub"}}),
+                   (legacy_nopub, {"cookies": {"substack.sid": "sid-nopub"}}),
                    (stray, {"publication_url": "https://stray.substack.com", "cookies": {"substack.sid": "sid-stray"}}),
                    (reserved_cfg, {"publication_url": "https://reserved.substack.com"})):
     with open(path, "w") as f:
@@ -389,28 +479,42 @@ desktop = {"mcpServers": {
     "tie-substack-acme": {"command": "python3", "args": [installed_server],
                           "env": {"TIE_SUBSTACK_CONFIG": legacy_acme, "SUBSTACK_PUBLICATION_URL": "https://acme.substack.com"}},
     "tie-substack-reserved": {"command": "python3", "args": [installed_server], "env": {"TIE_SUBSTACK_CONFIG": reserved_cfg}},
+    "tie-substack-envpub": {"command": "python3", "args": [installed_server],
+                            "env": {"TIE_SUBSTACK_CONFIG": legacy_envpub, "SUBSTACK_PUBLICATION_URL": "https://envpub.substack.com"}},
+    "tie-substack-nopub": {"command": "python3", "args": [installed_server], "env": {"TIE_SUBSTACK_CONFIG": legacy_nopub}},
+    "tie-substack-nofile": {"command": "python3", "args": [installed_server],
+                            "env": {"TIE_SUBSTACK_CONFIG": os.path.join(HOME, "missing.json"),
+                                    "SUBSTACK_PUBLICATION_URL": "https://nofile.substack.com"}},
     "other-server": {"command": "x"},
 }}
 with open(desktop_path, "w") as f:
     json.dump(desktop, f)
 rep = srv.migrate_import(desktop_path, default_slug="tie", installed_server=installed_server)
-check("selected by reference: default + acme, not the stray or reserved config",
-      sorted(s["slug"] for s in rep["selected"]), ["acme", "tie"])
-check("two imports", sorted(i["slug"] for i in rep["imported"]), ["acme", "tie"])
+check("selected by reference: default, acme, env-only publication and env publication without a file; not the stray",
+      sorted(s["slug"] for s in rep["selected"]), ["acme", "envpub", "nofile", "tie"])
+check("four imports", sorted(i["slug"] for i in rep["imported"]), ["acme", "envpub", "nofile", "tie"])
+check("entries without a determinable publication are reported, never imported",
+      sorted((u["entry"], "no publication" in u["reason"] or "reserved" in u["reason"]) for u in rep["unresolvable"]),
+      [("tie-substack-nopub", True), ("tie-substack-reserved", True)])
 clients = srv.load_clients()["clients"]
 check("tie imported with its pin and a profile source", (clients["tie"]["act_as"], clients["tie"]["cookie_source"]["type"], clients["tie"]["cookie_source"]["profile"]),
       ("owner", "profile", "Profile 2"))
 check("acme imported with a dedicated-browser source", clients["acme"]["cookie_source"], {"type": "user_data_dir", "browser": "chrome", "path": acme_browser})
+check("envpub took its publication from the entry env, with its pin and session",
+      (clients["envpub"]["publication_url"], clients["envpub"]["act_as"], srv.load_session("envpub")["cookies"]["substack.sid"]),
+      ("https://envpub.substack.com", "envpub-owner", "sid-envpub"))
+check("nofile imported unbound (no session, no source)", (clients["nofile"]["act_as"], clients["nofile"]["cookie_source"]), (None, None))
+check("nopub never reached the registry", "nopub" in clients, False)
 check("sessions imported", (srv.load_session("tie")["cookies"]["substack.sid"], srv.load_session("acme")["cookies"]["substack.sid"]), ("sid-tie", "sid-acme"))
 check("backup-original written once", rep.get("written"), True)
 manifest = json.load(open(os.path.join(HOME, "backup-original", "MANIFEST.json")))
-check("manifest covers desktop config, both configs and the v0.4 server",
+check("manifest covers desktop config, the selected configs and the v0.4 server",
       sorted(os.path.basename(m["source"]) for m in manifest["files"].values()),
-      ["acme.json", "claude_desktop_config.json", "config.json", "server.py"])
+      ["acme.json", "claude_desktop_config.json", "config.json", "envpub.json", "server.py"])
 check("legacy server kept", os.path.isfile(os.path.join(HOME, "legacy", "server.py")), True)
 check("per-run backup exists", os.path.isdir(rep["run_backup"]), True)
 rep2 = srv.migrate_import(desktop_path, default_slug="tie", installed_server=installed_server)
-check("re-run imports nothing twice", (len(rep2["imported"]), len(rep2["skipped"])), (0, 2))
+check("re-run imports nothing twice", (len(rep2["imported"]), len(rep2["skipped"])), (0, 4))
 check("backup-original not rewritten", rep2.get("written", False), False)
 # a changed source re-imports that one client
 with open(legacy_acme, "w") as f:
@@ -427,18 +531,30 @@ with open(legacy_acme, "w") as f:
 rep4 = srv.migrate_import(desktop_path, default_slug="tie", installed_server=installed_server)
 check("rebound record reported as a conflict, not overwritten",
       ([c["slug"] for c in rep4["conflicts"]], srv.load_clients()["clients"]["acme"]["act_as"]), (["acme"], "acme-new"))
-# switch: a failed client keeps the old entries working on the legacy server
-sw = srv.switch_entries(desktop_path, "/venv/bin/python3", "/home/server.py", failed=["acme"], legacy_server=os.path.join(HOME, "legacy", "server.py"))
+# switch: nothing verified (an empty or crashed verification) removes nothing; every 0.4 entry keeps working
+sw = srv.switch_entries(desktop_path, "/venv/bin/python3", "/home/server.py", verified=[], legacy_server=os.path.join(HOME, "legacy", "server.py"))
 dcfg = json.load(open(desktop_path))["mcpServers"]
-check("failed switch keeps legacy entries", sorted(sw["kept_legacy_entries"]), ["tie-substack-acme", "tie-substack-legacy", "tie-substack-reserved"])
+check("nothing verified -> nothing removed, not switched", (sw["removed"], sw["switched"]), ([], False))
+check("every 0.4 entry kept on the legacy server", sorted(sw["kept_legacy_entries"]),
+      ["tie-substack-acme", "tie-substack-envpub", "tie-substack-legacy", "tie-substack-nofile", "tie-substack-nopub", "tie-substack-reserved"])
 check("kept entries point at the legacy server", dcfg["tie-substack-acme"]["args"], [os.path.join(HOME, "legacy", "server.py")])
+check("kept entries keep their env", dcfg["tie-substack-nopub"]["env"], {"TIE_SUBSTACK_CONFIG": legacy_nopub})
 check("new single entry added with the home", dcfg["tie-substack"]["env"], {"TIE_SUBSTACK_HOME": HOME})
 check("unrelated servers untouched", "other-server" in dcfg, True)
 rep5 = srv.migrate_import(desktop_path, default_slug="tie", installed_server=installed_server)
 check("legacy entry is not re-imported as a client", "legacy" in {s["slug"] for s in rep5["selected"]}, False)
-sw2 = srv.switch_entries(desktop_path, "/venv/bin/python3", "/home/server.py", failed=[], legacy_server=None)
+# a verified slug that no 0.4 entry maps to removes nothing
+sw_ghost = srv.switch_entries(desktop_path, "/venv/bin/python3", "/home/server.py", verified=["ghost"], legacy_server=None)
+check("unknown verified slug removes nothing", sw_ghost["removed"], [])
+# every importable client verified: only their entries go; the unimportable ones survive, so it is not a full switch
+sw2 = srv.switch_entries(desktop_path, "/venv/bin/python3", "/home/server.py", verified=["tie", "acme", "envpub", "nofile"], legacy_server=None)
 dcfg = json.load(open(desktop_path))["mcpServers"]
-check("full switch removes the per-client entries", sorted(n for n in dcfg if n.startswith("tie-substack")), ["tie-substack"])
+check("verified clients' entries removed (the renamed default entry included)", sorted(sw2["removed"]),
+      ["tie-substack-acme", "tie-substack-envpub", "tie-substack-legacy", "tie-substack-nofile"])
+check("entries that could not be imported survive a full verification",
+      sorted(n for n in dcfg if n.startswith("tie-substack")), ["tie-substack", "tie-substack-nopub", "tie-substack-reserved"])
+check("not switched while a 0.4 entry remains, and it says which", (sw2["switched"], sorted(sw2["unresolvable"])),
+      (False, ["tie-substack-nopub", "tie-substack-reserved"]))
 # rollback: tampered snapshot refused; intact snapshot restores the pure v0.4 state
 snap = os.path.join(HOME, "backup-original", "claude_desktop_config.json")
 orig_bytes = open(snap, "rb").read()
@@ -450,7 +566,7 @@ with open(snap, "wb") as f:
 rb = srv.rollback(desktop_path)
 dcfg = json.load(open(desktop_path))["mcpServers"]
 check("rollback restores the original desktop entries", sorted(n for n in dcfg if n.startswith("tie-substack")),
-      ["tie-substack", "tie-substack-acme", "tie-substack-reserved"])
+      ["tie-substack", "tie-substack-acme", "tie-substack-envpub", "tie-substack-nofile", "tie-substack-nopub", "tie-substack-reserved"])
 check("rollback restores the v0.4 server", open(installed_server).read().startswith("# v0.4.2"), True)
 check("rollback restores the original acme config", json.load(open(legacy_acme))["cookies"]["substack.sid"], "sid-acme")
 check("registry survives a rollback", os.path.isfile(srv.clients_path()), True)

@@ -1526,10 +1526,45 @@ TOOL_HANDLERS = {
 }
 
 
+AUTH_ERROR_RE = re.compile(r"\b(401|403) client error|unauthori[sz]ed|forbidden", re.I)
+# Handlers that make exactly one Substack call, or only reads: safe to re-run after a
+# session refresh. Multi-step writers (create_draft runs create -> put -> tags -> read) are
+# not re-run blindly: a 401 half-way would leave a first draft behind.
+RETRY_SAFE_TOOLS = {"get_publication_settings", "get_draft", "list_drafts", "set_slug",
+                    "unschedule_draft", "delete_draft"}
+
+
+def auth_error_status(exc):
+    """401 or 403 when Substack refused the session during a call, else None. python-substack
+    raises SubstackAPIException(status_code, text); requests.HTTPError carries .response. Our
+    own refusals (ClientError, validation ValueErrors) are never auth errors, whatever they say."""
+    if isinstance(exc, (ClientError, ValueError, TypeError, KeyError)):
+        return None
+    code = getattr(exc, "status_code", None)
+    if code is None:
+        code = getattr(getattr(exc, "response", None), "status_code", None)
+    try:
+        code = int(code)
+    except (TypeError, ValueError):
+        code = None
+    if code is not None:
+        return code if code in (401, 403) else None
+    m = AUTH_ERROR_RE.search(str(exc))
+    if not m:
+        return None
+    return 403 if "403" in m.group(0) or "forbidden" in m.group(0).lower() else 401
+
+
+def is_auth_error(exc):
+    return auth_error_status(exc) is not None
+
+
 def dispatch_tool(name, args):
     """The one place a handler gets its facade. registry: nothing. probe: a ProbeFacade for the
     named client (clients_status may run over all). publication: the full client, only after
-    `client` and `expected_publication` passed every check in get_api."""
+    `client` and `expected_publication` passed every check in get_api. A 401/403 from Substack
+    during the call drops the cached client, re-reads the bound cookie source once (get_api
+    fresh=True), then re-runs a retry-safe tool or fails with the fix named."""
     handler = TOOL_HANDLERS.get(name)
     scope = TOOL_SCOPES.get(name)
     if handler is None or scope is None:
@@ -1546,8 +1581,28 @@ def dispatch_tool(name, args):
                           % (", ".join(sorted(load_clients()["clients"])) or "(none)"))
     if not args.get("expected_publication"):
         raise ClientError("`expected_publication` is required on %s (the brand's publication.domain)" % name)
-    api, ctx = get_api(args["client"], args["expected_publication"])
-    return handler(args, api, ctx)
+    client, expected = args["client"], args["expected_publication"]
+    api, ctx = get_api(client, expected)
+    try:
+        return handler(args, api, ctx)
+    except Exception as exc:  # noqa: BLE001
+        status = auth_error_status(exc)
+        if status is None:
+            raise
+        log("tool %s: Substack answered HTTP %s for client %s; refreshing the session once" % (name, status, client))
+        reset_api(client)
+        # Probes the stored session again and re-reads the bound source when it is expired;
+        # raises the usual actionable ClientError when neither yields a valid session.
+        api, ctx = get_api(client, expected, fresh=True)
+        if name not in RETRY_SAFE_TOOLS:
+            raise ClientError(
+                "client %r: Substack answered HTTP %s during %s; the session was refreshed and is "
+                "valid again, but %s writes in several steps and is not re-run automatically: check "
+                "list_drafts / get_draft for a partial result, then run it again"
+                % (client, status, name, name)
+            )
+        log("tool %s: session refreshed for client %s; re-running once" % (name, client))
+        return handler(args, api, ctx)
 
 
 # ---------------------------------------------------------------- rpc plumbing
@@ -1630,36 +1685,59 @@ def is_reserved_path(path):
 
 
 def is_legacy_config(data):
-    return isinstance(data, dict) and bool(data.get("publication_url")) and "clients" not in data
+    return isinstance(data, dict) and "clients" not in data
+
+
+def legacy_entries(desktop_config):
+    """Every 0.4 server entry in claude_desktop_config: name -> entry. A 0.5 entry carries
+    TIE_SUBSTACK_HOME; `tie-substack-legacy` is the kept-working 0.4 default after a partial
+    switch and is treated like the default entry it came from."""
+    servers = (desktop_config or {}).get("mcpServers") or {}
+    return {n: e for n, e in servers.items()
+            if (n == "tie-substack" or n.startswith("tie-substack-"))
+            and "TIE_SUBSTACK_HOME" not in ((e or {}).get("env") or {})}
 
 
 def select_legacy_configs(desktop_config, default_slug):
-    """[(server_entry_name, slug, config_path)] for the v0.4 entries in claude_desktop_config.
-    Selection is by reference (each entry's TIE_SUBSTACK_CONFIG, else <home>/config.json),
-    never by glob; reserved v0.5 paths are never candidates."""
-    servers = (desktop_config or {}).get("mcpServers") or {}
-    out = []
-    for name, entry in servers.items():
-        if name != "tie-substack" and not name.startswith("tie-substack-"):
-            continue
-        if name == "tie-substack-legacy":
-            continue  # the kept-working 0.4 default entry after a partial switch, not a client
+    """(selected, unresolvable) for the 0.4 entries in claude_desktop_config.
+
+    selected = [(entry name, slug, config path, config data, env publication)] for every entry
+    whose publication is known: SUBSTACK_PUBLICATION_URL in the entry's env (the 0.4 server
+    accepted that alone) or publication_url in the referenced config file (TIE_SUBSTACK_CONFIG,
+    else <home>/config.json). Selection is by reference, never by glob; reserved 0.5 paths are
+    never candidates. An entry whose publication cannot be determined is `unresolvable`: it is
+    reported and kept working, never imported and never removed."""
+    selected, unresolvable = [], []
+    for name, entry in legacy_entries(desktop_config).items():
         env = (entry or {}).get("env") or {}
-        if name == "tie-substack" and not env.get("TIE_SUBSTACK_CONFIG") and "TIE_SUBSTACK_HOME" in env:
-            continue  # already a v0.5 entry
         path = os.path.expanduser(env.get("TIE_SUBSTACK_CONFIG") or os.path.join(home(), "config.json"))
-        if is_reserved_path(path) or not os.path.isfile(path):
-            continue
+        reason, data = None, {}
+        if is_reserved_path(path):
+            reason = "config path %s is reserved for 0.5" % path
+        elif os.path.isfile(path):
+            try:
+                data = read_json(path, {}) or {}
+            except RuntimeError as exc:
+                reason = str(exc)
+            if not reason and not is_legacy_config(data):
+                reason = "%s is not a 0.4 config" % path
+        env_pub = env.get("SUBSTACK_PUBLICATION_URL")
+        if not reason and not normalize_publication_url(env_pub or data.get("publication_url")):
+            reason = ("no publication: neither SUBSTACK_PUBLICATION_URL in the entry nor "
+                      "publication_url in %s" % path)
+        if name in ("tie-substack", "tie-substack-legacy"):
+            slug_raw = os.environ.get("TIE_SUBSTACK_CLIENT") or default_slug
+        else:
+            slug_raw = name[len("tie-substack-"):]
         try:
-            data = read_json(path, None)
-        except RuntimeError:
+            slug = validate_client_slug(slug_raw)
+        except ClientError as exc:
+            reason, slug = reason or str(exc), None
+        if reason:
+            unresolvable.append({"entry": name, "slug": slug, "config": path, "reason": reason})
             continue
-        if not is_legacy_config(data):
-            continue
-        slug = name[len("tie-substack-"):] if name.startswith("tie-substack-") else (
-            os.environ.get("TIE_SUBSTACK_CLIENT") or default_slug)
-        out.append((name, validate_client_slug(slug), path, data, env.get("SUBSTACK_PUBLICATION_URL")))
-    return out
+        selected.append((name, slug, path, data, env_pub))
+    return selected, unresolvable
 
 
 def legacy_source_from(cfg):
@@ -1717,16 +1795,17 @@ def migrate_import(desktop_config_path, default_slug="tie", installed_server=Non
     """Steps 1-3 of the migration: select legacy configs by reference, back up (original once,
     plus per run), import idempotently into clients.json + sessions/ with a journal."""
     desktop = read_json(desktop_config_path, {}) if desktop_config_path else {}
-    selected = select_legacy_configs(desktop, default_slug)
-    legacy_paths = [p for _, _, p, _, _ in selected]
+    selected, unresolvable = select_legacy_configs(desktop, default_slug)
+    legacy_paths = [p for _, _, p, _, _ in selected if os.path.isfile(p)]
     journal = read_json(journal_path(), {"imports": {}})
     pre_migration = not any(
         n == "tie-substack" and "TIE_SUBSTACK_HOME" in ((e or {}).get("env") or {})
         for n, e in ((desktop.get("mcpServers") or {}).items())
     ) and not journal["imports"]
     report = {"selected": [{"entry": n, "slug": s, "config": p} for n, s, p, _, _ in selected],
+              "unresolvable": unresolvable,
               "imported": [], "skipped": [], "conflicts": [], "legacy_server": None}
-    if pre_migration and selected:
+    if pre_migration and (selected or unresolvable):
         report.update(write_backup_original(desktop_config_path, legacy_paths, installed_server))
     elif not os.path.isdir(os.path.join(home(), "backup-original")):
         report["warning"] = ("no backup-original snapshot exists and this is not a pre-migration state; "
@@ -1742,7 +1821,7 @@ def migrate_import(desktop_config_path, default_slug="tie", installed_server=Non
     clients = load_clients()
     now = datetime.now(timezone.utc).isoformat(timespec="seconds")
     for entry, slug, path, cfg, env_pub in selected:
-        digest = sha256_file(path)
+        digest = sha256_file(path) if os.path.isfile(path) else "no-config-file"
         prior = journal["imports"].get(path)
         if prior and prior.get("sha256") == digest and prior.get("result") == "imported":
             report["skipped"].append({"slug": slug, "config": path, "reason": "already imported, unchanged"})
@@ -1783,29 +1862,36 @@ def check_clients_report():
     return {"clients": rows, "all_ready": bool(rows) and all(r.get("ready") for r in rows)}
 
 
-def switch_entries(desktop_config_path, command, server, failed=(), legacy_server=None):
-    """Step 5: add the single `tie-substack` v0.5 entry; remove the per-client entries only
-    when every client verified, else keep them working on legacy/server.py."""
+def switch_entries(desktop_config_path, command, server, verified=(), legacy_server=None,
+                   default_slug="tie"):
+    """Step 5: add the single `tie-substack` 0.5 entry. A 0.4 entry is removed only when it
+    was imported AND its client verified ready (`verified` slugs); every other 0.4 entry,
+    including one whose publication could not be resolved, keeps working on legacy/server.py
+    under a name that cannot collide with the new entry (the default entry becomes
+    `tie-substack-legacy`), with its env overrides intact."""
     desktop = read_json(desktop_config_path, {})
     servers = desktop.setdefault("mcpServers", {})
-    old = {n: e for n, e in list(servers.items())
-           if (n == "tie-substack" or n.startswith("tie-substack-"))
-           and "TIE_SUBSTACK_HOME" not in ((e or {}).get("env") or {})}
-    kept = []
+    old = legacy_entries(desktop)
+    selected, unresolvable = select_legacy_configs(desktop, default_slug)
+    slug_of = {name: slug for name, slug, _, _, _ in selected}
+    verified = {v for v in verified if v}
+    removed, kept = [], []
     for name, entry in old.items():
         servers.pop(name, None)
-        if failed:
-            # Every 0.4 entry keeps working on the legacy server, under a name that cannot
-            # collide with the new single entry; the per-client env overrides stay intact.
-            entry = dict(entry or {})
-            if legacy_server:
-                entry["args"] = [legacy_server]
-            new_name = "tie-substack-legacy" if name == "tie-substack" else name
-            servers[new_name] = entry
-            kept.append(new_name)
+        slug = slug_of.get(name)
+        if slug and slug in verified:
+            removed.append(name)
+            continue
+        entry = dict(entry or {})
+        if legacy_server:
+            entry["args"] = [legacy_server]
+        new_name = "tie-substack-legacy" if name == "tie-substack" else name
+        servers[new_name] = entry
+        kept.append(new_name)
     servers["tie-substack"] = {"command": command, "args": [server], "env": {"TIE_SUBSTACK_HOME": home()}}
     write_json_plain(desktop_config_path, desktop)
-    return {"switched": not failed, "kept_legacy_entries": kept, "failed": list(failed)}
+    return {"switched": not kept, "removed": removed, "kept_legacy_entries": kept,
+            "verified": sorted(verified), "unresolvable": [u["entry"] for u in unresolvable]}
 
 
 def write_json_plain(path, data):
@@ -1864,8 +1950,9 @@ def cli(argv):
     s.add_argument("--desktop-config", required=True)
     s.add_argument("--command", required=True)
     s.add_argument("--server", required=True)
-    s.add_argument("--failed", default="")
+    s.add_argument("--verified", default="", help="comma-separated client slugs that check-clients reported ready")
     s.add_argument("--legacy-server")
+    s.add_argument("--default-slug", default="tie")
     r = sub.add_parser("rollback")
     r.add_argument("--desktop-config", required=True)
     r.add_argument("--last", action="store_true")
@@ -1875,8 +1962,9 @@ def cli(argv):
     elif args.cmd == "check-clients":
         out = check_clients_report()
     elif args.cmd == "switch":
-        failed = [f for f in args.failed.split(",") if f]
-        out = switch_entries(args.desktop_config, args.command, args.server, failed, args.legacy_server)
+        verified = [v.strip() for v in args.verified.split(",") if v.strip()]
+        out = switch_entries(args.desktop_config, args.command, args.server, verified,
+                             args.legacy_server, args.default_slug)
     elif args.cmd == "rollback":
         out = rollback(args.desktop_config, args.last)
     else:

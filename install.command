@@ -15,8 +15,9 @@
 # What it does: creates a venv in ~/.tie-substack/, installs deps, migrates any 0.4 configs
 # (one per client) into the 0.5 client registry (clients.json + sessions/), backs everything
 # up first (write-once backup-original/ + a per-run backup, the 0.4 server kept in legacy/),
-# verifies every client (live), and switches the Claude Desktop entries only on full success;
-# otherwise the old entries keep working on the legacy server and the new entry sits beside them.
+# verifies every client (live), and adds the single 0.5 entry. A 0.4 entry is removed only
+# when its client was imported AND verified ready; every other 0.4 entry (not ready, or its
+# publication could not be determined) keeps working on the legacy server beside the new entry.
 set -u
 
 if [ -f "$0" ]; then
@@ -151,9 +152,11 @@ for s in r.get("skipped", []):
     print("  · skipped  %-12s %s" % (s["slug"], s["reason"]))
 for c in r.get("conflicts", []):
     print("  ! conflict %-12s %s" % (c["slug"], c["reason"]))
+for u in r.get("unresolvable", []):
+    print("  ! not imported: entry %s (%s); it keeps working on the 0.4 server" % (u["entry"], u["reason"]))
 if r.get("warning"):
     print("  ! " + r["warning"])
-if not r.get("selected"):
+if not r.get("selected") and not r.get("unresolvable"):
     print("  · no 0.4 configs referenced by claude_desktop_config.json; fresh install")
 EOF
 else
@@ -166,20 +169,33 @@ mv "$NEW_SERVER" "$INSTALL_DIR/server.py" && ok "server.py installed → $INSTAL
 # --- 6. verify every client (live), then switch the entries -------------
 echo
 bold "Verification"
-FAILED=""
+# VERIFIED = the clients check-clients reported ready. Only their 0.4 entries are removed;
+# a crashed or empty verification verifies nothing, so nothing is removed.
+VERIFIED=""
 if TIE_SUBSTACK_HOME="$INSTALL_DIR" "$PYV" "$INSTALL_DIR/server.py" check-clients > "$INSTALL_DIR/check-clients.json"; then
   ok "every registered client is ready"
 else
-  FAILED="$("$PYV" -c "import json,sys; r=json.load(open(sys.argv[1])); print(','.join(c['client'] for c in r['clients'] if not c.get('ready')))" "$INSTALL_DIR/check-clients.json")"
-  if [ -n "$FAILED" ]; then warn "not ready: $FAILED (details in $INSTALL_DIR/check-clients.json)"; fi
+  warn "not every client is ready (details in $INSTALL_DIR/check-clients.json)"
 fi
+VERIFIED="$("$PYV" - "$INSTALL_DIR/check-clients.json" <<'EOF'
+import json, sys
+try:
+    r = json.load(open(sys.argv[1]))
+except Exception:  # noqa: BLE001
+    r = {}
+print(",".join(c["client"] for c in r.get("clients", []) if c.get("ready")))
+EOF
+)"
 "$PYV" - "$INSTALL_DIR/check-clients.json" <<'EOF'
 import json, sys
-r = json.load(open(sys.argv[1]))
-for c in r["clients"]:
+try:
+    r = json.load(open(sys.argv[1]))
+except Exception:  # noqa: BLE001
+    print("  ! verification produced no report; no 0.4 entry will be removed"); sys.exit(0)
+for c in r.get("clients", []):
     print("  %-12s %-28s bound=%-5s session=%-8s ready=%-5s %s" % (
         c["client"], c["publication"], c["bound"], c.get("session"), c.get("ready"), c.get("fix", "")))
-if not r["clients"]:
+if not r.get("clients"):
     print("  (no clients yet: add_client + bind_client in a chat)")
 EOF
 
@@ -187,13 +203,23 @@ LEGACY_ARG=""
 [ -f "$INSTALL_DIR/legacy/server.py" ] && LEGACY_ARG="--legacy-server $INSTALL_DIR/legacy/server.py"
 # shellcheck disable=SC2086
 TIE_SUBSTACK_HOME="$INSTALL_DIR" "$PYV" "$INSTALL_DIR/server.py" switch --desktop-config "$CONFIG" \
-    --command "$PYV" --server "$INSTALL_DIR/server.py" --failed "$FAILED" $LEGACY_ARG > /dev/null \
+    --command "$PYV" --server "$INSTALL_DIR/server.py" --verified "$VERIFIED" --default-slug "$DEFAULT_SLUG" \
+    $LEGACY_ARG > "$INSTALL_DIR/switch-report.json" \
   && ok "Claude Desktop config updated (server 'tie-substack')" \
   || { fail "could not update $CONFIG"; pause; exit 1; }
-if [ -n "$FAILED" ]; then
-  warn "the old per-client entries keep working on the legacy server until these clients verify: $FAILED"
-  echo "      Fix in a chat: bind_client (or refresh_session) for each, then re-run this installer."
-fi
+"$PYV" - "$INSTALL_DIR/switch-report.json" <<'EOF'
+import json, sys
+r = json.load(open(sys.argv[1]))
+for n in r.get("removed", []):
+    print("  ✓ 0.4 entry %s removed (its client verified ready)" % n)
+for n in r.get("kept_legacy_entries", []):
+    print("  ! 0.4 entry %s kept, working on the legacy server" % n)
+if r.get("kept_legacy_entries"):
+    print("      Fix in a chat: bind_client (or refresh_session) for each client, then re-run this installer.")
+if r.get("unresolvable"):
+    print("      Entries whose publication could not be determined are never imported: add_client +")
+    print("      bind_client for each in a chat, then remove the old entry from claude_desktop_config.json.")
+EOF
 
 echo
 bold "Done. Final steps:"
