@@ -519,10 +519,12 @@ def _context(slug, rec, probe):
     }
 
 
-def get_api(slug, expected_publication, fresh=False):
+def get_api(slug, expected_publication, fresh=False, reread_source=False):
     """(api, context) for one client, after every check: registry entry, expected vs
     registry publication, a valid session (one auto-refresh from the bound source), the
-    session reaching the publication, and the pinned identity. Nothing defaults."""
+    session reaching the publication, and the pinned identity. Nothing defaults.
+    reread_source=True takes a fresh cookie from the bound browser before anything else,
+    whatever the stored session's probe would say (a mid-call 401/403)."""
     slug, rec = client_record(slug)
     pub_url = normalize_publication_url(rec.get("publication_url"))
     sub = subdomain_of(pub_url)
@@ -547,7 +549,17 @@ def get_api(slug, expected_publication, fresh=False):
         cookies = session_cookies(slug)
         source = rec.get("cookie_source")
         refreshed = False
-        if not cookies.get("substack.sid"):
+        if reread_source:
+            # The stored cookie was refused mid-call although it may still pass the profile
+            # probe below: the only useful move is a fresh cookie from the bound browser.
+            if not source:
+                raise ClientError(
+                    "client %r: Substack refused the session mid-call and there is no bound cookie "
+                    "source to re-read; run bind_client" % slug
+                )
+            cookies, cf = read_source_cookies(source)
+            refreshed = True
+        elif not cookies.get("substack.sid"):
             if not source:
                 raise ClientError(
                     "client %r has no session and no bound cookie source: run bind_client" % slug
@@ -1589,20 +1601,34 @@ def dispatch_tool(name, args):
         status = auth_error_status(exc)
         if status is None:
             raise
-        log("tool %s: Substack answered HTTP %s for client %s; refreshing the session once" % (name, status, client))
+        log("tool %s: Substack answered HTTP %s for client %s; re-reading the bound source once" % (name, status, client))
         reset_api(client)
-        # Probes the stored session again and re-reads the bound source when it is expired;
-        # raises the usual actionable ClientError when neither yields a valid session.
-        api, ctx = get_api(client, expected, fresh=True)
+        # The bound browser source is re-read unconditionally (the stored cookie may still pass
+        # the profile probe and yet be refused by the publication), validated and stored; the
+        # usual actionable ClientError when that yields no valid session or there is no source.
+        api, ctx = get_api(client, expected, fresh=True, reread_source=True)
         if name not in RETRY_SAFE_TOOLS:
             raise ClientError(
-                "client %r: Substack answered HTTP %s during %s; the session was refreshed and is "
-                "valid again, but %s writes in several steps and is not re-run automatically: check "
-                "list_drafts / get_draft for a partial result, then run it again"
+                "client %r: Substack answered HTTP %s during %s; the bound source was re-read and "
+                "the session is valid again, but %s writes in several steps and is not re-run "
+                "automatically: check list_drafts / get_draft for a partial result, then run it again"
                 % (client, status, name, name)
             )
-        log("tool %s: session refreshed for client %s; re-running once" % (name, client))
-        return handler(args, api, ctx)
+        log("tool %s: session re-read from the bound source for client %s; re-running once" % (name, client))
+        try:
+            return handler(args, api, ctx)
+        except Exception as exc2:  # noqa: BLE001
+            status2 = auth_error_status(exc2)
+            if status2 is None:
+                raise
+            _, rec = client_record(client)
+            raise ClientError(
+                "client %r: Substack still answered HTTP %s for %s after re-reading %s; the login "
+                "there (%s) is valid but refused for %s; log in to Substack as the right account in "
+                "that browser, then refresh_session"
+                % (client, status2, name, describe_source(rec.get("cookie_source")),
+                   ctx.get("logged_in_as"), ctx.get("publication"))
+            )
 
 
 # ---------------------------------------------------------------- rpc plumbing
@@ -1737,6 +1763,24 @@ def select_legacy_configs(desktop_config, default_slug):
             unresolvable.append({"entry": name, "slug": slug, "config": path, "reason": reason})
             continue
         selected.append((name, slug, path, data, env_pub))
+    # Two entries mapping to one slug (the default entry plus `tie-substack-<default slug>`,
+    # say) would import over each other and then both be removed once that slug verified:
+    # neither is imported nor removed until the operator renames or drops one.
+    claimants = {}
+    for name, slug, _, _, _ in selected:
+        claimants.setdefault(slug, []).append(name)
+    clashes = {s: names for s, names in claimants.items() if len(names) > 1}
+    if clashes:
+        kept = []
+        for entry in selected:
+            name, slug, path = entry[0], entry[1], entry[2]
+            if slug in clashes:
+                unresolvable.append({"entry": name, "slug": slug, "config": path,
+                                     "reason": "slug %r is claimed by %d entries (%s); rename or remove all but "
+                                               "one, then re-run" % (slug, len(clashes[slug]), ", ".join(clashes[slug]))})
+            else:
+                kept.append(entry)
+        selected = kept
     return selected, unresolvable
 
 

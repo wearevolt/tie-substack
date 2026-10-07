@@ -217,8 +217,8 @@ for n in r.get("kept_legacy_entries", []):
 if r.get("kept_legacy_entries"):
     print("      Fix in a chat: bind_client (or refresh_session) for each client, then re-run this installer.")
 if r.get("unresolvable"):
-    print("      Entries whose publication could not be determined are never imported: add_client +")
-    print("      bind_client for each in a chat, then remove the old entry from claude_desktop_config.json.")
+    print("      Entries that could not be imported (no publication, or two entries claiming one slug) are")
+    print("      never removed: fix or add_client + bind_client in a chat, then edit claude_desktop_config.json.")
 EOF
 
 echo

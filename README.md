@@ -31,7 +31,10 @@ scheduling more than 3 months out is not supported by Substack.
   scope or crosses it.
 - **Sessions switch per call.** Each client's session is validated and cached briefly; an
   expired one is re-read once from the client's bound cookie source, then the call fails
-  with the fix named. Interleaved calls for different clients in one chat are safe.
+  with the fix named. A 401/403 in the middle of a call re-reads the source once more
+  (even when the stored cookie still passes the profile probe), re-runs read-only tools
+  on the new cookie, and names the fix for multi-step writers. Interleaved calls for
+  different clients in one chat are safe.
 
 ## How auth works (and why Claude never sees a cookie)
 

@@ -299,6 +299,16 @@ class SessionAwareApi(FakeApi):
 
 _by_sid_backup = dict(BY_SID)
 fake_sub.Api = SessionAwareApi
+SOURCE_READS = []
+_plain_chrome_cookies = fake_pcc.chrome_cookies
+
+
+def _counting_chrome_cookies(url, browser=None, cookie_file=None):
+    SOURCE_READS.append(cookie_file)
+    return _plain_chrome_cookies(url, browser=browser, cookie_file=cookie_file)
+
+
+fake_pcc.chrome_cookies = _counting_chrome_cookies
 reset_home()
 srv.dispatch_tool("add_client", {"client": "alpha", "publication_url": "alpha.substack.com"})
 srv.update_client("alpha", act_as="alpha-owner", cookie_source={"type": "user_data_dir", "browser": "chrome", "path": ded},
@@ -310,30 +320,61 @@ payload(srv.dispatch_tool("get_draft", {"client": "alpha", "expected_publication
 DEAD_SIDS.add("sid-alpha")
 BY_SID["sid-alpha"] = (False, {"reason": "session_invalid", "status": 401})
 NET_CALLS.clear()
+SOURCE_READS.clear()
 FakeApi.instances.clear()
 out = payload(srv.dispatch_tool("get_draft", {"client": "alpha", "expected_publication": "alpha.substack.com", "draft_id": 1}))
 check("401 mid-call: session re-read from the bound source, the read re-run", out["logged_in_as"], "alpha-owner")
 check("the re-run used an Api on the fresh session", FakeApi.instances[-1].cookies_string, "substack.sid=sid-alpha-2")
 check("the fresh session was stored", srv.load_session("alpha")["cookies"]["substack.sid"], "sid-alpha-2")
-check("two probes: the dead session, then the fresh one", NET_CALLS.count("probe"), 2)
-# a multi-step writer is refreshed but not re-run; the error names the fix
-DEAD_SIDS.add("sid-alpha-2")
-BY_SID["sid-alpha-2"] = (False, {"reason": "session_invalid", "status": 401})
+check("the browser source was read once, and only the fresh cookie probed", (len(SOURCE_READS), NET_CALLS.count("probe")), (1, 1))
+# the stored cookie still passes the profile probe but the publication refuses it: the
+# bound source is re-read anyway and the retry runs on the new cookie, never the old one
+DEAD_SIDS.add("sid-alpha-2")                      # endpoint refuses it; BY_SID still says valid
 BY_SID["sid-alpha-3"] = (True, {"handle": "alpha-owner", "email": "a@x.com", "subdomains": ["alpha"], "primary": "alpha"})
 SOURCE_COOKIES[os.path.join(ded, "Default", "Cookies")] = {"substack.sid": "sid-alpha-3"}
-raises("403 during create_draft: refreshed, not re-run, fix named",
+NET_CALLS.clear()
+SOURCE_READS.clear()
+FakeApi.instances.clear()
+out = payload(srv.dispatch_tool("get_draft", {"client": "alpha", "expected_publication": "alpha.substack.com", "draft_id": 1}))
+check("probe-valid but refused cookie: the source was still read once", len(SOURCE_READS), 1)
+check("the retry ran on the re-read cookie, not the refused one", FakeApi.instances[-1].cookies_string, "substack.sid=sid-alpha-3")
+check("no retry on the old cookie", [c for i in FakeApi.instances for c in i.calls if i._sid() == "sid-alpha-2"], [])
+check("the re-read session was stored", srv.load_session("alpha")["cookies"]["substack.sid"], "sid-alpha-3")
+# a multi-step writer gets the re-read but is not re-run; the error names the fix
+DEAD_SIDS.add("sid-alpha-3")
+BY_SID["sid-alpha-4"] = (True, {"handle": "alpha-owner", "email": "a@x.com", "subdomains": ["alpha"], "primary": "alpha"})
+SOURCE_COOKIES[os.path.join(ded, "Default", "Cookies")] = {"substack.sid": "sid-alpha-4"}
+raises("403 during create_draft: source re-read, not re-run, fix named",
        lambda: srv.dispatch_tool("create_draft", {"client": "alpha", "expected_publication": "alpha.substack.com",
                                                   "title": "T", "body_markdown": "b", "slug": "t"}),
        srv.ClientError, ["HTTP 403", "create_draft", "run it again"])
-check("the session was refreshed anyway", srv.load_session("alpha")["cookies"]["substack.sid"], "sid-alpha-3")
-# the refresh itself failing gives the usual actionable error, and the handler is not re-run
-DEAD_SIDS.add("sid-alpha-3")
-BY_SID["sid-alpha-3"] = (False, {"reason": "session_invalid", "status": 401})
+check("the session was re-read anyway", srv.load_session("alpha")["cookies"]["substack.sid"], "sid-alpha-4")
+# the re-read yields a cookie the publication still refuses: no second retry, the fix is named
+DEAD_SIDS.add("sid-alpha-4")
 FakeApi.instances.clear()
-raises("401 and the bound source still dead -> refresh_session named",
+SOURCE_READS.clear()
+raises("still refused after the re-read -> one retry only, login named",
+       lambda: srv.dispatch_tool("get_draft", {"client": "alpha", "expected_publication": "alpha.substack.com", "draft_id": 1}),
+       srv.ClientError, ["still answered HTTP 401", "alpha-owner", "alpha.substack.com", "refresh_session"])
+check("one source read and one new Api (the single retry; the refused cookie was the cached Api)",
+      (len(SOURCE_READS), len(FakeApi.instances), FakeApi.instances[-1].cookies_string), (1, 1, "substack.sid=sid-alpha-4"))
+# the re-read source itself being dead gives the usual actionable error, and nothing is re-run
+BY_SID["sid-alpha-4"] = (False, {"reason": "session_invalid", "status": 401})
+FakeApi.instances.clear()
+raises("401 and the bound source dead -> refresh_session named",
        lambda: srv.dispatch_tool("get_draft", {"client": "alpha", "expected_publication": "alpha.substack.com", "draft_id": 1}),
        srv.ClientError, ["refresh_session"])
-check("no Api built on a failed refresh", len(FakeApi.instances), 0)
+check("no Api built on a failed re-read", len(FakeApi.instances), 0)
+# no bound source: nothing to re-read, bind_client named
+BY_SID["sid-alpha-9"] = (True, {"handle": "alpha-owner", "email": "a@x.com", "subdomains": ["alpha"], "primary": "alpha"})
+DEAD_SIDS.add("sid-alpha-9")
+srv.update_client("alpha", cookie_source=None)
+srv.save_session("alpha", {"substack.sid": "sid-alpha-9"}, {"handle": "alpha-owner"})
+srv.reset_api()
+raises("401 with no bound source -> bind_client named",
+       lambda: srv.dispatch_tool("get_draft", {"client": "alpha", "expected_publication": "alpha.substack.com", "draft_id": 1}),
+       srv.ClientError, ["no bound cookie source", "bind_client"])
+fake_pcc.chrome_cookies = _plain_chrome_cookies
 # what counts as an auth error
 check("SubstackAPIException-shaped 401/403/404", tuple(srv.auth_error_status(Refused(c)) for c in (401, 403, 404)), (401, 403, None))
 
@@ -574,6 +615,36 @@ rb_last = srv.rollback(desktop_path, last=True)
 check("--last restores from a per-run backup", os.path.basename(rb_last["restored_from"]).startswith("backup-2"), True)
 raises("no snapshot -> rollback refuses", lambda: (shutil.rmtree(os.path.join(HOME, "backup-original")), srv.rollback(desktop_path)),
        RuntimeError, ["backup-original"])
+
+print("migration: two 0.4 entries mapping to one slug are refused, never imported, never removed")
+reset_home()
+dup_desktop = os.path.join(HOME, "dup_desktop.json")
+cfg_one, cfg_two = os.path.join(HOME, "one.json"), os.path.join(HOME, "two.json")
+with open(cfg_one, "w") as f:
+    json.dump({"publication_url": "https://one.substack.com", "act_as": "one", "cookies": {"substack.sid": "sid-one"}}, f)
+with open(cfg_two, "w") as f:
+    json.dump({"publication_url": "https://two.substack.com", "act_as": "two", "cookies": {"substack.sid": "sid-two"}}, f)
+with open(dup_desktop, "w") as f:
+    json.dump({"mcpServers": {
+        "tie-substack": {"command": "python3", "args": ["/old/server.py"], "env": {"TIE_SUBSTACK_CONFIG": cfg_one}},
+        "tie-substack-tie": {"command": "python3", "args": ["/old/server.py"], "env": {"TIE_SUBSTACK_CONFIG": cfg_two}},
+        "tie-substack-solo": {"command": "python3", "args": ["/old/server.py"],
+                              "env": {"SUBSTACK_PUBLICATION_URL": "https://solo.substack.com"}},
+    }}, f)
+rep = srv.migrate_import(dup_desktop, default_slug="tie")
+check("only the unclashed entry is selected", [s["entry"] for s in rep["selected"]], ["tie-substack-solo"])
+check("both claimants reported with the clash", sorted((u["entry"], "slug 'tie' is claimed by 2 entries" in u["reason"]) for u in rep["unresolvable"]),
+      [("tie-substack", True), ("tie-substack-tie", True)])
+check("neither claimant reached the registry", sorted(srv.load_clients()["clients"]), ["solo"])
+sw = srv.switch_entries(dup_desktop, "/venv/bin/python3", "/home/server.py", verified=["tie", "solo"], legacy_server=None)
+dcfg = json.load(open(dup_desktop))["mcpServers"]
+check("a verified 'tie' removes neither claimant; solo goes", (sorted(sw["removed"]), sorted(sw["kept_legacy_entries"])),
+      (["tie-substack-solo"], ["tie-substack-legacy", "tie-substack-tie"]))
+check("the claimants keep their configs", (dcfg["tie-substack-legacy"]["env"], dcfg["tie-substack-tie"]["env"]),
+      ({"TIE_SUBSTACK_CONFIG": cfg_one}, {"TIE_SUBSTACK_CONFIG": cfg_two}))
+rep2 = srv.migrate_import(dup_desktop, default_slug="tie")
+check("re-run after the switch still sees the clash (legacy + tie)", sorted(u["entry"] for u in rep2["unresolvable"]),
+      ["tie-substack-legacy", "tie-substack-tie"])
 
 print("registration & version")
 check("server version", srv.SERVER_VERSION, "0.5.0")
