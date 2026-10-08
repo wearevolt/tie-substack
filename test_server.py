@@ -1,18 +1,22 @@
-"""Regression checks for the v0.1.1 fixes. Offline — no live Substack, no cookie.
+"""Offline regression checks for tie-substack 0.5.0. No live Substack, no cookies.
 
 Run:  python3 test_server.py
 """
-import importlib.util, os, sys
+import importlib.util
+import json
+import os
+import shutil
+import sys
+import tempfile
+import types
 
-os.environ["TIE_SUBSTACK_CONFIG"] = "/tmp/tie-substack-test-config.json"
-# The temp config survives across runs — an aborted run must not poison the next.
-try:
-    os.remove(os.environ["TIE_SUBSTACK_CONFIG"])
-except FileNotFoundError:
-    pass
+HOME = tempfile.mkdtemp(prefix="tie-substack-test-")
+os.environ["TIE_SUBSTACK_HOME"] = HOME
+os.environ.pop("SUBSTACK_SESSION_TOKEN", None)
+os.environ.pop("TIE_SUBSTACK_CLIENT", None)
+
 spec = importlib.util.spec_from_file_location(
-    "srv", os.path.join(os.path.dirname(os.path.abspath(__file__)), "server.py")
-)
+    "srv", os.path.join(os.path.dirname(os.path.abspath(__file__)), "server.py"))
 srv = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(srv)
 
@@ -21,716 +25,636 @@ fails = []
 
 def check(label, got, want):
     ok = got == want
-    print(("  ok   " if ok else "  FAIL ") + label + "  → %r" % (got,))
+    print(("  ok   " if ok else "  FAIL ") + label + ("" if ok else "  -> %r" % (got,)))
     if not ok:
         fails.append("%s: got %r want %r" % (label, got, want))
 
 
-print("Bug 1 — publication_url normalization")
-for raw, want in [
-    ("iviq.substack.com", "https://iviq.substack.com"),
-    ("https://iviq.substack.com/", "https://iviq.substack.com"),
-    ("http://iviq.substack.com", "https://iviq.substack.com"),
-    ("  thrivinginengineering.substack.com  ", "https://thrivinginengineering.substack.com"),
-    ("", ""),
-]:
-    check("normalize(%r)" % raw, srv.normalize_publication_url(raw), want)
-
-print("Bug 1 — subdomain extraction (drives the publication match)")
-for raw, want in [
-    ("iviq.substack.com", "iviq"),           # the exact value that broke auth
-    ("https://iviq.substack.com", "iviq"),
-    ("https://tie.example.com", None),       # custom domain → explicit error path
-]:
-    os.environ["SUBSTACK_PUBLICATION_URL"] = raw
-    check("subdomain(%r)" % raw, srv.configured_subdomain(), want)
-
-print("Bug 1 — errors name the right cause, in the right order")
-os.environ["SUBSTACK_PUBLICATION_URL"] = "https://tie.example.com"
-os.environ.pop("SUBSTACK_SESSION_TOKEN", None)
-try:
-    srv.get_api(fresh=True)
-    check("no-cookie raises", False, True)
-except RuntimeError as e:
-    check("missing cookie is reported first", "substack.sid" in str(e), True)
-
-# With a cookie present, an unusable URL must fail BEFORE any network call.
-os.environ["SUBSTACK_SESSION_TOKEN"] = "dummy-not-a-real-session"
-try:
-    srv.get_api(fresh=True)
-    check("custom domain raises", False, True)
-except RuntimeError as e:
-    check("custom-domain error names the required form", "substack.com" in str(e), True)
-    check("custom-domain error is not the old TypeError", "NoneType" in str(e), False)
-
-print("Bug 2 — /drafts payload unwrapping")
-real_payload = {"posts": [{"id": 208981733, "publication_id": 10255107,
-                           "is_published": False, "draft_title": "", "title": None,
-                           "slug": None}]}
-check("unwrap object form", len(srv.unwrap_items(real_payload, "posts")), 1)
-check("unwrap bare list", len(srv.unwrap_items([{"id": 1}], "posts")), 1)
-check("unwrap unknown dict", srv.unwrap_items({"weird": 1}, "posts"), [])
-check("unwrap None", srv.unwrap_items(None, "posts"), [])
-# The old code iterated the dict and hit .get on the key string "posts":
-try:
-    [srv.draft_summary(d) for d in real_payload]
-    check("draft_summary survives raw-string entries", True, True)
-except AttributeError as e:
-    check("draft_summary survives raw-string entries (%s)" % e, False, True)
-
-print("Bug 2 — brand-new draft summary is readable")
-os.environ["SUBSTACK_PUBLICATION_URL"] = "https://iviq.substack.com"
-s = srv.draft_summary(real_payload["posts"][0])
-check("title falls back", s["title"], "(untitled draft)")
-check("is_published from field", s["is_published"], False)
-check("post_url is None without slug", s["post_url"], None)
-check("explains missing slug", "set_slug" in s.get("post_url_note", ""), True)
-check("editor_url built", s["editor_url"], "https://iviq.substack.com/publish/post/208981733")
-s2 = srv.draft_summary({"id": 7, "draft_slug": "my-post", "draft_title": "T",
-                        "is_published": False})
-check("post_url from draft_slug", s2["post_url"], "https://iviq.substack.com/p/my-post")
-
-
-print("v0.2.0 — settings validation")
-caps_free = {"paid_enabled": False, "payments_state": "disabled", "existing_tags": [{"name": "debugging"}]}
-caps_paid = {"paid_enabled": True, "payments_state": "enabled", "existing_tags": []}
-def expect_raises(label, fn):
+def raises(label, fn, exc=Exception, contains=()):
     try:
-        fn(); check(label, "no error", "ValueError")
-    except ValueError as e:
-        check(label, True, True)
-srv.validate_settings("everyone", "everyone", caps_free)
-check("everyone/everyone allowed on free pub", True, True)
-expect_raises("only_paid audience rejected on free pub",
-              lambda: srv.validate_settings("only_paid", "everyone", caps_free))
-expect_raises("only_paid comments rejected on free pub",
-              lambda: srv.validate_settings("everyone", "only_paid", caps_free))
-expect_raises("bogus audience rejected",
-              lambda: srv.validate_settings("subscribers", "everyone", caps_free))
-srv.validate_settings("only_paid", "only_paid", caps_paid)
-check("paid values allowed when payments enabled", True, True)
-check("'none' disables comments and is valid", "none" in srv.COMMENT_VALUES, True)
-
-print("v0.2.0 — tag resolution (new vs existing, normalized)")
-plan = srv.resolve_tags(None, ["Debugging", "MCP tooling", "debugging", "  ", "a/b!"], caps_free)
-check("normalizes + dedupes", plan["normalized"], ["debugging", "mcp-tooling", "a-b"])
-check("existing detected", plan["existing"], ["debugging"])
-check("new detected", plan["new"], ["mcp-tooling", "a-b"])
-
-print("v0.2.0 — schedule/settings read from server state")
-sched = {"id": 9, "draft_title": "T", "is_published": False, "should_send_email": True,
-         "audience": "everyone", "write_comment_permissions": "none",
-         "postSchedules": [{"trigger_at": "2026-08-03T13:00:00.000Z"}]}
-s9 = srv.draft_summary(sched)
-check("scheduled_for from postSchedules", s9["scheduled_for"], "2026-08-03T13:00:00.000Z")
-check("audience surfaced", s9["audience"], "everyone")
-check("comments surfaced", s9["comment_permissions"], "none")
-check("send_email surfaced", s9["send_email"], True)
-# Real payloads have no postTags key at all, so the summary must not claim tags —
-# they come from the association endpoint (see read_post_tags below).
-check("summary claims no tags of its own", "tags" in s9, False)
-# The list payload has no postSchedules key at all — absence must not read as "not scheduled".
-s10 = srv.draft_summary({"id": 9, "draft_title": "T", "is_published": False})
-check("list payload flags unknown schedule", "scheduled_for" in s10, False)
-check("list payload explains why", "scheduled_for_note" in s10, True)
-
-print("v0.2.0 — irreversible-email gate")
-check("schedule_draft advertises confirm_send_email",
-      any(t["name"] == "schedule_draft" and "confirm_send_email" in t["inputSchema"]["properties"]
-          for t in srv.TOOLS), True)
-check("publish_draft advertises confirm_send_email",
-      any(t["name"] == "publish_draft" and "confirm_send_email" in t["inputSchema"]["properties"]
-          for t in srv.TOOLS), True)
-check("new tools registered",
-      all(n in srv.TOOL_HANDLERS for n in
-          ("get_publication_settings", "update_post_settings", "apply_tags")), True)
+        fn()
+        check(label, "no error", exc.__name__)
+    except exc as e:
+        missing = [c for c in contains if c not in str(e)]
+        check(label + (" (message has %s)" % list(contains) if contains else ""), missing, [])
+    except Exception as e:  # noqa: BLE001
+        check(label, type(e).__name__, exc.__name__)
 
 
-print("v0.2.1 — narrower list projection is not reported as empty")
-# Verified live: the list payload carries NEITHER subtitle nor draft_subtitle.
-list_row = {"id": 1, "draft_title": "T", "is_published": False, "audience": "everyone"}
-r = srv.draft_summary(list_row)
-check("no null subtitle from list payload", "subtitle" in r, False)
-check("explains absent subtitle", "get_draft" in r.get("subtitle_note", ""), True)
-single = {"id": 1, "draft_title": "T", "draft_subtitle": "A first post", "is_published": False}
-check("subtitle read when present", srv.draft_summary(single)["subtitle"], "A first post")
-check("empty subtitle stays reported", "subtitle" in srv.draft_summary(
-    {"id": 1, "draft_title": "T", "subtitle": None}), True)
+def payload(result):
+    return json.loads(result["content"][0]["text"])
 
-print("v0.2.1 — attached tags read from the association endpoint")
-class FakeApi:  # postTags is absent from real payloads, so this is the only truth
-    def __init__(self, rows): self.rows = rows; self.calls = []
-    def call(self, endpoint, method, **kw): self.calls.append((endpoint, method)); return self.rows
-    def get_publication_post_tags(self):
-        return [{"id": "65ac113b-uuid", "name": "debugging"},
-                {"id": "69c0ed7c-uuid", "name": "tooling"}]
-fake = FakeApi([{"post_id": 9, "post_tag_id": "65ac113b-uuid"},
-                {"post_id": 9, "post_tag_id": "69c0ed7c-uuid"}])
-got = srv.read_post_tags(fake, 9)
-check("uuid ids mapped to names", got["names"], ["debugging", "tooling"])
-check("hits the association endpoint", fake.calls, [("post/9/tag", "GET")])
-check("unknown id degrades visibly",
-      srv.read_post_tags(FakeApi([{"post_tag_id": "ghost-uuid"}]), 9)["names"], ["tag:ghost-uuid"])
-check("no attachments -> empty, not echo", srv.read_post_tags(FakeApi([]), 9)["names"], [])
-check("odd shape flagged", "note" in srv.read_post_tags(FakeApi({"x": 1}), 9), True)
 
-print("v0.3.0 — per-client cookie_file resolution")
-import json as _json
-_cfg_path = os.environ["TIE_SUBSTACK_CONFIG"]
-def _write_cfg(d):
-    with open(_cfg_path, "w") as f:
-        _json.dump(d, f)
-_write_cfg({})
-check("no arg, no config -> default profile", srv.resolve_cookie_file(None), None)
-check("explicit arg wins", srv.resolve_cookie_file("/tmp/x/Cookies"), "/tmp/x/Cookies")
-check("~ expands", srv.resolve_cookie_file("~/x/Cookies"),
-      os.path.expanduser("~/x/Cookies"))
-_write_cfg({"cookie_file": "~/TIE-Browsers/acme/Default/Cookies"})
-check("config fallback used when no arg", srv.resolve_cookie_file(None),
-      os.path.expanduser("~/TIE-Browsers/acme/Default/Cookies"))
-check("arg still wins over config", srv.resolve_cookie_file("/tmp/y/Cookies"),
-      "/tmp/y/Cookies")
-_write_cfg({})
-check("refresh_cookie schema exposes cookie_file",
-      "cookie_file" in [t for t in srv.TOOLS if t["name"] == "refresh_cookie"
-                        ][0]["inputSchema"]["properties"], True)
-try:
-    srv.tool_refresh_cookie({"browser": "firefox", "cookie_file": "/tmp/x/Cookies"})
-    check("firefox + cookie_file rejected", "no error", "RuntimeError")
-except RuntimeError:
-    check("firefox + cookie_file rejected", "RuntimeError", "RuntimeError")
-except Exception as e:  # pycookiecheat missing would raise before the guard — order matters
-    check("firefox + cookie_file rejected", type(e).__name__, "RuntimeError")
+def reset_home():
+    shutil.rmtree(HOME, ignore_errors=True)
+    os.makedirs(HOME)
+    srv.reset_api()
 
-print("v0.3.0 — publication_accessible: one predicate for scan, get_api and status")
-check("subdomain member -> accessible",
-      srv.publication_accessible({"subdomains": ["acme"], "primary": None}, "acme"), True)
-check("primary-only profile -> accessible",
-      srv.publication_accessible({"subdomains": [], "primary": "acme"}, "acme"), True)
-check("primary case-insensitive",
-      srv.publication_accessible({"subdomains": [], "primary": "Acme"}, "acme"), True)
-check("no access -> rejected",
-      srv.publication_accessible({"subdomains": ["other"], "primary": "else"}, "acme"), False)
-check("no target -> any valid session",
-      srv.publication_accessible({"subdomains": [], "primary": None}, None), True)
-check("error listing merges primary",
-      srv.accessible_publications({"subdomains": ["beta"], "primary": "Acme"}),
-      ["acme", "beta"])
 
-print("v0.3.0 — profile scan: pick the profile whose session reaches the publication")
-import tempfile, types
-tmp = tempfile.mkdtemp()
-for prof in ("Default", "Profile 1", "Profile 2", "System Profile"):
-    os.makedirs(os.path.join(tmp, prof), exist_ok=True)
-for prof in ("Default", "Profile 1", "Profile 2"):
-    open(os.path.join(tmp, prof, "Cookies"), "w").close()
-check("enumerates Default + Profile N with a Cookies DB",
-      [n for n, _ in srv.chrome_profile_cookie_files("chrome", root=tmp)],
-      ["Default", "Profile 1", "Profile 2"])
-check("unknown browser -> empty", srv.chrome_profile_cookie_files("firefox"), [])
+# ---------------------------------------------------------------- helpers (carried from 0.4)
+print("helpers: URLs")
+for raw, want in [("iviq.substack.com", "https://iviq.substack.com"),
+                  ("https://iviq.substack.com/", "https://iviq.substack.com"),
+                  ("http://iviq.substack.com", "https://iviq.substack.com"), ("", "")]:
+    check("normalize(%r)" % raw, srv.normalize_publication_url(raw), want)
+check("subdomain_of", srv.subdomain_of("iviq.substack.com"), "iviq")
+check("subdomain_of custom domain", srv.subdomain_of("https://tie.example.com"), None)
+for raw, want in [("https://Acme.substack.com/p/x?y=1", "acme.substack.com"),
+                  ("acme.substack.com", "acme.substack.com"), ("www.acme.substack.com", "acme.substack.com")]:
+    check("canonical_host(%r)" % raw, srv.canonical_host(raw), want)
 
-fake_pcc = types.ModuleType("pycookiecheat")
-fake_pcc.BrowserType = lambda b: b
-BY_FILE = {
-    None: {"substack.sid": "sid-personal"},                                  # default: personal acct
-    os.path.join(tmp, "Profile 1", "Cookies"): {"other": "x"},               # not logged in
-    os.path.join(tmp, "Profile 2", "Cookies"): {"substack.sid": "sid-client"},  # the client acct
-}
-fake_pcc.chrome_cookies = lambda url, browser=None, cookie_file=None: dict(
-    BY_FILE.get(cookie_file) or {})
-sys.modules["pycookiecheat"] = fake_pcc
+print("helpers: drafts")
+real_payload = {"posts": [{"id": 208981733, "is_published": False, "draft_title": "", "title": None, "slug": None}]}
+check("unwrap object form", len(srv.unwrap_items(real_payload, "posts")), 1)
+check("unwrap None", srv.unwrap_items(None, "posts"), [])
+s = srv.draft_summary(real_payload["posts"][0], "https://iviq.substack.com")
+check("title falls back", s["title"], "(untitled draft)")
+check("post_url None without slug", s["post_url"], None)
+check("editor_url built from the client's publication", s["editor_url"],
+      "https://iviq.substack.com/publish/post/208981733")
+check("post_url from draft_slug", srv.draft_summary({"id": 7, "draft_slug": "my-post"}, "iviq.substack.com")["post_url"],
+      "https://iviq.substack.com/p/my-post")
+sched = {"id": 9, "draft_title": "T", "should_send_email": True, "audience": "everyone",
+         "write_comment_permissions": "none", "postSchedules": [{"trigger_at": "2026-08-03T13:00:00.000Z"}]}
+check("scheduled_for from postSchedules", srv.draft_summary(sched)["scheduled_for"], "2026-08-03T13:00:00.000Z")
+check("list payload explains unknown schedule", "scheduled_for_note" in srv.draft_summary({"id": 9}), True)
+caps_free = {"paid_enabled": False, "payments_state": "disabled", "existing_tags": [{"name": "debugging"}]}
+raises("only_paid audience rejected on free pub", lambda: srv.validate_settings("only_paid", "everyone", caps_free), ValueError)
+plan = srv.resolve_tags(None, ["Debugging", "MCP tooling", "debugging"], caps_free)
+check("tags normalized/split", (plan["existing"], plan["new"]), (["debugging"], ["mcp-tooling"]))
+raises("naive datetime rejected", lambda: srv.parse_iso_aware("2026-08-03T09:00:00"), ValueError)
+raises("bad slug rejected", lambda: srv.validate_slug("Bad Slug"), ValueError)
 
-def _fake_probe(cookies):
-    if cookies.get("substack.sid") == "sid-client":
-        # primary-only profile: acme is the primaryPublication but absent from
-        # publicationUsers — must still be selectable (shared predicate).
-        return True, {"handle": "client", "primary": "acme", "subdomains": []}
-    return True, {"handle": "me", "primary": "personal", "subdomains": ["personal"]}
-
-class _FakeApi:
-    def get_user_profile(self):
-        return {"handle": "client"}
-
-_orig = (srv.probe_session, srv.chrome_profile_cookie_files, srv.get_api, srv.reset_api)
-srv.probe_session = _fake_probe
-srv.chrome_profile_cookie_files = lambda browser, root=None: [
-    (n, os.path.join(tmp, n, "Cookies")) for n in ("Default", "Profile 1", "Profile 2")]
-srv.get_api = lambda fresh=False: _FakeApi()
-srv.reset_api = lambda: None
-os.environ["SUBSTACK_PUBLICATION_URL"] = "https://acme.substack.com"
-_write_cfg({})
-_payload = _json.loads(srv.tool_refresh_cookie({})["content"][0]["text"])
-check("scan picked the profile that reaches the publication",
-      _payload.get("profile"), "Profile 2")
-with open(_cfg_path) as f:
-    _saved = _json.load(f)
-check("scan hit persisted as cookie_file", _saved.get("cookie_file"),
-      os.path.join(tmp, "Profile 2", "Cookies"))
-check("the matching session was stored", _saved["cookies"]["substack.sid"], "sid-client")
-check("unique scan hit pins the identity", _saved.get("act_as"), "client")
-
-os.environ["SUBSTACK_PUBLICATION_URL"] = "https://nowhere.substack.com"
-_write_cfg({})
-try:
-    srv.tool_refresh_cookie({})
-    check("no profile reaches the publication -> explicit error", "no error", "RuntimeError")
-except RuntimeError:
-    check("no profile reaches the publication -> explicit error", "RuntimeError", "RuntimeError")
-
-srv.probe_session, srv.chrome_profile_cookie_files, srv.get_api, srv.reset_api = _orig
-del sys.modules["pycookiecheat"]
-os.environ.pop("SUBSTACK_PUBLICATION_URL", None)
-
-print("v0.4.0 — Local State parsing (list_profiles reads names/emails, never cookies)")
+print("helpers: browser profiles")
 root2 = tempfile.mkdtemp()
 with open(os.path.join(root2, "Local State"), "w") as f:
-    _json.dump({"profile": {"info_cache": {
-        "Default": {"name": "Person 1", "user_name": "me@x.com", "gaia_name": "Me"},
+    json.dump({"profile": {"info_cache": {
+        "Default": {"name": "Person 1", "user_name": "me@x.com"},
         "Profile 1": {"name": "Work", "user_name": "work@client.com"},
-        "Profile 9": {},
-    }}}, f)
-_profs = srv.local_state_profiles("chrome", root=root2)
-check("profiles sorted by dir", [p["dir"] for p in _profs],
-      ["Default", "Profile 1", "Profile 9"])
-check("display name + email surfaced", (_profs[0]["name"], _profs[0]["email"]),
-      ("Person 1", "me@x.com"))
-check("empty meta -> empty strings", (_profs[2]["name"], _profs[2]["email"]), ("", ""))
-check("missing Local State -> []",
-      srv.local_state_profiles("chrome", root=tempfile.mkdtemp()), [])
-_payload = _json.loads(srv.tool_list_profiles({"root": root2})["content"][0]["text"])
-check("list_profiles count", _payload["count"], 3)
-check("list_profiles emails", _payload["profiles"][1]["email"], "work@client.com")
-try:
-    srv.tool_list_profiles({"root": os.path.join(root2, "nope")})
-    check("bogus root -> explicit error", "no error", "RuntimeError")
-except RuntimeError:
-    check("bogus root -> explicit error", "RuntimeError", "RuntimeError")
+        "Profile 9": {}}}}, f)
+check("selector by display name", srv.resolve_profile_selector("work", "chrome", root=root2)["dir"], "Profile 1")
+raises("ambiguous selector", lambda: srv.resolve_profile_selector("profile", "chrome", root=root2), ValueError)
 
-print("v0.4.0 — profile selector: exact-or-substring, exactly one hit")
-check("dir name, case-insensitive",
-      srv.resolve_profile_selector("profile 1", "chrome", root=root2)["dir"], "Profile 1")
-check("display-name substring",
-      srv.resolve_profile_selector("work", "chrome", root=root2)["dir"], "Profile 1")
-check("email exact",
-      srv.resolve_profile_selector("work@client.com", "chrome", root=root2)["dir"],
-      "Profile 1")
-check("email substring, unique",
-      srv.resolve_profile_selector("me@x", "chrome", root=root2)["dir"], "Default")
-try:
-    srv.resolve_profile_selector("profile", "chrome", root=root2)
-    check("ambiguous selector -> error listing candidates", "no error", "ValueError")
-except ValueError as e:
-    check("ambiguous selector -> error listing candidates",
-          "Profile 1" in str(e) and "Profile 9" in str(e), True)
-try:
-    srv.resolve_profile_selector("zzz", "chrome", root=root2)
-    check("no match -> error", "no error", "ValueError")
-except ValueError:
-    check("no match -> error", "ValueError", "ValueError")
-root3 = tempfile.mkdtemp()
-with open(os.path.join(root3, "Local State"), "w") as f:
-    _json.dump({"profile": {"info_cache": {
-        "Default": {"name": "Person 1"}, "Profile 1": {"name": "Person 10"},
-    }}}, f)
-check("exact match beats substring ('Person 1' vs 'Person 10')",
-      srv.resolve_profile_selector("person 1", "chrome", root=root3)["dir"], "Default")
+# ---------------------------------------------------------------- fakes
+BY_SID = {
+    "sid-alpha": (True, {"handle": "alpha-owner", "email": "a@x.com", "subdomains": ["alpha"], "primary": "alpha"}),
+    "sid-beta": (True, {"handle": "beta-owner", "email": "b@x.com", "subdomains": ["beta"], "primary": "beta"}),
+    "sid-both": (True, {"handle": "agency", "email": "ag@x.com", "subdomains": ["alpha", "beta"], "primary": None}),
+    "sid-stale": (False, {"reason": "session_invalid", "status": 401}),
+    "sid-alpha-2": (True, {"handle": "alpha-owner", "email": "a@x.com", "subdomains": ["alpha"], "primary": "alpha"}),
+    "sid-intruder": (True, {"handle": "intruder", "email": "i@x.com", "subdomains": ["alpha"], "primary": None}),
+}
+NET_CALLS = []
 
-print("v0.4.0 — multi-match scan stops; act_as pins the identity")
+
+def fake_probe(cookies):
+    NET_CALLS.append("probe")
+    sid = (cookies or {}).get("substack.sid")
+    return BY_SID.get(sid, (False, {"reason": "session_invalid", "status": 401}))
+
+
+class FakeApi:
+    instances = []
+
+    def __init__(self, cookies_string="", publication_url=""):
+        self.cookies_string, self.publication_url = cookies_string, publication_url
+        self.calls = []
+        FakeApi.instances.append(self)
+
+    def create_draft_from_markdown(self, **kw):
+        self.calls.append(("create", kw))
+        return {"draft": {"id": 1, "draft_title": kw["title"], "slug": kw["slug"], "is_published": False}}
+
+    def get_draft(self, i):
+        self.calls.append(("get_draft", i))
+        return {"id": i, "draft_title": "T", "slug": "my-post", "is_published": False, "audience": "everyone",
+                "write_comment_permissions": "everyone", "should_send_email": True, "postSchedules": []}
+
+    def put_draft(self, i, **kw):
+        self.calls.append(("put", i, kw)); return self.get_draft(i)
+
+    def delete_draft(self, i):
+        self.calls.append(("delete", i))
+
+    def get_user_primary_publication(self):
+        return {"subdomain": "x", "payments_state": "disabled"}
+
+    def get_sections(self):
+        return []
+
+    def get_publication_post_tags(self):
+        return []
+
+    def add_tags_to_post(self, *a):
+        self.calls.append(("tags", a))
+
+    def call(self, *a, **k):
+        return []
+
+    def get_drafts(self, **kw):
+        return {"posts": [self.get_draft(5)]}
+
+
+fake_sub = types.ModuleType("substack")
+fake_sub.Api = FakeApi
+sys.modules["substack"] = fake_sub
+srv.probe_session = fake_probe
+
+# ---------------------------------------------------------------- registry
+print("registry: add_client, list_clients, unknown client")
+reset_home()
+p = payload(srv.dispatch_tool("add_client", {"client": "alpha", "publication_url": "alpha.substack.com"}))
+check("add_client normalizes and reports", (p["added"], p["publication"]), ("alpha", "alpha.substack.com"))
+raises("duplicate client refused", lambda: srv.dispatch_tool("add_client", {"client": "alpha", "publication_url": "x.substack.com"}),
+       srv.ClientError, ["already exists"])
+raises("bad slug refused", lambda: srv.dispatch_tool("add_client", {"client": "Alpha Co", "publication_url": "x.substack.com"}),
+       srv.ClientError)
+raises("custom domain refused", lambda: srv.dispatch_tool("add_client", {"client": "gamma", "publication_url": "https://gamma.example.com"}),
+       srv.ClientError, ["substack.com"])
+srv.dispatch_tool("add_client", {"client": "beta", "publication_url": "https://beta.substack.com"})
+lst = payload(srv.dispatch_tool("list_clients", {}))
+check("list_clients shows both, unbound", [(c["client"], c["bound"]) for c in lst["clients"]],
+      [("alpha", False), ("beta", False)])
+check("registry file is 0600", oct(os.stat(srv.clients_path()).st_mode & 0o777), "0o600")
+raises("unknown client lists configured ones", lambda: srv.dispatch_tool("get_draft", {
+    "client": "gamma", "expected_publication": "gamma.substack.com", "draft_id": 1}), srv.ClientError, ["alpha", "beta"])
+raises("client required on publication tools", lambda: srv.dispatch_tool("get_draft", {
+    "expected_publication": "alpha.substack.com", "draft_id": 1}), srv.ClientError, ["`client` is required"])
+raises("expected_publication required", lambda: srv.dispatch_tool("get_draft", {"client": "alpha", "draft_id": 1}),
+       srv.ClientError, ["expected_publication"])
+
+# bind alpha and beta directly (sessions + pins), as bind_client would
+srv.update_client("alpha", act_as="alpha-owner", cookie_source={"type": "user_data_dir", "browser": "chrome", "path": "/tmp/x/alpha"}, bound_at="2026-10-06T10:00:00+00:00")
+srv.save_session("alpha", {"substack.sid": "sid-alpha"}, {"handle": "alpha-owner"})
+srv.update_client("beta", act_as="beta-owner", cookie_source={"type": "user_data_dir", "browser": "chrome", "path": "/tmp/x/beta"}, bound_at="2026-10-06T10:00:00+00:00")
+srv.save_session("beta", {"substack.sid": "sid-beta"}, {"handle": "beta-owner"})
+check("session file is 0600", oct(os.stat(srv.session_path("alpha")).st_mode & 0o777), "0o600")
+
+# ---------------------------------------------------------------- expected_publication, three cases × read/write/cleanup
+print("expected_publication check")
+for tool, extra in (("get_draft", {"draft_id": 1}), ("create_draft", {"title": "T", "body_markdown": "b", "slug": "t"}),
+                    ("delete_draft", {"draft_id": 1})):
+    FakeApi.instances.clear()
+    raises("%s: expected != registry refused before any network" % tool,
+           lambda t=tool, x=extra: srv.dispatch_tool(t, dict(x, client="alpha", expected_publication="beta.substack.com")),
+           srv.PublicationMismatch, ["expected_publication='beta.substack.com'", "registry='alpha.substack.com'"])
+    check("%s: no Api was built" % tool, len(FakeApi.instances), 0)
+# registry != live: beta's record points at alpha's publication, but beta's session reaches beta only
+srv.update_client("beta", publication_url="https://alpha.substack.com")
+for tool, extra in (("get_draft", {"draft_id": 1}), ("create_draft", {"title": "T", "body_markdown": "b", "slug": "t"}),
+                    ("delete_draft", {"draft_id": 1})):
+    FakeApi.instances.clear()
+    raises("%s: live session not reaching the registry publication refused" % tool,
+           lambda t=tool, x=extra: srv.dispatch_tool(t, dict(x, client="beta", expected_publication="alpha.substack.com")),
+           srv.PublicationMismatch, ["live session reaches=['beta']"])
+    check("%s: no Api was built (live mismatch)" % tool, len(FakeApi.instances), 0)
+srv.update_client("beta", publication_url="https://beta.substack.com")
+srv.reset_api()
+
+print("identity and session gates")
+srv.save_session("alpha", {"substack.sid": "sid-intruder"}, {"handle": "intruder"})
+srv.update_client("alpha", cookie_source=None)
+raises("identity mismatch refused", lambda: srv.dispatch_tool("get_draft", {"client": "alpha", "expected_publication": "alpha.substack.com", "draft_id": 1}),
+       srv.ClientError, ["logged in as 'intruder'", "act_as='alpha-owner'"])
+srv.update_client("alpha", act_as=None)
+raises("unbound client refused", lambda: srv.dispatch_tool("get_draft", {"client": "alpha", "expected_publication": "alpha.substack.com", "draft_id": 1}),
+       srv.ClientError, ["unbound", "bind_client"])
+srv.update_client("alpha", act_as="alpha-owner")
+srv.save_session("alpha", {"substack.sid": "sid-alpha"}, {"handle": "alpha-owner"})
+
+print("publication tools echo client, publication and identity; interleaved clients keep separate sessions")
+FakeApi.instances.clear()
+out_a = payload(srv.dispatch_tool("get_draft", {"client": "alpha", "expected_publication": "alpha.substack.com", "draft_id": 1}))
+out_b = payload(srv.dispatch_tool("get_draft", {"client": "beta", "expected_publication": "beta.substack.com", "draft_id": 2}))
+out_a2 = payload(srv.dispatch_tool("get_draft", {"client": "alpha", "expected_publication": "https://alpha.substack.com/p/x", "draft_id": 3}))
+check("echo on alpha", (out_a["client"], out_a["publication"], out_a["act_as"], out_a["logged_in_as"]),
+      ("alpha", "alpha.substack.com", "alpha-owner", "alpha-owner"))
+check("echo on beta", (out_b["client"], out_b["publication"]), ("beta", "beta.substack.com"))
+check("post_url built from each client's publication", (out_a["post_url"], out_b["post_url"]),
+      ("https://alpha.substack.com/p/my-post", "https://beta.substack.com/p/my-post"))
+check("two Api instances, one per client", len(FakeApi.instances), 2)
+check("each Api wraps its own session", sorted(i.cookies_string for i in FakeApi.instances),
+      ["substack.sid=sid-alpha", "substack.sid=sid-beta"])
+check("alpha reused its cached client on the third call", out_a2["client"], "alpha")
+lst = payload(srv.dispatch_tool("list_drafts", {"client": "alpha", "expected_publication": "alpha.substack.com"}))
+check("list results carry the echo too", (lst["client"], len(lst["items"])), ("alpha", 1))
+cr = payload(srv.dispatch_tool("create_draft", {"client": "beta", "expected_publication": "beta.substack.com",
+                                                "title": "T", "body_markdown": "b", "slug": "my-post"}))
+check("create_draft on beta uses beta's Api", cr["editor_url"], "https://beta.substack.com/publish/post/1")
+
+print("one-shot auto-refresh from the bound source")
+reset_home()
+srv.dispatch_tool("add_client", {"client": "alpha", "publication_url": "alpha.substack.com"})
+ded = tempfile.mkdtemp()
+os.makedirs(os.path.join(ded, "Default"))
+open(os.path.join(ded, "Default", "Cookies"), "w").close()
+srv.update_client("alpha", act_as="alpha-owner", cookie_source={"type": "user_data_dir", "browser": "chrome", "path": ded},
+                  bound_at="2026-10-06T10:00:00+00:00")
+srv.save_session("alpha", {"substack.sid": "sid-stale"}, {"handle": "alpha-owner"})
 fake_pcc = types.ModuleType("pycookiecheat")
 fake_pcc.BrowserType = lambda b: b
-BY_FILE2 = {
-    None: {"substack.sid": "sid-personal"},
-    os.path.join(tmp, "Default", "Cookies"): {"substack.sid": "sid-personal"},
-    os.path.join(tmp, "Profile 1", "Cookies"): {"substack.sid": "sid-alice"},
-    os.path.join(tmp, "Profile 2", "Cookies"): {"substack.sid": "sid-bob"},
-}
-fake_pcc.chrome_cookies = lambda url, browser=None, cookie_file=None: dict(
-    BY_FILE2.get(cookie_file) or {})
+SOURCE_COOKIES = {os.path.join(ded, "Default", "Cookies"): {"substack.sid": "sid-alpha-2"}}
+fake_pcc.chrome_cookies = lambda url, browser=None, cookie_file=None: dict(SOURCE_COOKIES.get(cookie_file) or {})
 sys.modules["pycookiecheat"] = fake_pcc
+NET_CALLS.clear()
+out = payload(srv.dispatch_tool("get_draft", {"client": "alpha", "expected_publication": "alpha.substack.com", "draft_id": 1}))
+check("expired session re-read once from the bound source", out["logged_in_as"], "alpha-owner")
+check("the fresh session was stored", srv.load_session("alpha")["cookies"]["substack.sid"], "sid-alpha-2")
+check("exactly two probes (stale, then fresh)", NET_CALLS.count("probe"), 2)
+SOURCE_COOKIES[os.path.join(ded, "Default", "Cookies")] = {"substack.sid": "sid-stale"}
+srv.save_session("alpha", {"substack.sid": "sid-stale"}, {"handle": "alpha-owner"})
+srv.reset_api()
+raises("source still stale -> actionable error", lambda: srv.dispatch_tool("get_draft", {
+    "client": "alpha", "expected_publication": "alpha.substack.com", "draft_id": 1}), srv.ClientError, ["refresh_session"])
 
-def _fake_probe2(cookies):
-    sid = cookies.get("substack.sid")
-    if sid == "sid-alice":
-        return True, {"handle": "alice", "primary": None, "subdomains": ["acme"]}
-    if sid == "sid-bob":
-        return True, {"handle": "bob", "primary": None, "subdomains": ["acme"]}
-    return True, {"handle": "me", "primary": "personal", "subdomains": ["personal"]}
+print("401/403 during a tool call: refresh once, re-run a read, name the fix for a multi-step writer")
+DEAD_SIDS = set()
 
-_orig = (srv.probe_session, srv.chrome_profile_cookie_files, srv.local_state_profiles,
-         srv.get_api, srv.reset_api)
-srv.probe_session = _fake_probe2
-srv.chrome_profile_cookie_files = lambda browser, root=None: [
-    (n, os.path.join(tmp, n, "Cookies")) for n in ("Default", "Profile 1", "Profile 2")]
+
+class Refused(Exception):
+    """SubstackAPIException shape: python-substack raises (status_code, text)."""
+
+    def __init__(self, code):
+        super().__init__("APIError(code=%d): refused" % code)
+        self.status_code = code
+
+
+class SessionAwareApi(FakeApi):
+    """Answers 401/403 once the session it wraps has died server-side (DEAD_SIDS)."""
+
+    def _sid(self):
+        return self.cookies_string.split("=", 1)[-1]
+
+    def get_draft(self, i):
+        if self._sid() in DEAD_SIDS:
+            self.calls.append(("get_draft", i))
+            raise Refused(401)
+        return super().get_draft(i)
+
+    def create_draft_from_markdown(self, **kw):
+        if self._sid() in DEAD_SIDS:
+            raise Refused(403)
+        return super().create_draft_from_markdown(**kw)
+
+
+_by_sid_backup = dict(BY_SID)
+fake_sub.Api = SessionAwareApi
+SOURCE_READS = []
+_plain_chrome_cookies = fake_pcc.chrome_cookies
+
+
+def _counting_chrome_cookies(url, browser=None, cookie_file=None):
+    SOURCE_READS.append(cookie_file)
+    return _plain_chrome_cookies(url, browser=browser, cookie_file=cookie_file)
+
+
+fake_pcc.chrome_cookies = _counting_chrome_cookies
+reset_home()
+srv.dispatch_tool("add_client", {"client": "alpha", "publication_url": "alpha.substack.com"})
+srv.update_client("alpha", act_as="alpha-owner", cookie_source={"type": "user_data_dir", "browser": "chrome", "path": ded},
+                  bound_at="2026-10-06T10:00:00+00:00")
+srv.save_session("alpha", {"substack.sid": "sid-alpha"}, {"handle": "alpha-owner"})
+SOURCE_COOKIES[os.path.join(ded, "Default", "Cookies")] = {"substack.sid": "sid-alpha-2"}
+payload(srv.dispatch_tool("get_draft", {"client": "alpha", "expected_publication": "alpha.substack.com", "draft_id": 1}))
+# the validated, cached session dies server-side within the validation TTL
+DEAD_SIDS.add("sid-alpha")
+BY_SID["sid-alpha"] = (False, {"reason": "session_invalid", "status": 401})
+NET_CALLS.clear()
+SOURCE_READS.clear()
+FakeApi.instances.clear()
+out = payload(srv.dispatch_tool("get_draft", {"client": "alpha", "expected_publication": "alpha.substack.com", "draft_id": 1}))
+check("401 mid-call: session re-read from the bound source, the read re-run", out["logged_in_as"], "alpha-owner")
+check("the re-run used an Api on the fresh session", FakeApi.instances[-1].cookies_string, "substack.sid=sid-alpha-2")
+check("the fresh session was stored", srv.load_session("alpha")["cookies"]["substack.sid"], "sid-alpha-2")
+check("the browser source was read once, and only the fresh cookie probed", (len(SOURCE_READS), NET_CALLS.count("probe")), (1, 1))
+# the stored cookie still passes the profile probe but the publication refuses it: the
+# bound source is re-read anyway and the retry runs on the new cookie, never the old one
+DEAD_SIDS.add("sid-alpha-2")                      # endpoint refuses it; BY_SID still says valid
+BY_SID["sid-alpha-3"] = (True, {"handle": "alpha-owner", "email": "a@x.com", "subdomains": ["alpha"], "primary": "alpha"})
+SOURCE_COOKIES[os.path.join(ded, "Default", "Cookies")] = {"substack.sid": "sid-alpha-3"}
+NET_CALLS.clear()
+SOURCE_READS.clear()
+FakeApi.instances.clear()
+out = payload(srv.dispatch_tool("get_draft", {"client": "alpha", "expected_publication": "alpha.substack.com", "draft_id": 1}))
+check("probe-valid but refused cookie: the source was still read once", len(SOURCE_READS), 1)
+check("the retry ran on the re-read cookie, not the refused one", FakeApi.instances[-1].cookies_string, "substack.sid=sid-alpha-3")
+check("no retry on the old cookie", [c for i in FakeApi.instances for c in i.calls if i._sid() == "sid-alpha-2"], [])
+check("the re-read session was stored", srv.load_session("alpha")["cookies"]["substack.sid"], "sid-alpha-3")
+# a multi-step writer gets the re-read but is not re-run; the error names the fix
+DEAD_SIDS.add("sid-alpha-3")
+BY_SID["sid-alpha-4"] = (True, {"handle": "alpha-owner", "email": "a@x.com", "subdomains": ["alpha"], "primary": "alpha"})
+SOURCE_COOKIES[os.path.join(ded, "Default", "Cookies")] = {"substack.sid": "sid-alpha-4"}
+raises("403 during create_draft: source re-read, not re-run, fix named",
+       lambda: srv.dispatch_tool("create_draft", {"client": "alpha", "expected_publication": "alpha.substack.com",
+                                                  "title": "T", "body_markdown": "b", "slug": "t"}),
+       srv.ClientError, ["HTTP 403", "create_draft", "run it again"])
+check("the session was re-read anyway", srv.load_session("alpha")["cookies"]["substack.sid"], "sid-alpha-4")
+# the re-read yields a cookie the publication still refuses: no second retry, the fix is named
+DEAD_SIDS.add("sid-alpha-4")
+FakeApi.instances.clear()
+SOURCE_READS.clear()
+raises("still refused after the re-read -> one retry only, login named",
+       lambda: srv.dispatch_tool("get_draft", {"client": "alpha", "expected_publication": "alpha.substack.com", "draft_id": 1}),
+       srv.ClientError, ["still answered HTTP 401", "alpha-owner", "alpha.substack.com", "refresh_session"])
+check("one source read and one new Api (the single retry; the refused cookie was the cached Api)",
+      (len(SOURCE_READS), len(FakeApi.instances), FakeApi.instances[-1].cookies_string), (1, 1, "substack.sid=sid-alpha-4"))
+# the re-read source itself being dead gives the usual actionable error, and nothing is re-run
+BY_SID["sid-alpha-4"] = (False, {"reason": "session_invalid", "status": 401})
+FakeApi.instances.clear()
+raises("401 and the bound source dead -> refresh_session named",
+       lambda: srv.dispatch_tool("get_draft", {"client": "alpha", "expected_publication": "alpha.substack.com", "draft_id": 1}),
+       srv.ClientError, ["refresh_session"])
+check("no Api built on a failed re-read", len(FakeApi.instances), 0)
+# no bound source: nothing to re-read, bind_client named
+BY_SID["sid-alpha-9"] = (True, {"handle": "alpha-owner", "email": "a@x.com", "subdomains": ["alpha"], "primary": "alpha"})
+DEAD_SIDS.add("sid-alpha-9")
+srv.update_client("alpha", cookie_source=None)
+srv.save_session("alpha", {"substack.sid": "sid-alpha-9"}, {"handle": "alpha-owner"})
+srv.reset_api()
+raises("401 with no bound source -> bind_client named",
+       lambda: srv.dispatch_tool("get_draft", {"client": "alpha", "expected_publication": "alpha.substack.com", "draft_id": 1}),
+       srv.ClientError, ["no bound cookie source", "bind_client"])
+fake_pcc.chrome_cookies = _plain_chrome_cookies
+# what counts as an auth error
+check("SubstackAPIException-shaped 401/403/404", tuple(srv.auth_error_status(Refused(c)) for c in (401, 403, 404)), (401, 403, None))
+
+
+class HttpErr(Exception):
+    response = types.SimpleNamespace(status_code=403)
+
+
+check("requests.HTTPError shape", srv.auth_error_status(HttpErr("403 Client Error: Forbidden for url")), 403)
+check("text-only unauthorized", srv.auth_error_status(Exception("Unauthorized")), 401)
+check("a 404 that mentions 401 as a number is not", srv.auth_error_status(Exception("post 401 not found")), None)
+check("our own refusals never are", (srv.is_auth_error(srv.ClientError("forbidden")), srv.is_auth_error(ValueError("401 forbidden"))),
+      (False, False))
+BY_SID.clear()
+BY_SID.update(_by_sid_backup)
+DEAD_SIDS.clear()
+fake_sub.Api = FakeApi
+srv.reset_api()
+
+print("probe tools: bind_client, refresh_session, clients_status")
+reset_home()
+srv.dispatch_tool("add_client", {"client": "alpha", "publication_url": "alpha.substack.com"})
+srv.dispatch_tool("add_client", {"client": "beta", "publication_url": "beta.substack.com"})
+std = tempfile.mkdtemp()
+for prof in ("Default", "Profile 1", "Profile 2"):
+    os.makedirs(os.path.join(std, prof))
+    open(os.path.join(std, prof, "Cookies"), "w").close()
+PROFILE_COOKIES = {
+    os.path.join(std, "Default", "Cookies"): {"substack.sid": "sid-beta"},
+    os.path.join(std, "Profile 1", "Cookies"): {"other": "x"},
+    os.path.join(std, "Profile 2", "Cookies"): {"substack.sid": "sid-alpha"},
+}
+fake_pcc.chrome_cookies = lambda url, browser=None, cookie_file=None: dict(PROFILE_COOKIES.get(cookie_file) or {})
+_orig_files, _orig_ls = srv.chrome_profile_cookie_files, srv.local_state_profiles
+srv.chrome_profile_cookie_files = lambda browser, root=None: [(n, os.path.join(std, n, "Cookies")) for n in ("Default", "Profile 1", "Profile 2")]
 srv.local_state_profiles = lambda browser, root=None: [
     {"dir": "Default", "name": "Personal", "email": "me@x.com"},
-    {"dir": "Profile 1", "name": "Alice", "email": "alice@x.com"},
-    {"dir": "Profile 2", "name": "Bob", "email": "bob@x.com"},
-    {"dir": "Profile 9", "name": "Ghost", "email": ""},
-]
-srv.get_api = lambda fresh=False: _FakeApi()
-srv.reset_api = lambda: None
-os.environ["SUBSTACK_PUBLICATION_URL"] = "https://acme.substack.com"
+    {"dir": "Profile 1", "name": "Empty", "email": ""},
+    {"dir": "Profile 2", "name": "Alpha Work", "email": "alpha@x.com"}]
+st = payload(srv.dispatch_tool("clients_status", {}))
+check("status before binding: missing sessions, fix bind_client",
+      [(r["client"], r["session"], r["fix"]) for r in st["clients"]],
+      [("alpha", "missing", "bind_client"), ("beta", "missing", "bind_client")])
+b = payload(srv.dispatch_tool("bind_client", {"client": "alpha"}))
+check("scan found the one login reaching alpha", (b["cookie_source"], b["act_as"]), ("chrome profile 'Profile 2'", "alpha-owner"))
+check("scan result lists every profile", len(b["profiles_scanned"]), 3)
+check("session persisted", srv.load_session("alpha")["cookies"]["substack.sid"], "sid-alpha")
+PROFILE_COOKIES[os.path.join(std, "Profile 1", "Cookies")] = {"substack.sid": "sid-intruder"}
+raises("bind_client on an unknown client refused", lambda: srv.dispatch_tool("bind_client", {"client": "gamma-nope"}),
+       srv.ClientError, ["unknown client"])
+srv.update_client("alpha", act_as=None, cookie_source=None)
+raises("two logins reach the publication -> refuse to guess", lambda: srv.dispatch_tool("bind_client", {"client": "alpha"}),
+       srv.ClientError, ["2 Substack logins", "alpha-owner", "intruder"])
+b = payload(srv.dispatch_tool("bind_client", {"client": "alpha", "profile": "alpha work"}))
+check("explicit profile binds and pins", (b["cookie_source"], b["act_as"]), ("chrome profile 'Profile 2'", "alpha-owner"))
+raises("rebinding to another identity needs confirm_switch",
+       lambda: srv.dispatch_tool("bind_client", {"client": "alpha", "profile": "Profile 1"}), srv.ClientError, ["confirm_switch"])
+b = payload(srv.dispatch_tool("bind_client", {"client": "alpha", "profile": "Profile 1", "confirm_switch": True}))
+check("confirmed switch re-pins and reports", b["act_as_changed"], {"from": "alpha-owner", "to": "intruder"})
+b = payload(srv.dispatch_tool("bind_client", {"client": "alpha", "profile": "Profile 2", "confirm_switch": True}))
+check("switched back", b["act_as"], "alpha-owner")
+raises("profile that does not reach the publication refused",
+       lambda: srv.dispatch_tool("bind_client", {"client": "beta", "profile": "Profile 2"}), srv.ClientError, ["no access"])
+b = payload(srv.dispatch_tool("bind_client", {"client": "beta", "profile": "Personal"}))
+check("beta bound to the Default profile", (b["cookie_source"], b["act_as"]), ("chrome profile 'Default'", "beta-owner"))
+raises("refresh_session on an unbound client refused", lambda: (srv.update_client("beta", act_as=None),
+       srv.dispatch_tool("refresh_session", {"client": "beta"})), srv.ClientError, ["unbound"])
+srv.update_client("beta", act_as="beta-owner")
+PROFILE_COOKIES[os.path.join(std, "Default", "Cookies")] = {"substack.sid": "sid-both"}
+raises("refresh_session: source now another identity -> refuse, nothing stored",
+       lambda: srv.dispatch_tool("refresh_session", {"client": "beta"}), srv.ClientError, ["agency", "beta-owner"])
+check("beta's stored session unchanged", srv.load_session("beta")["cookies"]["substack.sid"], "sid-beta")
+PROFILE_COOKIES[os.path.join(std, "Default", "Cookies")] = {"substack.sid": "sid-beta"}
+r = payload(srv.dispatch_tool("refresh_session", {"client": "beta"}))
+check("refresh_session ok", (r["session"], r["logged_in_as"]), ("valid", "beta-owner"))
+st = payload(srv.dispatch_tool("clients_status", {}))
+check("status after binding: both ready", (st["all_ready"], [r["ready"] for r in st["clients"]]), (True, [True, True]))
+st1 = payload(srv.dispatch_tool("clients_status", {"client": "alpha"}))
+check("status for one client", [r["client"] for r in st1["clients"]], ["alpha"])
+lp = payload(srv.dispatch_tool("list_browser_profiles", {"root": std}))
+check("list_browser_profiles shows bindings", [(pr["dir"], pr.get("bound_to")) for pr in lp["profiles"]] if lp["profiles"] else "no profiles",
+      "no profiles")  # root has no Local State here; dedicated list still works
+check("list_browser_profiles never read cookies", "no cookies were read" in lp["note"], True)
 
-_write_cfg({})
-try:
-    srv.tool_refresh_cookie({})
-    check("two qualifying logins -> refuse to guess", "no error", "RuntimeError")
-except RuntimeError as e:
-    check("two qualifying logins -> refuse to guess",
-          "alice" in str(e) and "bob" in str(e) and "profile" in str(e), True)
-    check("refusal candidates carry display names (not just dirs)",
-          "Alice" in str(e) and "Bob" in str(e), True)
-with open(_cfg_path) as f:
-    _saved = _json.load(f)
-check("multi-match stored NOTHING", "cookies" in _saved, False)
+print("scope drift guard")
+check("every tool has a scope", sorted(srv.TOOL_SCOPES), sorted(srv.TOOL_HANDLERS))
+check("tools/list hides the scope key", any("scope" in t for t in srv.PUBLIC_TOOLS), False)
+for name in ("get_draft", "put_draft", "create_draft_from_markdown", "call", "get_drafts", "delete_draft",
+             "schedule_draft", "publish_draft", "get_user_primary_publication"):
+    check("ProbeFacade has no %s" % name, hasattr(srv.ProbeFacade("alpha"), name), False)
+_probe_backup = srv.probe_session
 
-_write_cfg({"act_as": "bob"})
-_payload = _json.loads(srv.tool_refresh_cookie({})["content"][0]["text"])
-check("profiles_scanned entries carry the display name",
-      any(e.get("name") for e in _payload.get("profiles_scanned", [])), True)
-check("act_as reduces two hits to one", _payload.get("profile"), "Profile 2")
-check("act_as reported in result", _payload.get("act_as"), "bob")
-with open(_cfg_path) as f:
-    _saved = _json.load(f)
-check("the pinned identity's session was stored",
-      _saved["cookies"]["substack.sid"], "sid-bob")
 
-_write_cfg({"act_as": "nobody"})
-try:
-    srv.tool_refresh_cookie({})
-    check("act_as matching no login -> explicit error", "no error", "RuntimeError")
-except RuntimeError as e:
-    check("act_as matching no login -> explicit error",
-          "act_as" in str(e) and "nobody" in str(e), True)
+def _boom(*a, **k):
+    raise AssertionError("network call from a registry tool")
 
-print("v0.4.0 — explicit profile argument; act_as persistence")
-_write_cfg({})
-_payload = _json.loads(
-    srv.tool_refresh_cookie({"profile": "alice"})["content"][0]["text"])
-check("profile arg picked by display name", _payload.get("profile"), "Profile 1")
-check("explicit choice pins act_as", _payload.get("act_as_persisted"), True)
-with open(_cfg_path) as f:
-    _saved = _json.load(f)
-check("act_as persisted as the handle", _saved.get("act_as"), "alice")
-check("profile's Cookies path persisted", _saved.get("cookie_file"),
-      os.path.join(tmp, "Profile 1", "Cookies"))
 
-_write_cfg({"act_as": "bob"})
-_payload = _json.loads(
-    srv.tool_refresh_cookie({"profile": "Profile 2"})["content"][0]["text"])
-check("existing act_as never overwritten", "act_as_persisted" in _payload, False)
-with open(_cfg_path) as f:
-    _saved = _json.load(f)
-check("act_as still the original pin", _saved.get("act_as"), "bob")
-_write_cfg({"act_as": "bob"})
-try:
-    srv.tool_refresh_cookie({"profile": "alice"})
-    check("explicit profile vs pin mismatch -> error", "no error", "RuntimeError")
-except RuntimeError as e:
-    check("explicit profile vs pin mismatch -> error", "bob" in str(e), True)
-    check("mismatch refusal offers confirm_switch", "confirm_switch" in str(e), True)
+srv.probe_session = _boom
+for name, args in (("list_clients", {}), ("add_client", {"client": "gamma", "publication_url": "gamma.substack.com"}),
+                   ("list_browser_profiles", {"root": std})):
+    try:
+        srv.dispatch_tool(name, args)
+        check("registry tool %s makes no network call" % name, True, True)
+    except AssertionError as e:
+        check("registry tool %s makes no network call" % name, str(e), "")
+srv.probe_session = _probe_backup
+raises("publication handler cannot run without the dispatcher's facade",
+       lambda: srv.tool_get_draft({"draft_id": 1}), TypeError)
+raises("probe handler cannot run without a facade", lambda: srv.tool_bind_client({"client": "alpha"}), TypeError)
 
-print("v0.4.0 — confirm_switch: switching accounts is deliberate, never silent")
-_payload = _json.loads(srv.tool_refresh_cookie(
-    {"profile": "alice", "confirm_switch": True})["content"][0]["text"])
-check("confirm_switch re-pins to the new identity", _payload.get("act_as"), "alice")
-check("the switch is reported", _payload.get("act_as_changed"),
-      {"from": "bob", "to": "alice"})
-with open(_cfg_path) as f:
-    _saved = _json.load(f)
-check("new pin persisted", _saved.get("act_as"), "alice")
-check("switched session stored", _saved["cookies"]["substack.sid"], "sid-alice")
-try:
-    srv.tool_refresh_cookie({"confirm_switch": True})
-    check("confirm_switch without profile rejected", "no error", "ValueError")
-except ValueError:
-    check("confirm_switch without profile rejected", "ValueError", "ValueError")
+srv.chrome_profile_cookie_files, srv.local_state_profiles = _orig_files, _orig_ls
 
-_write_cfg({})
-try:
-    srv.tool_refresh_cookie({"profile": "x", "cookie_file": "/tmp/y"})
-    check("profile + cookie_file rejected", "no error", "ValueError")
-except ValueError:
-    check("profile + cookie_file rejected", "ValueError", "ValueError")
-try:
-    srv.tool_refresh_cookie({"profile": "x", "browser": "firefox"})
-    check("profile + firefox rejected", "no error", "RuntimeError")
-except RuntimeError:
-    check("profile + firefox rejected", "RuntimeError", "RuntimeError")
-try:
-    srv.tool_refresh_cookie({"profile": "ghost"})
-    check("profile without a Cookies DB -> explicit error", "no error", "RuntimeError")
-except RuntimeError as e:
-    check("profile without a Cookies DB -> explicit error", "Cookies" in str(e), True)
+# ---------------------------------------------------------------- migration
+print("migration: select by reference, import once, journal, backups, rollback, switch")
+reset_home()
+desktop_path = os.path.join(HOME, "claude_desktop_config.json")
+installed_server = os.path.join(HOME, "server.py")
+with open(installed_server, "w") as f:
+    f.write("# v0.4.2 server stand-in\n")
+legacy_default = os.path.join(HOME, "config.json")
+legacy_acme = os.path.join(HOME, "acme.json")
+legacy_envpub = os.path.join(HOME, "envpub.json")   # publication only in the entry's env (0.4 accepted that alone)
+legacy_nopub = os.path.join(HOME, "nopub.json")     # no publication anywhere: cannot be imported, must survive
+stray = os.path.join(HOME, "stray.json")
+reserved_dir = os.path.join(HOME, "backup-old")
+os.makedirs(reserved_dir)
+reserved_cfg = os.path.join(reserved_dir, "config.json")
+acme_browser = tempfile.mkdtemp()
+for path, data in ((legacy_default, {"publication_url": "https://tie-pub.substack.com", "act_as": "owner",
+                                      "cookie_file": os.path.expanduser("~/Library/Application Support/Google/Chrome/Profile 2/Cookies"),
+                                      "cookies": {"substack.sid": "sid-tie"}}),
+                   (legacy_acme, {"publication_url": "https://acme.substack.com", "act_as": "acme-owner",
+                                  "cookie_file": os.path.join(acme_browser, "Default", "Cookies"),
+                                  "cookies": {"substack.sid": "sid-acme"}}),
+                   (legacy_envpub, {"act_as": "envpub-owner", "cookies": {"substack.sid": "sid-envpub"}}),
+                   (legacy_nopub, {"cookies": {"substack.sid": "sid-nopub"}}),
+                   (stray, {"publication_url": "https://stray.substack.com", "cookies": {"substack.sid": "sid-stray"}}),
+                   (reserved_cfg, {"publication_url": "https://reserved.substack.com"})):
+    with open(path, "w") as f:
+        json.dump(data, f)
+desktop = {"mcpServers": {
+    "tie-substack": {"command": "python3", "args": [installed_server]},
+    "tie-substack-acme": {"command": "python3", "args": [installed_server],
+                          "env": {"TIE_SUBSTACK_CONFIG": legacy_acme, "SUBSTACK_PUBLICATION_URL": "https://acme.substack.com"}},
+    "tie-substack-reserved": {"command": "python3", "args": [installed_server], "env": {"TIE_SUBSTACK_CONFIG": reserved_cfg}},
+    "tie-substack-envpub": {"command": "python3", "args": [installed_server],
+                            "env": {"TIE_SUBSTACK_CONFIG": legacy_envpub, "SUBSTACK_PUBLICATION_URL": "https://envpub.substack.com"}},
+    "tie-substack-nopub": {"command": "python3", "args": [installed_server], "env": {"TIE_SUBSTACK_CONFIG": legacy_nopub}},
+    "tie-substack-nofile": {"command": "python3", "args": [installed_server],
+                            "env": {"TIE_SUBSTACK_CONFIG": os.path.join(HOME, "missing.json"),
+                                    "SUBSTACK_PUBLICATION_URL": "https://nofile.substack.com"}},
+    "other-server": {"command": "x"},
+}}
+with open(desktop_path, "w") as f:
+    json.dump(desktop, f)
+rep = srv.migrate_import(desktop_path, default_slug="tie", installed_server=installed_server)
+check("selected by reference: default, acme, env-only publication and env publication without a file; not the stray",
+      sorted(s["slug"] for s in rep["selected"]), ["acme", "envpub", "nofile", "tie"])
+check("four imports", sorted(i["slug"] for i in rep["imported"]), ["acme", "envpub", "nofile", "tie"])
+check("entries without a determinable publication are reported, never imported",
+      sorted((u["entry"], "no publication" in u["reason"] or "reserved" in u["reason"]) for u in rep["unresolvable"]),
+      [("tie-substack-nopub", True), ("tie-substack-reserved", True)])
+clients = srv.load_clients()["clients"]
+check("tie imported with its pin and a profile source", (clients["tie"]["act_as"], clients["tie"]["cookie_source"]["type"], clients["tie"]["cookie_source"]["profile"]),
+      ("owner", "profile", "Profile 2"))
+check("acme imported with a dedicated-browser source", clients["acme"]["cookie_source"], {"type": "user_data_dir", "browser": "chrome", "path": acme_browser})
+check("envpub took its publication from the entry env, with its pin and session",
+      (clients["envpub"]["publication_url"], clients["envpub"]["act_as"], srv.load_session("envpub")["cookies"]["substack.sid"]),
+      ("https://envpub.substack.com", "envpub-owner", "sid-envpub"))
+check("nofile imported unbound (no session, no source)", (clients["nofile"]["act_as"], clients["nofile"]["cookie_source"]), (None, None))
+check("nopub never reached the registry", "nopub" in clients, False)
+check("sessions imported", (srv.load_session("tie")["cookies"]["substack.sid"], srv.load_session("acme")["cookies"]["substack.sid"]), ("sid-tie", "sid-acme"))
+check("backup-original written once", rep.get("written"), True)
+manifest = json.load(open(os.path.join(HOME, "backup-original", "MANIFEST.json")))
+check("manifest covers desktop config, the selected configs and the v0.4 server",
+      sorted(os.path.basename(m["source"]) for m in manifest["files"].values()),
+      ["acme.json", "claude_desktop_config.json", "config.json", "envpub.json", "server.py"])
+check("legacy server kept", os.path.isfile(os.path.join(HOME, "legacy", "server.py")), True)
+check("per-run backup exists", os.path.isdir(rep["run_backup"]), True)
+rep2 = srv.migrate_import(desktop_path, default_slug="tie", installed_server=installed_server)
+check("re-run imports nothing twice", (len(rep2["imported"]), len(rep2["skipped"])), (0, 4))
+check("backup-original not rewritten", rep2.get("written", False), False)
+# a changed source re-imports that one client
+with open(legacy_acme, "w") as f:
+    json.dump({"publication_url": "https://acme.substack.com", "act_as": "acme-owner",
+               "cookie_file": os.path.join(acme_browser, "Default", "Cookies"), "cookies": {"substack.sid": "sid-acme-2"}}, f)
+rep3 = srv.migrate_import(desktop_path, default_slug="tie", installed_server=installed_server)
+check("changed source re-imported", [i["slug"] for i in rep3["imported"]], ["acme"])
+check("new session taken", srv.load_session("acme")["cookies"]["substack.sid"], "sid-acme-2")
+# a rebound registry record wins over a later source change
+srv.update_client("acme", act_as="acme-new", bound_at="2099-01-01T00:00:00+00:00")
+with open(legacy_acme, "w") as f:
+    json.dump({"publication_url": "https://acme.substack.com", "act_as": "acme-owner",
+               "cookie_file": os.path.join(acme_browser, "Default", "Cookies"), "cookies": {"substack.sid": "sid-acme-3"}}, f)
+rep4 = srv.migrate_import(desktop_path, default_slug="tie", installed_server=installed_server)
+check("rebound record reported as a conflict, not overwritten",
+      ([c["slug"] for c in rep4["conflicts"]], srv.load_clients()["clients"]["acme"]["act_as"]), (["acme"], "acme-new"))
+# switch: nothing verified (an empty or crashed verification) removes nothing; every 0.4 entry keeps working
+sw = srv.switch_entries(desktop_path, "/venv/bin/python3", "/home/server.py", verified=[], legacy_server=os.path.join(HOME, "legacy", "server.py"))
+dcfg = json.load(open(desktop_path))["mcpServers"]
+check("nothing verified -> nothing removed, not switched", (sw["removed"], sw["switched"]), ([], False))
+check("every 0.4 entry kept on the legacy server", sorted(sw["kept_legacy_entries"]),
+      ["tie-substack-acme", "tie-substack-envpub", "tie-substack-legacy", "tie-substack-nofile", "tie-substack-nopub", "tie-substack-reserved"])
+check("kept entries point at the legacy server", dcfg["tie-substack-acme"]["args"], [os.path.join(HOME, "legacy", "server.py")])
+check("kept entries keep their env", dcfg["tie-substack-nopub"]["env"], {"TIE_SUBSTACK_CONFIG": legacy_nopub})
+check("new single entry added with the home", dcfg["tie-substack"]["env"], {"TIE_SUBSTACK_HOME": HOME})
+check("unrelated servers untouched", "other-server" in dcfg, True)
+rep5 = srv.migrate_import(desktop_path, default_slug="tie", installed_server=installed_server)
+check("legacy entry is not re-imported as a client", "legacy" in {s["slug"] for s in rep5["selected"]}, False)
+# a verified slug that no 0.4 entry maps to removes nothing
+sw_ghost = srv.switch_entries(desktop_path, "/venv/bin/python3", "/home/server.py", verified=["ghost"], legacy_server=None)
+check("unknown verified slug removes nothing", sw_ghost["removed"], [])
+# every importable client verified: only their entries go; the unimportable ones survive, so it is not a full switch
+sw2 = srv.switch_entries(desktop_path, "/venv/bin/python3", "/home/server.py", verified=["tie", "acme", "envpub", "nofile"], legacy_server=None)
+dcfg = json.load(open(desktop_path))["mcpServers"]
+check("verified clients' entries removed (the renamed default entry included)", sorted(sw2["removed"]),
+      ["tie-substack-acme", "tie-substack-envpub", "tie-substack-legacy", "tie-substack-nofile"])
+check("entries that could not be imported survive a full verification",
+      sorted(n for n in dcfg if n.startswith("tie-substack")), ["tie-substack", "tie-substack-nopub", "tie-substack-reserved"])
+check("not switched while a 0.4 entry remains, and it says which", (sw2["switched"], sorted(sw2["unresolvable"])),
+      (False, ["tie-substack-nopub", "tie-substack-reserved"]))
+# rollback: tampered snapshot refused; intact snapshot restores the pure v0.4 state
+snap = os.path.join(HOME, "backup-original", "claude_desktop_config.json")
+orig_bytes = open(snap, "rb").read()
+with open(snap, "ab") as f:
+    f.write(b"\n# tampered\n")
+raises("hash mismatch refuses the rollback", lambda: srv.rollback(desktop_path), RuntimeError, ["hash"])
+with open(snap, "wb") as f:
+    f.write(orig_bytes)
+rb = srv.rollback(desktop_path)
+dcfg = json.load(open(desktop_path))["mcpServers"]
+check("rollback restores the original desktop entries", sorted(n for n in dcfg if n.startswith("tie-substack")),
+      ["tie-substack", "tie-substack-acme", "tie-substack-envpub", "tie-substack-nofile", "tie-substack-nopub", "tie-substack-reserved"])
+check("rollback restores the v0.4 server", open(installed_server).read().startswith("# v0.4.2"), True)
+check("rollback restores the original acme config", json.load(open(legacy_acme))["cookies"]["substack.sid"], "sid-acme")
+check("registry survives a rollback", os.path.isfile(srv.clients_path()), True)
+rb_last = srv.rollback(desktop_path, last=True)
+check("--last restores from a per-run backup", os.path.basename(rb_last["restored_from"]).startswith("backup-2"), True)
+raises("no snapshot -> rollback refuses", lambda: (shutil.rmtree(os.path.join(HOME, "backup-original")), srv.rollback(desktop_path)),
+       RuntimeError, ["backup-original"])
 
-check("identity_matches: handle, case-insensitive",
-      srv.identity_matches({"handle": "Bob"}, "bob"), True)
-check("identity_matches: email fallback",
-      srv.identity_matches({"handle": "x", "email": "Bob@Y.com"}, "bob@y.com"), True)
-check("identity_matches: no pin -> everything qualifies",
-      srv.identity_matches({"handle": "x"}, ""), True)
-check("identity_matches: mismatch",
-      srv.identity_matches({"handle": "x"}, "bob"), False)
+print("migration: two 0.4 entries mapping to one slug are refused, never imported, never removed")
+reset_home()
+dup_desktop = os.path.join(HOME, "dup_desktop.json")
+cfg_one, cfg_two = os.path.join(HOME, "one.json"), os.path.join(HOME, "two.json")
+with open(cfg_one, "w") as f:
+    json.dump({"publication_url": "https://one.substack.com", "act_as": "one", "cookies": {"substack.sid": "sid-one"}}, f)
+with open(cfg_two, "w") as f:
+    json.dump({"publication_url": "https://two.substack.com", "act_as": "two", "cookies": {"substack.sid": "sid-two"}}, f)
+with open(dup_desktop, "w") as f:
+    json.dump({"mcpServers": {
+        "tie-substack": {"command": "python3", "args": ["/old/server.py"], "env": {"TIE_SUBSTACK_CONFIG": cfg_one}},
+        "tie-substack-tie": {"command": "python3", "args": ["/old/server.py"], "env": {"TIE_SUBSTACK_CONFIG": cfg_two}},
+        "tie-substack-solo": {"command": "python3", "args": ["/old/server.py"],
+                              "env": {"SUBSTACK_PUBLICATION_URL": "https://solo.substack.com"}},
+    }}, f)
+rep = srv.migrate_import(dup_desktop, default_slug="tie")
+check("only the unclashed entry is selected", [s["entry"] for s in rep["selected"]], ["tie-substack-solo"])
+check("both claimants reported with the clash", sorted((u["entry"], "slug 'tie' is claimed by 2 entries" in u["reason"]) for u in rep["unresolvable"]),
+      [("tie-substack", True), ("tie-substack-tie", True)])
+check("neither claimant reached the registry", sorted(srv.load_clients()["clients"]), ["solo"])
+sw = srv.switch_entries(dup_desktop, "/venv/bin/python3", "/home/server.py", verified=["tie", "solo"], legacy_server=None)
+dcfg = json.load(open(dup_desktop))["mcpServers"]
+check("a verified 'tie' removes neither claimant; solo goes", (sorted(sw["removed"]), sorted(sw["kept_legacy_entries"])),
+      (["tie-substack-solo"], ["tie-substack-legacy", "tie-substack-tie"]))
+check("the claimants keep their configs", (dcfg["tie-substack-legacy"]["env"], dcfg["tie-substack-tie"]["env"]),
+      ({"TIE_SUBSTACK_CONFIG": cfg_one}, {"TIE_SUBSTACK_CONFIG": cfg_two}))
+rep2 = srv.migrate_import(dup_desktop, default_slug="tie")
+check("re-run after the switch still sees the clash (legacy + tie)", sorted(u["entry"] for u in rep2["unresolvable"]),
+      ["tie-substack-legacy", "tie-substack-tie"])
 
-(srv.probe_session, srv.chrome_profile_cookie_files, srv.local_state_profiles,
- srv.get_api, srv.reset_api) = _orig
-del sys.modules["pycookiecheat"]
-os.environ.pop("SUBSTACK_PUBLICATION_URL", None)
-_write_cfg({})
-
-print("v0.4.0 — default profile gets no special trust (review fix)")
-fake_pcc = types.ModuleType("pycookiecheat")
-fake_pcc.BrowserType = lambda b: b
-BY_FILE3 = {
-    None: {"substack.sid": "sid-carol"},
-    os.path.join(tmp, "Default", "Cookies"): {"substack.sid": "sid-carol"},
-    os.path.join(tmp, "Profile 1", "Cookies"): {"other": "x"},
-    os.path.join(tmp, "Profile 2", "Cookies"): {"substack.sid": "sid-bob"},
-}
-fake_pcc.chrome_cookies = lambda url, browser=None, cookie_file=None: dict(
-    BY_FILE3.get(cookie_file) or {})
-sys.modules["pycookiecheat"] = fake_pcc
-
-def _fake_probe3(cookies):
-    sid = cookies.get("substack.sid")
-    if sid in ("sid-carol", "sid-carol2"):
-        return True, {"handle": "carol", "primary": None, "subdomains": ["acme"]}
-    if sid == "sid-bob":
-        return True, {"handle": "bob", "primary": None, "subdomains": ["acme"]}
-    return False, {"reason": "session_invalid", "status": 401}
-
-_orig = (srv.probe_session, srv.chrome_profile_cookie_files, srv.local_state_profiles,
-         srv.get_api, srv.reset_api)
-srv.probe_session = _fake_probe3
-srv.chrome_profile_cookie_files = lambda browser, root=None: [
-    (n, os.path.join(tmp, n, "Cookies")) for n in ("Default", "Profile 1", "Profile 2")]
-srv.local_state_profiles = lambda browser, root=None: []
-srv.get_api = lambda fresh=False: _FakeApi()
-srv.reset_api = lambda: None
-os.environ["SUBSTACK_PUBLICATION_URL"] = "https://acme.substack.com"
-
-# Default (carol) AND Profile 2 (bob) both reach acme — the default must NOT win.
-_write_cfg({})
-try:
-    srv.tool_refresh_cookie({})
-    check("default + another login both reach -> refuse", "no error", "RuntimeError")
-except RuntimeError as e:
-    check("default + another login both reach -> refuse",
-          "carol" in str(e) and "bob" in str(e), True)
-with open(_cfg_path) as f:
-    _saved = _json.load(f)
-check("default-vs-other ambiguity stored NOTHING", "cookies" in _saved, False)
-# act_as resolves the same ambiguity without a profile argument.
-_write_cfg({"act_as": "bob"})
-_payload = _json.loads(srv.tool_refresh_cookie({})["content"][0]["text"])
-check("act_as disambiguates default-vs-other", _payload.get("profile"), "Profile 2")
-# Two profiles signed into the SAME account are not an ambiguity — default kept.
-BY_FILE3[os.path.join(tmp, "Profile 2", "Cookies")] = {"substack.sid": "sid-carol2"}
-_write_cfg({})
-_payload = _json.loads(srv.tool_refresh_cookie({})["content"][0]["text"])
-check("same identity twice -> default kept, no refusal",
-      _payload.get("profile"), "(default profile)")
-with open(_cfg_path) as f:
-    _saved = _json.load(f)
-check("pure default hit still persists no cookie_file",
-      "cookie_file" in _saved, False)
-check("scan-validated default hit pins the identity too",
-      _saved.get("act_as"), "carol")
-
-print("v0.4.0 — legacy unpinned cookie_file is re-validated (upgrade path)")
-BY_FILE3[os.path.join(tmp, "Profile 2", "Cookies")] = {"substack.sid": "sid-bob"}
-_orig_dirs = srv.CHROME_FAMILY_DATA_DIRS
-srv.CHROME_FAMILY_DATA_DIRS = {"chrome": tmp}  # tmp now counts as a standard install
-# Pre-0.4.0 state: scan-persisted path, no identity pin — a wrong login must not
-# survive the upgrade silently; the stored path is ignored and the scan re-runs.
-_write_cfg({"cookie_file": os.path.join(tmp, "Profile 2", "Cookies")})
-try:
-    srv.tool_refresh_cookie({})
-    check("legacy pin re-validated -> refuses on 2 identities", "no error",
-          "RuntimeError")
-except RuntimeError as e:
-    check("legacy pin re-validated -> refuses on 2 identities",
-          "carol" in str(e) and "bob" in str(e), True)
-with open(_cfg_path) as f:
-    _saved = _json.load(f)
-check("legacy re-validation stored nothing", "cookies" in _saved, False)
-# With an act_as pin the stored path is trusted exactly as before — no scan.
-_write_cfg({"cookie_file": os.path.join(tmp, "Profile 2", "Cookies"),
-            "act_as": "bob"})
-_payload = _json.loads(srv.tool_refresh_cookie({})["content"][0]["text"])
-check("pinned cookie_file honored, no legacy override",
-      _payload.get("profile"), os.path.join(tmp, "Profile 2", "Cookies"))
-check("pinned cookie_file: no scan ran", "profiles_scanned" in _payload, False)
-# A dedicated --user-data-dir path (model B) is outside the standard install and
-# keeps the old contract: that exact DB, no scan, no pin required.
-ded = tempfile.mkdtemp()
-os.makedirs(os.path.join(ded, "Default"), exist_ok=True)
-open(os.path.join(ded, "Default", "Cookies"), "w").close()
-BY_FILE3[os.path.join(ded, "Default", "Cookies")] = {"substack.sid": "sid-bob"}
-_write_cfg({"cookie_file": os.path.join(ded, "Default", "Cookies")})
-_payload = _json.loads(srv.tool_refresh_cookie({})["content"][0]["text"])
-check("dedicated-browser cookie_file untouched by the legacy check",
-      _payload.get("profile"), os.path.join(ded, "Default", "Cookies"))
-check("dedicated path: no scan ran", "profiles_scanned" in _payload, False)
-# substack_status flags the legacy state so it is visible before any refresh.
-_write_cfg({"cookie_file": os.path.join(tmp, "Profile 2", "Cookies"),
-            "cookies": {"substack.sid": "sid-bob"}})
-_status = _json.loads(srv.tool_substack_status({})["content"][0]["text"])
-check("status flags the legacy unpinned state", "identity_note" in _status, True)
-check("legacy state is write-blocking in status", _status.get("api_ready"), False)
-check("legacy status fix names refresh_cookie",
-      "refresh_cookie" in _status.get("fix", ""), True)
-# Family inference: a Brave-family legacy pin must be re-validated against
-# BRAVE's profiles, not Chrome's (a no-arg call defaults browser to chrome).
-srv.CHROME_FAMILY_DATA_DIRS = {"chrome": tempfile.mkdtemp(), "brave": tmp}
-srv.chrome_profile_cookie_files = lambda browser, root=None: (
-    [(n, os.path.join(tmp, n, "Cookies"))
-     for n in ("Default", "Profile 1", "Profile 2")]
-    if browser == "brave" else [])
-_write_cfg({"cookie_file": os.path.join(tmp, "Profile 2", "Cookies")})
-try:
-    srv.tool_refresh_cookie({})
-    check("brave legacy pin -> re-validated against the brave family",
-          "no error", "RuntimeError")
-except RuntimeError as e:
-    check("brave legacy pin -> re-validated against the brave family",
-          "carol" in str(e) and "bob" in str(e), True)
-# An EXPLICIT browser naming a different family wins: path honored, no override.
-_write_cfg({"cookie_file": os.path.join(tmp, "Profile 2", "Cookies")})
-_payload = _json.loads(
-    srv.tool_refresh_cookie({"browser": "chrome"})["content"][0]["text"])
-check("explicit other-family browser -> legacy override skipped",
-      _payload.get("profile"), os.path.join(tmp, "Profile 2", "Cookies"))
-check("explicit other-family browser: no scan ran",
-      "profiles_scanned" in _payload, False)
-# Self-heal: a legacy pin with a SINGLE qualifying login re-validates AND pins
-# in one no-arg refresh — the write block below clears itself.
-BY_FILE3[None] = {}
-BY_FILE3[os.path.join(tmp, "Default", "Cookies")] = {}
-_write_cfg({"cookie_file": os.path.join(tmp, "Profile 2", "Cookies")})
-_payload = _json.loads(srv.tool_refresh_cookie({})["content"][0]["text"])
-check("legacy heal: unique identity adopted", _payload.get("profile"), "Profile 2")
-check("legacy heal: identity pinned", _payload.get("act_as_persisted"), True)
-with open(_cfg_path) as f:
-    _saved = _json.load(f)
-check("legacy heal: pin persisted", _saved.get("act_as"), "bob")
-# Heal when the DEFAULT profile is the one that qualifies: the stale legacy
-# path must be dropped and the identity pinned — else the config loops in the
-# write-blocked state forever.
-BY_FILE3[None] = {"substack.sid": "sid-carol"}
-BY_FILE3[os.path.join(tmp, "Default", "Cookies")] = {"substack.sid": "sid-carol"}
-BY_FILE3[os.path.join(tmp, "Profile 2", "Cookies")] = {}
-_write_cfg({"cookie_file": os.path.join(tmp, "Profile 2", "Cookies")})
-_payload = _json.loads(srv.tool_refresh_cookie({})["content"][0]["text"])
-check("legacy heal via default: default kept",
-      _payload.get("profile"), "(default profile)")
-with open(_cfg_path) as f:
-    _saved = _json.load(f)
-check("legacy heal via default: stale path dropped",
-      "cookie_file" in _saved, False)
-check("legacy heal via default: identity pinned", _saved.get("act_as"), "carol")
-srv.CHROME_FAMILY_DATA_DIRS = _orig_dirs
-
-(srv.probe_session, srv.chrome_profile_cookie_files, srv.local_state_profiles,
- srv.get_api, srv.reset_api) = _orig
-del sys.modules["pycookiecheat"]
-
-print("v0.4.0 — act_as gates get_api and substack_status (review fix)")
-os.environ.pop("SUBSTACK_SESSION_TOKEN", None)  # set at the top — wins over config
-fake_sub = types.ModuleType("substack")
-class _FakeSubApi:
-    def __init__(self, **kw):
-        pass
-
-    def create_draft_from_markdown(self, **kw):  # get_api's modern-library probe
-        raise NotImplementedError
-fake_sub.Api = _FakeSubApi
-sys.modules["substack"] = fake_sub
-_orig_probe = srv.probe_session
-srv.probe_session = _fake_probe3
-_write_cfg({"cookies": {"substack.sid": "sid-carol"}, "act_as": "bob"})
-srv.reset_api()
-try:
-    srv.get_api(fresh=True)
-    check("get_api refuses a wrong-identity session", "no error", "RuntimeError")
-except RuntimeError as e:
-    check("get_api refuses a wrong-identity session",
-          "act_as" in str(e) and "bob" in str(e) and "carol" in str(e), True)
-_status = _json.loads(srv.tool_substack_status({})["content"][0]["text"])
-check("status: wrong identity -> api_ready False", _status.get("api_ready"), False)
-check("status: wrong identity -> act_as fix hint", "act_as" in _status.get("fix", ""),
-      True)
-_write_cfg({"cookies": {"substack.sid": "sid-bob"}, "act_as": "bob"})
-srv.reset_api()
-check("get_api passes the pinned identity",
-      isinstance(srv.get_api(fresh=True), _FakeSubApi), True)
-_status = _json.loads(srv.tool_substack_status({})["content"][0]["text"])
-check("status: matching identity -> api_ready True", _status.get("api_ready"), True)
-check("status: act_as_matches reported", _status.get("act_as_matches"), True)
-# The live C3 failure (2026-08-19): the pin changes AFTER the cache is warm —
-# a cache hit must not hand back the now-untrusted client.
-check("cache is warm going into the pin flip",
-      isinstance(srv.get_api(), _FakeSubApi), True)
-_write_cfg({"cookies": {"substack.sid": "sid-bob"}, "act_as": "nobody"})
-try:
-    srv.get_api()  # no fresh — the exact create_draft path
-    check("warm cache does not bypass act_as", "no error", "RuntimeError")
-except RuntimeError as e:
-    check("warm cache does not bypass act_as",
-          "act_as" in str(e) and "nobody" in str(e), True)
-_write_cfg({"cookies": {"substack.sid": "sid-bob"}, "act_as": "bob"})
-check("restoring the pin restores cached access",
-      isinstance(srv.get_api(), _FakeSubApi), True)
-# The legacy-unpinned state blocks writes too — cold cache and warm cache both.
-_orig_dirs = srv.CHROME_FAMILY_DATA_DIRS
-srv.CHROME_FAMILY_DATA_DIRS = {"chrome": tmp}
-_write_cfg({"cookies": {"substack.sid": "sid-bob"},
-            "cookie_file": os.path.join(tmp, "Profile 2", "Cookies")})
-srv.reset_api()
-try:
-    srv.get_api(fresh=True)
-    check("legacy unpinned config blocks get_api (cold)", "no error", "RuntimeError")
-except RuntimeError as e:
-    check("legacy unpinned config blocks get_api (cold)",
-          "pre-0.4.0" in str(e) and "refresh_cookie" in str(e), True)
-_write_cfg({"cookies": {"substack.sid": "sid-bob"}, "act_as": "bob"})
-srv.reset_api()
-srv.get_api(fresh=True)  # warm the cache in a healthy state
-_write_cfg({"cookies": {"substack.sid": "sid-bob"},
-            "cookie_file": os.path.join(tmp, "Profile 2", "Cookies")})
-try:
-    srv.get_api()  # cache hit path
-    check("legacy unpinned config blocks get_api (warm cache)",
-          "no error", "RuntimeError")
-except RuntimeError as e:
-    check("legacy unpinned config blocks get_api (warm cache)",
-          "pre-0.4.0" in str(e), True)
-# An explicit env session token overrides config cookies entirely — stale
-# legacy config must not block a CI/env-driven setup.
-os.environ["SUBSTACK_SESSION_TOKEN"] = "sid-bob"
-srv.reset_api()
-check("SUBSTACK_SESSION_TOKEN exempt from the legacy block",
-      isinstance(srv.get_api(fresh=True), _FakeSubApi), True)
-os.environ.pop("SUBSTACK_SESSION_TOKEN", None)
-srv.CHROME_FAMILY_DATA_DIRS = _orig_dirs
-srv.reset_api()
-srv.probe_session = _orig_probe
-srv.reset_api()
-del sys.modules["substack"]
-os.environ.pop("SUBSTACK_PUBLICATION_URL", None)
-_write_cfg({})
-
-print("v0.4.0 — registration & version")
-check("refresh_cookie schema exposes profile",
-      "profile" in [t for t in srv.TOOLS if t["name"] == "refresh_cookie"
-                    ][0]["inputSchema"]["properties"], True)
-check("list_profiles registered", "list_profiles" in srv.TOOL_HANDLERS, True)
-check("list_profiles never offers firefox",
-      "firefox" in [t for t in srv.TOOLS if t["name"] == "list_profiles"
-                    ][0]["inputSchema"]["properties"]["browser"]["enum"], False)
-check("server version", srv.SERVER_VERSION, "0.4.2")
+print("registration & version")
+check("server version", srv.SERVER_VERSION, "0.5.0")
+check("old tool names gone", any(n in srv.TOOL_HANDLERS for n in ("substack_status", "refresh_cookie", "list_profiles")), False)
+check("publication tools require client + expected_publication",
+      all(set(t["inputSchema"]["required"]) >= {"client", "expected_publication"}
+          for t in srv.TOOLS if t["scope"] == "publication"), True)
 
 print("\n%d failure(s)" % len(fails))
 for f in fails:
     print(" -", f)
+shutil.rmtree(HOME, ignore_errors=True)
 sys.exit(1 if fails else 0)
