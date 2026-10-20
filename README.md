@@ -12,6 +12,9 @@ Substack has no official write API. This server wraps the community
 endpoints): functional for years, but an unofficial integration; endpoints may change, and
 scheduling more than 3 months out is not supported by Substack.
 
+Design docs: [`wearevolt/internal-agentic-services-docs`](https://github.com/wearevolt/internal-agentic-services-docs),
+`docs/marketing/` (the 0.5 client registry is designed in `20260928_apotapov_productization/`).
+
 ## The client contract (0.5.0)
 
 - **Every Substack-facing tool takes `client`**: the brand slug the tie-social plugin uses
