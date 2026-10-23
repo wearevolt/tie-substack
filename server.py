@@ -28,6 +28,12 @@ It exists so the tie-social skill can run its Substack leg from Claude surfaces
   - Sessions switch per call; an expired session is re-read once from the client's bound
     cookie source, then the call fails with the fix named.
 
+0.6.0: Substack Notes, through Substack's own Notes scheduler (a note draft with a
+trigger_at is published by Substack, so nothing here runs at publish time):
+create_note_draft, schedule_note, unschedule_note, update_note_draft, list_note_drafts,
+delete_note_draft, publish_note. Notes belong to the logged-in user, not the publication, so
+every note tool also requires that user's primary publication to be the client's.
+
 Env:
   TIE_SUBSTACK_HOME        registry home (default ~/.tie-substack); tests point it at a temp dir
   TIE_SUBSTACK_CLIENT +    an explicit substack.sid for exactly that client (CI-style setups);
@@ -57,7 +63,7 @@ import traceback
 from datetime import datetime, timezone
 
 SERVER_NAME = "tie-substack"
-SERVER_VERSION = "0.5.0"
+SERVER_VERSION = "0.6.0"
 CONFIG_FORMAT_VERSION = 1
 
 AUDIENCE_VALUES = ("everyone", "only_free", "only_paid", "founding")
@@ -67,6 +73,9 @@ FALLBACK_PROTOCOL = "2025-06-18"
 SESSION_TTL_SECONDS = 600  # a validated session is trusted this long between probes
 SLUG_RE = re.compile(r"^[a-z0-9]+(?:-[a-z0-9]+)*$")
 CLIENT_RE = re.compile(r"^[a-z][a-z0-9-]{1,30}$")
+NOTE_LINK_RE = re.compile(r"\[([^\]]+)\]\((https?://(?:[^\s()]|\([^\s()]*\))+)\)"
+                          r"|(https?://(?:[^\s<>()]|\([^\s<>()]*\))*(?:[^\s<>().,;:!?'\"]|\([^\s<>()]*\)))")
+NOTE_DRAFTS_PAGE = 20  # feed/drafts page size, as the Notes editor requests it
 RESERVED_NAMES = ("clients.json", "migration.json")
 RESERVED_DIR_PREFIXES = ("sessions", "backup-", "legacy", "venv", "python", "cache", "bin")
 
@@ -852,6 +861,159 @@ def validate_slug(slug):
     return slug
 
 
+# ---------------------------------------------------------------- notes helpers
+
+
+def notes_call(api, method, path, body=None, params=None):
+    """One Notes request on the client's session. python-substack has no Notes methods, so
+    this follows its own pattern (base_url, _handle_response): errors carry status_code."""
+    from substack import Api  # noqa: PLC0415
+
+    response = api._session.request(method, "%s/%s" % (api.base_url, path), json=body, params=params)
+    if 200 <= response.status_code < 300 and not response.content:
+        return {}  # DELETE answers with an empty body
+    return Api._handle_response(response=response)
+
+
+def _link_text(text, href):
+    return {"type": "text", "text": text, "marks": [{"type": "link", "attrs": {
+        "href": href, "target": "_blank", "rel": "nofollow ugc noopener", "class": "note-link", "title": None}}]}
+
+
+def note_body_json(text):
+    """Plain text -> the ProseMirror doc the Notes editor sends. One paragraph per line (an
+    empty line stays an empty paragraph, as the editor stores it); bare URLs and
+    [text](url) become link marks."""
+    text = (text or "").replace("\r\n", "\n").strip()
+    if not text:
+        raise ValueError("the note text is empty")
+    paragraphs = []
+    for line in text.split("\n"):
+        nodes, pos = [], 0
+        for m in NOTE_LINK_RE.finditer(line):
+            if m.start() > pos:
+                nodes.append({"type": "text", "text": line[pos:m.start()]})
+            nodes.append(_link_text(m.group(1), m.group(2)) if m.group(2) else _link_text(m.group(3), m.group(3)))
+            pos = m.end()
+        if pos < len(line):
+            nodes.append({"type": "text", "text": line[pos:]})
+        paragraphs.append({"type": "paragraph", "content": nodes} if nodes else {"type": "paragraph"})
+    return {"type": "doc", "attrs": {"schemaVersion": "v1", "title": None}, "content": paragraphs}
+
+
+def note_trigger_at(value):
+    """An offset-carrying ISO time in the future -> the UTC string Substack stores."""
+    dt = parse_iso_aware(value)
+    now = datetime.now(timezone.utc)
+    if dt <= now:
+        raise ValueError("datetime_iso %s is in the past (now %s UTC)" % (value, now.isoformat(timespec="seconds")))
+    utc = dt.astimezone(timezone.utc)
+    return "%s.%03dZ" % (utc.strftime("%Y-%m-%dT%H:%M:%S"), utc.microsecond // 1000)
+
+
+def note_attachment_ids(note):
+    return [a["id"] for a in (note or {}).get("attachments") or [] if isinstance(a, dict) and a.get("id")]
+
+
+def note_summary(note):
+    """Cookie-free view of a note or note draft as Substack returns it."""
+    if not isinstance(note, dict):
+        return {"warning": "unexpected note payload shape", "raw": str(note)[:200]}
+    when = note.get("trigger_at")
+    status = note.get("status") or "draft"
+    return {
+        "note_id": note.get("id"),
+        "status": "scheduled" if status == "draft" and when else status,
+        "scheduled_for": when,
+        "text": note.get("body"),
+        "attachments": [{"type": a.get("type"), "post_id": (a.get("post") or {}).get("id"),
+                         "comment_id": (a.get("comment") or {}).get("id")}
+                        for a in (note.get("attachments") or []) if isinstance(a, dict)],
+    }
+
+
+def note_drafts(api):
+    """{id: draft} over every page of the account's note drafts and scheduled notes
+    (feed/drafts pages by ?cursor=<nextCursor>)."""
+    out, cursor, seen = {}, None, set()
+    while True:
+        params = {"limit": NOTE_DRAFTS_PAGE}
+        if cursor:
+            params["cursor"] = cursor
+        page = notes_call(api, "GET", "feed/drafts", params=params) or {}
+        for d in page.get("drafts") or []:
+            if isinstance(d, dict):
+                out[d.get("id")] = d
+        cursor = page.get("nextCursor")
+        if not page.get("hasMore") or not cursor or cursor in seen:
+            return out
+        seen.add(cursor)
+
+
+def note_draft(api, note_id):
+    d = note_drafts(api).get(int(note_id)) if str(note_id).isdigit() else None
+    if d is None:
+        raise ClientError("note %s is not among this account's note drafts or scheduled notes "
+                          "(list_note_drafts); a published note cannot be changed here" % note_id)
+    return d
+
+
+def note_draft_body(draft):
+    return draft.get("body_json") or note_body_json(draft.get("body"))
+
+
+def primary_subdomain(profile):
+    """The profile's primary publication, strictly: primaryPublication, else the
+    publicationUsers entry marked is_primary. No fallback to the first publication (the
+    library's get_user_primary_publication has one), so an unmarked account proves nothing."""
+    pub = (profile or {}).get("primaryPublication")
+    if not pub:
+        pub = next((pu.get("publication") for pu in (profile or {}).get("publicationUsers") or []
+                    if isinstance(pu, dict) and pu.get("is_primary")), None)
+    return ((pub or {}).get("subdomain") or "").lower() or None
+
+
+def require_author_session(api, ctx):
+    """Notes go out under the session's own user, not under the publication: a session bound
+    through a team member's login would post on that member's profile. So a note tool runs only
+    when the logged-in user's primary publication is the client's."""
+    profile = api.get_user_profile() or {}
+    primary = primary_subdomain(profile)
+    if primary != subdomain_of(ctx["publication"]):
+        raise ClientError(
+            "client %r: notes would be posted on %r's own profile, whose primary publication is %r, "
+            "not %s. Bind the client to the publication owner's login (bind_client with "
+            "confirm_switch) before using note tools." % (ctx["client"], profile.get("handle"), primary, ctx["publication"]))
+
+
+def note_attachment(api, link_url):
+    """A link card for a post or note URL (a note URL makes a quote-restack)."""
+    if not re.match(r"^https?://", link_url or ""):
+        raise ValueError("link_url %r must be an http(s) URL" % link_url)
+    att = notes_call(api, "POST", "comment/attachment", {"url": link_url, "type": "link"}) or {}
+    if not att.get("id"):
+        raise RuntimeError("Substack returned no attachment id for %s" % link_url)
+    return att
+
+
+def patch_note(api, draft, body_json, trigger):
+    """The one PATCH every editing tool uses: the draft's own attachmentIds go along, because a
+    PATCH without them drops the link card. -> (stored draft, attachment ids it lost, still
+    listed). A note gone from the drafts right after a successful PATCH has most likely
+    published (a near-term schedule): the PATCH answer is reported instead of an error."""
+    ids = note_attachment_ids(draft)
+    body = {"bodyJson": body_json, "replyMinimumRole": draft.get("reply_minimum_role") or "everyone",
+            "trigger_at": trigger}
+    if ids:
+        body["attachmentIds"] = ids
+    answer = notes_call(api, "PATCH", "feed/comment/%s" % draft["id"], body) or {}
+    stored = note_drafts(api).get(draft["id"])
+    listed = stored is not None
+    if not listed:
+        stored = dict(answer, id=draft["id"])
+    return stored, [i for i in ids if i not in note_attachment_ids(stored)], listed
+
+
 def text_result(payload, ctx=None):
     if ctx:
         if isinstance(payload, dict):
@@ -880,6 +1042,9 @@ EXPECTED_PROP = {
     }
 }
 DRAFT_ID = {"draft_id": {"type": ["integer", "string"]}}
+NOTE_ID = {"note_id": {"type": ["integer", "string"]}}
+NOTE_TEXT = {"text": {"type": "string", "description": "The note as plain text: one paragraph per line; bare URLs and [text](url) become links."}}
+NOTE_LINK = {"link_url": {"type": "string", "description": "OPTIONAL. A post or note URL attached as a link card (a note URL makes a quote-restack)."}}
 
 
 def _schema(props, required):
@@ -1043,6 +1208,49 @@ TOOLS = [
         "scope": "publication",
         "description": "Delete a draft by id.",
         "inputSchema": _pub_schema(dict(DRAFT_ID), ["draft_id"]),
+    },
+    # ---- notes (publication scope; also require the logged-in user to be the publication's author)
+    {
+        "name": "create_note_draft",
+        "scope": "publication",
+        "description": "Save a Substack Note as a DRAFT on the client's profile (not published, not scheduled), optionally with a link card. Returns note_id and the draft as stored. schedule_note then gives it a publish time.",
+        "inputSchema": _pub_schema(dict(NOTE_TEXT, **NOTE_LINK), ["text"]),
+    },
+    {
+        "name": "schedule_note",
+        "scope": "publication",
+        "description": "Schedule (or reschedule) a note draft at an exact instant (datetime_iso MUST carry an offset; past times rejected). Substack's own scheduler publishes it; nothing needs to run here. Keeps the link card. Returns the schedule AS STORED.",
+        "inputSchema": _pub_schema(dict(NOTE_ID, datetime_iso={"type": "string"}), ["note_id", "datetime_iso"]),
+    },
+    {
+        "name": "unschedule_note",
+        "scope": "publication",
+        "description": "Cancel a scheduled note's publication; it stays a draft (link card kept).",
+        "inputSchema": _pub_schema(dict(NOTE_ID), ["note_id"]),
+    },
+    {
+        "name": "update_note_draft",
+        "scope": "publication",
+        "description": "Replace the text of a note draft or scheduled note; its schedule and link card stay.",
+        "inputSchema": _pub_schema(dict(NOTE_ID, **NOTE_TEXT), ["note_id", "text"]),
+    },
+    {
+        "name": "list_note_drafts",
+        "scope": "publication",
+        "description": "Every note draft and scheduled note of the client's profile, soonest first (scheduled ones carry scheduled_for).",
+        "inputSchema": _pub_schema({}),
+    },
+    {
+        "name": "delete_note_draft",
+        "scope": "publication",
+        "description": "Delete a note draft or scheduled note by id. Refuses an id that is not among the drafts (never deletes a published note).",
+        "inputSchema": _pub_schema(dict(NOTE_ID), ["note_id"]),
+    },
+    {
+        "name": "publish_note",
+        "scope": "publication",
+        "description": "PUBLISH a note NOW (needs confirm_publish_now). Only on an explicit user instruction; the normal flow is create_note_draft + schedule_note.",
+        "inputSchema": _pub_schema(dict(NOTE_TEXT, confirm_publish_now={"type": "boolean", "default": False}, **NOTE_LINK), ["text"]),
     },
 ]
 TOOL_SCOPES = {t["name"]: t["scope"] for t in TOOLS}
@@ -1516,6 +1724,114 @@ def tool_delete_draft(args, api, ctx):
     return text_result({"deleted": True, "draft_id": args["draft_id"]}, ctx)
 
 
+# ---------------------------------------------------------------- note tools
+
+
+def _warn(summary, text):
+    summary["warning"] = "; ".join(w for w in (summary.get("warning"), text) if w)
+
+
+def _patch_warnings(summary, lost, listed):
+    """What a PATCH-based tool reports beyond its own schedule check, added, never replacing."""
+    if not listed:
+        _warn(summary, "the note is no longer among the drafts after the change, so it has most likely published "
+                       "already; check the profile's notes before scheduling it again")
+    if lost:
+        _warn(summary, "Substack dropped the link card(s) %s from this note; check it in the Notes editor, or "
+                       "delete_note_draft and create it again with link_url" % lost)
+
+
+def tool_create_note_draft(args, api, ctx):
+    require_author_session(api, ctx)
+    body = {"bodyJson": note_body_json(args.get("text")), "replyMinimumRole": "everyone"}
+    if args.get("link_url"):
+        body["attachmentIds"] = [note_attachment(api, args["link_url"])["id"]]
+    note = notes_call(api, "POST", "comment/draft", body) or {}
+    stored = note_drafts(api).get(note.get("id"))
+    summary = note_summary(stored or note)
+    if stored is None:
+        summary["warning"] = "the draft was created but is not listed in feed/drafts yet; verify with list_note_drafts"
+    summary["next"] = "schedule_note gives it a publish time; until then it stays a draft"
+    return text_result(summary, ctx)
+
+
+def tool_schedule_note(args, api, ctx):
+    require_author_session(api, ctx)
+    when = note_trigger_at(args.get("datetime_iso"))
+    draft = note_draft(api, args.get("note_id"))
+    stored, lost, listed = patch_note(api, draft, note_draft_body(draft), when)
+    summary = note_summary(stored)
+    summary["requested_for"] = args["datetime_iso"]
+    summary["utc_equivalent"] = when
+    _patch_warnings(summary, lost, listed)
+    got = stored.get("trigger_at")
+    if not got:
+        _warn(summary, "Substack did not report a schedule after the call; verify with list_note_drafts")
+    elif parse_iso_aware(got) != parse_iso_aware(when):
+        _warn(summary, "stored schedule %s differs from the requested %s; the STORED value is what will fire"
+                       % (got, when))
+    summary["undo"] = "call unschedule_note to cancel while it is still pending"
+    return text_result(summary, ctx)
+
+
+def tool_unschedule_note(args, api, ctx):
+    require_author_session(api, ctx)
+    draft = note_draft(api, args.get("note_id"))
+    stored, lost, listed = patch_note(api, draft, note_draft_body(draft), None)
+    summary = note_summary(stored)
+    _patch_warnings(summary, lost, listed)
+    if stored.get("trigger_at"):
+        _warn(summary, "Substack still reports a schedule (%s); verify with list_note_drafts" % stored["trigger_at"])
+    return text_result(summary, ctx)
+
+
+def tool_update_note_draft(args, api, ctx):
+    require_author_session(api, ctx)
+    body_json = note_body_json(args.get("text"))
+    draft = note_draft(api, args.get("note_id"))
+    stored, lost, listed = patch_note(api, draft, body_json, draft.get("trigger_at"))
+    summary = note_summary(stored)
+    _patch_warnings(summary, lost, listed)
+    if stored.get("trigger_at") != draft.get("trigger_at"):
+        _warn(summary, "the schedule changed from %s to %s while editing; check it with list_note_drafts"
+                       % (draft.get("trigger_at"), stored.get("trigger_at")))
+    return text_result(summary, ctx)
+
+
+def tool_list_note_drafts(_args, api, ctx):
+    require_author_session(api, ctx)
+    notes = [note_summary(d) for d in note_drafts(api).values()]
+    notes.sort(key=lambda n: (n["scheduled_for"] is None, n["scheduled_for"] or ""))
+    return text_result(notes, ctx)
+
+
+def tool_delete_note_draft(args, api, ctx):
+    require_author_session(api, ctx)
+    draft = note_draft(api, args.get("note_id"))
+    notes_call(api, "DELETE", "comment/%s" % draft["id"])
+    result = {"deleted": True, "note_id": draft["id"]}
+    if draft["id"] in note_drafts(api):
+        result = {"deleted": False, "note_id": draft["id"],
+                  "warning": "the note is still listed among the drafts; verify with list_note_drafts"}
+    return text_result(result, ctx)
+
+
+def tool_publish_note(args, api, ctx):
+    if not args.get("confirm_publish_now"):
+        raise ValueError("publish_note posts the note on the client's profile right now and cannot be "
+                         "unpublished from here. Get an explicit yes from the user, then retry with "
+                         "confirm_publish_now=true, or use create_note_draft + schedule_note.")
+    require_author_session(api, ctx)
+    body = {"bodyJson": note_body_json(args.get("text")), "replyMinimumRole": "everyone"}
+    if args.get("link_url"):
+        body["attachmentIds"] = [note_attachment(api, args["link_url"])["id"]]
+    note = notes_call(api, "POST", "comment/feed", body) or {}
+    summary = note_summary(note)
+    if note.get("id") and ctx.get("logged_in_as"):
+        summary["note_url"] = "https://substack.com/@%s/note/c-%s" % (ctx["logged_in_as"], note["id"])
+    return text_result(summary, ctx)
+
+
 TOOL_HANDLERS = {
     "list_clients": tool_list_clients,
     "add_client": tool_add_client,
@@ -1535,6 +1851,13 @@ TOOL_HANDLERS = {
     "list_drafts": tool_list_drafts,
     "publish_draft": tool_publish_draft,
     "delete_draft": tool_delete_draft,
+    "create_note_draft": tool_create_note_draft,
+    "schedule_note": tool_schedule_note,
+    "unschedule_note": tool_unschedule_note,
+    "update_note_draft": tool_update_note_draft,
+    "list_note_drafts": tool_list_note_drafts,
+    "delete_note_draft": tool_delete_note_draft,
+    "publish_note": tool_publish_note,
 }
 
 
@@ -1543,7 +1866,17 @@ AUTH_ERROR_RE = re.compile(r"\b(401|403) client error|unauthori[sz]ed|forbidden"
 # session refresh. Multi-step writers (create_draft runs create -> put -> tags -> read) are
 # not re-run blindly: a 401 half-way would leave a first draft behind.
 RETRY_SAFE_TOOLS = {"get_publication_settings", "get_draft", "list_drafts", "set_slug",
-                    "unschedule_draft", "delete_draft"}
+                    "unschedule_draft", "delete_draft",
+                    "list_note_drafts"}
+# Where to look for a partial result when a writer is not re-run; post writers by default.
+PARTIAL_RESULT_HINTS = {
+    "create_note_draft": "check list_note_drafts",
+    "schedule_note": "check list_note_drafts",
+    "unschedule_note": "check list_note_drafts",
+    "update_note_draft": "check list_note_drafts",
+    "delete_note_draft": "check list_note_drafts (a note no longer listed was deleted)",
+    "publish_note": "check the profile's notes on substack.com before publishing again",
+}
 
 
 def auth_error_status(exc):
@@ -1611,8 +1944,8 @@ def dispatch_tool(name, args):
             raise ClientError(
                 "client %r: Substack answered HTTP %s during %s; the bound source was re-read and "
                 "the session is valid again, but %s writes in several steps and is not re-run "
-                "automatically: check list_drafts / get_draft for a partial result, then run it again"
-                % (client, status, name, name)
+                "automatically: %s for a partial result, then run it again"
+                % (client, status, name, name, PARTIAL_RESULT_HINTS.get(name, "check list_drafts / get_draft"))
             )
         log("tool %s: session re-read from the bound source for client %s; re-running once" % (name, client))
         try:
