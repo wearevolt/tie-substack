@@ -88,7 +88,12 @@ Adding a client needs no reinstall: in a chat, `add_client(client, publication_u
 | publication | `update_post_settings` / `apply_tags` / `set_slug` | Fix settings, attach tags (new ones only with `allow_new`), change the slug. |
 | publication | `schedule_draft` / `unschedule_draft` | Schedule at an exact ISO instant (offset required; refuses without `confirm_send_email` when the post emails); cancel. |
 | publication | `get_draft` / `list_drafts` | Inspect drafts (`list_drafts` is a narrower projection; its notes say what is absent). |
-| publication | `publish_draft` / `delete_draft` | Publish **now** (explicit user request only; `confirm_send_email` when emailing); delete. |
+| publication | `publish_draft` / `delete_draft` | Publish **now** (explicit user request only; `confirm_send_email` when emailing); delete (a published post's id deletes the live post). |
+| publication | `create_note_draft` | Save a Substack Note as a draft on the client's profile, optionally with a link card (a post, or a note for a quote-restack). |
+| publication | `schedule_note` / `unschedule_note` | Give a note draft a publish time (offset required; Substack's own scheduler fires it) or take it back; the link card is kept. |
+| publication | `update_note_draft` | Replace a note draft's text; schedule and card stay. |
+| publication | `list_note_drafts` / `delete_note_draft` | Every note draft and scheduled note, soonest first; delete one (never a published note). |
+| publication | `publish_note` | Publish a note **now** (explicit user request only; `confirm_publish_now`). |
 
 ## Settings, defaults, and the confirmation gate
 
@@ -179,11 +184,27 @@ clients, one-shot auto-refresh, `bind_client` scan/selection/switch, `refresh_se
 conflicts, write-once backup, switch with and without failures, rollback with hash check).
 Needs no cookie and makes no network calls.
 
+## Substack Notes (0.6.0)
+
+Notes are scheduled through **Substack's own Notes scheduler**: `schedule_note` stores a
+`trigger_at` on the note draft and Substack publishes it at that time, so nothing has to run
+here (the laptop can sleep) and every scheduled note is visible and editable in the client's
+own Notes editor.
+
+- **Author guard.** A note goes out on the logged-in **user's** profile, not on the
+  publication. Every note tool therefore refuses unless that user's primary publication is the
+  client's (a team member's login would post on the team member's profile).
+- **Images.** `create_note_draft` / `publish_note` take `image_url` (an https image, e.g. a
+  card's Cloudinary URL): it is uploaded to Substack first and attached; one attachment per
+  note, so not together with `link_url`.
+- **Attachments survive edits.** Substack drops a note draft's link card or image on any edit
+  that does not send it again; the tools always re-send it and warn if Substack still lost it.
+- Not covered yet: scheduling a plain (comment-less) restack, Notes statistics.
+
 ## Caveats
 
 - Unofficial API: a Substack change can break any tool here; nothing is destructive by
-  default and `publish_draft` is the only immediate-publish path.
+  default and `publish_draft` / `publish_note` are the only immediate-publish paths.
 - A session belongs to a **user**, not a publication: bind the account that should own the
-  posts (for a client publication: its owner's or the agency seat's with team access).
-- Substack Notes are out of scope for now (Phase 2 of the productization plan adds them on
-  this session layer).
+  posts (for a client publication: its owner's or the agency seat's with team access). Note
+  tools need the owner's login (see "Substack Notes").

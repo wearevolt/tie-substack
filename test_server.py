@@ -113,13 +113,113 @@ def fake_probe(cookies):
     return BY_SID.get(sid, (False, {"reason": "session_invalid", "status": 401}))
 
 
+REAUTH_MSG = "For your security, please sign out and sign back in to do this."  # live, 2026-10-25
+
+
+class NotesHTTPError(Exception):
+    """SubstackAPIException shape: status_code + text."""
+
+    def __init__(self, code, text=""):
+        super().__init__("APIError(code=%d): %s" % (code, text))
+        self.status_code = code
+
+
+class FakeResponse:
+    def __init__(self, status, data):
+        self.status_code, self._data = status, data
+        self.content = b"" if data is None else b"{}"
+
+    def json(self):
+        return self._data
+
+
+class FakeNotes:
+    """substack.com Notes as probed live 2026-10-22: drafts paged by cursor, and a PATCH without
+    attachmentIds drops the link card."""
+
+    def __init__(self):
+        self.reset()
+
+    def reset(self, page=20):
+        self.drafts, self.requests, self.next_id, self.page = {}, [], 100, page
+        self.drop_cards = self.publish_on_patch = self.reauth = False
+
+    def request(self, method, url, json=None, params=None, sid=None):
+        path = url.split("/api/v1/", 1)[1]
+        self.requests.append((method, path, json, dict(params or {})))
+        if sid in globals().get("DEAD_SIDS", ()):
+            return FakeResponse(401, {"error": "Not authorized"})
+        if self.reauth:
+            return FakeResponse(403, {"error": REAUTH_MSG, "type": "reauthentication_required"})
+        cards =lambda ids: [{"id": i, "type": "image"} if i.startswith("img-") else  # noqa: E731
+                             {"id": i, "type": "post", "post": {"id": 7}} for i in ids or []]
+        if method == "POST" and path == "image":
+            return FakeResponse(200, {"url": "https://substack-post-media.s3.amazonaws.com/public/images/x.png"})
+        if method == "POST" and path == "comment/attachment":
+            if json.get("type") == "image":
+                return FakeResponse(200, {"id": "img-1", "type": "image"})
+            return FakeResponse(200, {"id": "att-1", "type": "post"})
+        if method == "POST" and path in ("comment/draft", "comment/feed"):
+            self.next_id += 1
+            note = {"id": self.next_id, "body": "text", "body_json": json["bodyJson"],
+                    "reply_minimum_role": json["replyMinimumRole"], "attachments": cards(json.get("attachmentIds"))}
+            if path == "comment/feed":
+                return FakeResponse(200, dict(note, status="published"))
+            note.update(status="draft", trigger_at=json.get("trigger_at"))
+            self.drafts[note["id"]] = note
+            return FakeResponse(200, dict(note))
+        if method == "GET" and path == "feed/drafts":
+            items = sorted(self.drafts.values(), key=lambda d: d["id"])
+            start = int((params or {}).get("cursor") or 0)
+            more = start + self.page < len(items)
+            return FakeResponse(200, {"drafts": [{k: v for k, v in d.items() if k != "status"} for d in items[start:start + self.page]],
+                                      "hasMore": more, "nextCursor": str(start + self.page) if more else None})
+        if method == "PATCH" and path.startswith("feed/comment/"):
+            d = self.drafts[int(path.rsplit("/", 1)[1])]
+            d.update(body_json=json["bodyJson"], trigger_at=json["trigger_at"],
+                     attachments=[] if self.drop_cards else cards(json.get("attachmentIds")))
+            if self.publish_on_patch:
+                self.drafts.pop(d["id"])
+            return FakeResponse(200, dict(d))
+        if method == "DELETE" and path.startswith("comment/"):
+            self.drafts.pop(int(path.rsplit("/", 1)[1]), None)
+            return FakeResponse(200, None)
+        return FakeResponse(404, {"error": "not found"})
+
+
+FAKE_NOTES = FakeNotes()
+
+
+class _NotesSession:
+    def __init__(self, sid):
+        self.sid = sid
+
+    def request(self, method, url, json=None, params=None):
+        return FAKE_NOTES.request(method, url, json=json, params=params, sid=self.sid)
+
+
 class FakeApi:
     instances = []
+    base_url = "https://substack.com/api/v1"
+    profile = {"handle": "alpha-owner", "primaryPublication": {"subdomain": "alpha"}}
 
     def __init__(self, cookies_string="", publication_url=""):
         self.cookies_string, self.publication_url = cookies_string, publication_url
         self.calls = []
         FakeApi.instances.append(self)
+
+    @property
+    def _session(self):
+        return _NotesSession(self.cookies_string.split("=", 1)[-1])
+
+    @staticmethod
+    def _handle_response(response):
+        if not 200 <= response.status_code < 300:
+            raise NotesHTTPError(response.status_code, (response.json() or {}).get("error", ""))
+        return response.json()
+
+    def get_user_profile(self):
+        return FakeApi.profile
 
     def create_draft_from_markdown(self, **kw):
         self.calls.append(("create", kw))
@@ -182,6 +282,10 @@ raises("client required on publication tools", lambda: srv.dispatch_tool("get_dr
     "expected_publication": "alpha.substack.com", "draft_id": 1}), srv.ClientError, ["`client` is required"])
 raises("expected_publication required", lambda: srv.dispatch_tool("get_draft", {"client": "alpha", "draft_id": 1}),
        srv.ClientError, ["expected_publication"])
+raises("client required on note tools", lambda: srv.dispatch_tool("create_note_draft", {
+    "expected_publication": "alpha.substack.com", "text": "hi"}), srv.ClientError, ["`client` is required"])
+raises("expected_publication required on note tools", lambda: srv.dispatch_tool("list_note_drafts", {"client": "alpha"}),
+       srv.ClientError, ["expected_publication"])
 
 # bind alpha and beta directly (sessions + pins), as bind_client would
 srv.update_client("alpha", act_as="alpha-owner", cookie_source={"type": "user_data_dir", "browser": "chrome", "path": "/tmp/x/alpha"}, bound_at="2026-10-06T10:00:00+00:00")
@@ -192,8 +296,9 @@ check("session file is 0600", oct(os.stat(srv.session_path("alpha")).st_mode & 0
 
 # ---------------------------------------------------------------- expected_publication, three cases × read/write/cleanup
 print("expected_publication check")
+NOTE_TOOL_ARGS = (("create_note_draft", {"text": "hi"}), ("list_note_drafts", {}), ("delete_note_draft", {"note_id": 1}))
 for tool, extra in (("get_draft", {"draft_id": 1}), ("create_draft", {"title": "T", "body_markdown": "b", "slug": "t"}),
-                    ("delete_draft", {"draft_id": 1})):
+                    ("delete_draft", {"draft_id": 1})) + NOTE_TOOL_ARGS:
     FakeApi.instances.clear()
     raises("%s: expected != registry refused before any network" % tool,
            lambda t=tool, x=extra: srv.dispatch_tool(t, dict(x, client="alpha", expected_publication="beta.substack.com")),
@@ -202,7 +307,7 @@ for tool, extra in (("get_draft", {"draft_id": 1}), ("create_draft", {"title": "
 # registry != live: beta's record points at alpha's publication, but beta's session reaches beta only
 srv.update_client("beta", publication_url="https://alpha.substack.com")
 for tool, extra in (("get_draft", {"draft_id": 1}), ("create_draft", {"title": "T", "body_markdown": "b", "slug": "t"}),
-                    ("delete_draft", {"draft_id": 1})):
+                    ("delete_draft", {"draft_id": 1})) + NOTE_TOOL_ARGS:
     FakeApi.instances.clear()
     raises("%s: live session not reaching the registry publication refused" % tool,
            lambda t=tool, x=extra: srv.dispatch_tool(t, dict(x, client="beta", expected_publication="alpha.substack.com")),
@@ -646,8 +751,213 @@ rep2 = srv.migrate_import(dup_desktop, default_slug="tie")
 check("re-run after the switch still sees the clash (legacy + tie)", sorted(u["entry"] for u in rep2["unresolvable"]),
       ["tie-substack-legacy", "tie-substack-tie"])
 
+# ---------------------------------------------------------------- notes
+print("notes: text -> ProseMirror, schedule times")
+doc = srv.note_body_json("Read it: https://alpha.substack.com/p/x.\n\n[the post](https://alpha.substack.com/p/y) is out")
+check("one paragraph per line, the blank line kept", [p.get("content") is None for p in doc["content"]], [False, True, False])
+first = doc["content"][0]["content"]
+check("bare URL becomes a link mark, trailing period left outside",
+      [(n["text"], (n.get("marks") or [{}])[0].get("attrs", {}).get("href")) for n in first],
+      [("Read it: ", None), ("https://alpha.substack.com/p/x", "https://alpha.substack.com/p/x"), (".", None)])
+check("[text](url) keeps the text and links it", doc["content"][2]["content"][0]["marks"][0]["attrs"]["href"],
+      "https://alpha.substack.com/p/y")
+check("doc attrs as the editor sends them", doc["attrs"], {"schemaVersion": "v1", "title": None})
+raises("empty note refused", lambda: srv.note_body_json("  \n "), ValueError, ["empty"])
+check("offset converted to the UTC string Substack stores", srv.note_trigger_at("2099-01-01T10:00:00+03:00"),
+      "2099-01-01T07:00:00.000Z")
+check("milliseconds kept", srv.note_trigger_at("2099-01-01T10:00:00.750+03:00"), "2099-01-01T07:00:00.750Z")
+wiki = srv.note_body_json("See https://en.wikipedia.org/wiki/Foo_(bar), then (https://x.com/a).")["content"][0]["content"]
+check("balanced parentheses stay in a bare URL, sentence punctuation does not",
+      [n.get("marks", [{}])[0].get("attrs", {}).get("href") for n in wiki if n.get("marks")],
+      ["https://en.wikipedia.org/wiki/Foo_(bar)", "https://x.com/a"])
+md = srv.note_body_json("[article](https://en.wikipedia.org/wiki/Foo_(bar)) here")["content"][0]["content"]
+check("balanced parentheses stay in a [text](url) destination",
+      [(n["text"], n.get("marks", [{}])[0].get("attrs", {}).get("href")) for n in md],
+      [("article", "https://en.wikipedia.org/wiki/Foo_(bar)"), (" here", None)])
+raises("naive time refused", lambda: srv.note_trigger_at("2099-01-01T10:00:00"), ValueError, ["timezone"])
+raises("past time refused", lambda: srv.note_trigger_at("2020-01-01T10:00:00+00:00"), ValueError, ["past"])
+
+print("notes: tools through the dispatcher")
+reset_home()
+fake_sub.Api = FakeApi
+srv.dispatch_tool("add_client", {"client": "alpha", "publication_url": "alpha.substack.com"})
+BY_SID["sid-notes"] = (True, {"handle": "alpha-owner", "email": "a@x.com", "subdomains": ["alpha"], "primary": "alpha"})
+srv.update_client("alpha", act_as="alpha-owner", cookie_source={"type": "user_data_dir", "browser": "chrome", "path": ded},
+                  bound_at="2026-10-22T10:00:00+00:00")
+srv.save_session("alpha", {"substack.sid": "sid-notes"}, {"handle": "alpha-owner"})
+NA = {"client": "alpha", "expected_publication": "alpha.substack.com"}
+FAKE_NOTES.reset(page=1)
+c1 = payload(srv.dispatch_tool("create_note_draft", dict(NA, text="New post", link_url="https://alpha.substack.com/p/x")))
+check("create_note_draft: the link card is made first, then the draft carries it",
+      [(m, p) for m, p, _, _ in FAKE_NOTES.requests if m == "POST"], [("POST", "comment/attachment"), ("POST", "comment/draft")])
+check("create_note_draft: no trigger_at sent, a plain draft", [j.get("trigger_at") for m, p, j, _ in FAKE_NOTES.requests
+                                                               if p == "comment/draft"], [None])
+check("create_note_draft: the stored draft is reported", (c1["status"], c1["scheduled_for"], len(c1["attachments"]), c1["client"]),
+      ("draft", None, 1, "alpha"))
+c2 = payload(srv.dispatch_tool("create_note_draft", dict(NA, text="Plain note")))
+s2 = payload(srv.dispatch_tool("schedule_note", dict(NA, note_id=c2["note_id"], datetime_iso="2099-01-01T10:00:00+03:00")))
+check("schedule_note finds a draft on the second page and schedules it",
+      (s2["status"], s2["scheduled_for"], "warning" in s2), ("scheduled", "2099-01-01T07:00:00.000Z", False))
+check("feed/drafts was paged by cursor", any(q.get("cursor") for m, p, _, q in FAKE_NOTES.requests if p == "feed/drafts"), True)
+FAKE_NOTES.requests.clear()
+s1 = payload(srv.dispatch_tool("schedule_note", dict(NA, note_id=c1["note_id"], datetime_iso="2099-01-02T10:00:00+03:00")))
+patches = [j for m, p, j, _ in FAKE_NOTES.requests if m == "PATCH"]
+check("schedule_note re-sends the draft's attachmentIds and its current body",
+      (patches[0]["attachmentIds"], patches[0]["bodyJson"]["content"][0]["content"][0]["text"]), (["att-1"], "New post"))
+check("schedule_note keeps the card", (len(s1["attachments"]), "warning" in s1), (1, False))
+u1 = payload(srv.dispatch_tool("unschedule_note", dict(NA, note_id=c1["note_id"])))
+check("unschedule_note: trigger_at null, card kept", (u1["status"], u1["scheduled_for"], len(u1["attachments"])), ("draft", None, 1))
+e2 = payload(srv.dispatch_tool("update_note_draft", dict(NA, note_id=c2["note_id"], text="Edited note")))
+check("update_note_draft keeps the schedule", (e2["status"], e2["scheduled_for"]), ("scheduled", "2099-01-01T07:00:00.000Z"))
+check("update_note_draft sends the new text", [j["bodyJson"]["content"][0]["content"][0]["text"]
+                                               for m, p, j, _ in FAKE_NOTES.requests if m == "PATCH"][-1], "Edited note")
+FAKE_NOTES.drop_cards = True  # Substack loses the card despite the attachmentIds
+lost = payload(srv.dispatch_tool("schedule_note", dict(NA, note_id=c1["note_id"], datetime_iso="2099-01-03T10:00:00+03:00")))
+check("a card lost on the PATCH is reported, not hidden", "dropped the attachment" in lost.get("warning", ""), True)
+both = {"warning": "Substack still reports a schedule (2099-01-01T07:00:00.000Z)"}
+srv._patch_warnings(both, ["att-1"], True)
+check("a lost card adds to an earlier warning instead of replacing it",
+      ("still reports a schedule" in both["warning"], "dropped the attachment" in both["warning"]), (True, True))
+FAKE_NOTES.publish_on_patch = True  # a near-term note publishes between the PATCH and the check
+gone = payload(srv.dispatch_tool("schedule_note", dict(NA, note_id=c1["note_id"], datetime_iso="2099-01-04T10:00:00+03:00")))
+check("a note that publishes right after the PATCH is reported from the PATCH answer, not as an error",
+      (gone["note_id"], gone["scheduled_for"], "most likely published" in gone.get("warning", "")),
+      (c1["note_id"], "2099-01-04T07:00:00.000Z", True))
+FAKE_NOTES.publish_on_patch = False
+c1 = payload(srv.dispatch_tool("create_note_draft", dict(NA, text="New post", link_url="https://alpha.substack.com/p/x")))
+FAKE_NOTES.drop_cards = False
+payload(srv.dispatch_tool("unschedule_note", dict(NA, note_id=c1["note_id"])))
+
+print("notes: images")
+_real_requests = sys.modules.get("requests")
+fake_requests = types.ModuleType("requests")
+fake_requests.RequestException = type("RequestException", (Exception,), {})
+fake_requests.get = lambda url, timeout=None: (_ for _ in ()).throw(fake_requests.RequestException("connection refused"))
+sys.modules["requests"] = fake_requests
+raises("fetch_image: a failed download is a ValueError naming the URL",
+       lambda: srv.fetch_image("https://res.cloudinary.com/x/card.png"), ValueError,
+       ["could not be downloaded", "res.cloudinary.com/x/card.png", "connection refused"])
+if _real_requests is not None:
+    sys.modules["requests"] = _real_requests
+else:
+    del sys.modules["requests"]
+srv.fetch_image =lambda url: (b"\x89PNG", "image/png") if url.endswith(".png") else (b"<html>", "text/html")
+FAKE_NOTES.requests.clear()
+ci = payload(srv.dispatch_tool("create_note_draft", dict(NA, text="With a picture", image_url="https://res.cloudinary.com/x/card.png")))
+check("create_note_draft with image_url: upload, image attachment, then the draft",
+      [(m, p, (j or {}).get("type")) for m, p, j, _ in FAKE_NOTES.requests if m == "POST"],
+      [("POST", "image", None), ("POST", "comment/attachment", "image"), ("POST", "comment/draft", None)])
+check("the upload is a data URI of the fetched bytes", [j["image"] for m, p, j, _ in FAKE_NOTES.requests if p == "image"],
+      ["data:image/png;base64,iVBORw=="])
+check("the draft carries the image", [a["type"] for a in ci["attachments"]], ["image"])
+si = payload(srv.dispatch_tool("schedule_note", dict(NA, note_id=ci["note_id"], datetime_iso="2099-02-01T10:00:00+03:00")))
+check("schedule_note keeps the image", ([a["type"] for a in si["attachments"]], "warning" in si), (["image"], False))
+FAKE_NOTES.drop_cards = True
+li = payload(srv.dispatch_tool("unschedule_note", dict(NA, note_id=ci["note_id"])))
+check("a lost image is reported with image_url as the fix", ("a link card or an image" in li.get("warning", ""),
+                                                            "image_url" in li.get("warning", "")), (True, True))
+FAKE_NOTES.drop_cards = False
+payload(srv.dispatch_tool("delete_note_draft", dict(NA, note_id=ci["note_id"])))
+FAKE_NOTES.requests.clear()
+for label, extra, msg in (("http:// image_url", {"image_url": "http://res.cloudinary.com/x/card.png"}, "https URL"),
+                          ("non-image content", {"image_url": "https://example.com/page"}, "is not an image"),
+                          ("link_url and image_url together", {"image_url": "https://res.cloudinary.com/x/card.png",
+                                                               "link_url": "https://alpha.substack.com/p/x"}, "not both")):
+    raises("create_note_draft refuses %s" % label,
+           lambda x=extra: srv.dispatch_tool("create_note_draft", dict(NA, text="hi", **x)), ValueError, [msg])
+check("no note was created by the refused calls", [p for m, p, _, _ in FAKE_NOTES.requests if p == "comment/draft"], [])
+pi = payload(srv.dispatch_tool("publish_note", dict(NA, text="Now with a picture", image_url="https://res.cloudinary.com/x/card.png",
+                                                    confirm_publish_now=True)))
+check("publish_note posts comment/feed with the image", (pi["status"], [a["type"] for a in pi["attachments"]]),
+      ("published", ["image"]))
+lst = payload(srv.dispatch_tool("list_note_drafts", dict(NA)))
+check("list_note_drafts: every page, scheduled first", [(n["note_id"], n["status"]) for n in lst["items"]],
+      [(c2["note_id"], "scheduled"), (c1["note_id"], "draft")])
+FAKE_NOTES.requests.clear()
+raises("delete_note_draft: an id outside the drafts is refused",
+       lambda: srv.dispatch_tool("delete_note_draft", dict(NA, note_id=999)), srv.ClientError, ["list_note_drafts"])
+check("no DELETE sent for the unknown id", [m for m, _, _, _ in FAKE_NOTES.requests if m == "DELETE"], [])
+d2 = payload(srv.dispatch_tool("delete_note_draft", dict(NA, note_id=c2["note_id"])))
+check("delete_note_draft deletes and verifies", (d2["deleted"], c2["note_id"] in FAKE_NOTES.drafts), (True, False))
+FAKE_NOTES.requests.clear()
+raises("publish_note refused without confirm_publish_now",
+       lambda: srv.dispatch_tool("publish_note", dict(NA, text="Now")), ValueError, ["confirm_publish_now"])
+check("nothing posted without the confirmation", [p for m, p, _, _ in FAKE_NOTES.requests if m == "POST"], [])
+pn = payload(srv.dispatch_tool("publish_note", dict(NA, text="Now", confirm_publish_now=True)))
+check("publish_note posts to comment/feed and links the note", (pn["status"], pn["note_url"].startswith(
+    "https://substack.com/@alpha-owner/note/c-")), ("published", True))
+
+print("notes: the author guard")
+FakeApi.profile = {"handle": "alpha-owner", "publicationUsers": [
+    {"is_primary": False, "publication": {"subdomain": "beta"}}, {"is_primary": True, "publication": {"subdomain": "alpha"}}]}
+check("primary via publicationUsers[is_primary] accepted",
+      payload(srv.dispatch_tool("list_note_drafts", dict(NA)))["client"], "alpha")
+for label, profile in (
+        ("several publications, none marked primary", {"handle": "agency", "publicationUsers": [
+            {"publication": {"subdomain": "alpha"}}, {"publication": {"subdomain": "beta"}}]}),
+        ("another primary publication", {"handle": "agency", "primaryPublication": {"subdomain": "beta"}})):
+    FakeApi.profile = profile
+    FAKE_NOTES.requests.clear()
+    raises("author guard: %s refused" % label,
+           lambda: srv.dispatch_tool("create_note_draft", dict(NA, text="hi")), srv.ClientError, ["own profile"])
+    check("author guard: %s, no Notes request made" % label, FAKE_NOTES.requests, [])
+FakeApi.profile = {"handle": "alpha-owner", "primaryPublication": {"subdomain": "alpha"}}
+
+print("notes: 401 mid-call")
+_profile_chrome_cookies = fake_pcc.chrome_cookies  # the bind_client section reads PROFILE_COOKIES
+fake_pcc.chrome_cookies = lambda url, browser=None, cookie_file=None: dict(SOURCE_COOKIES.get(cookie_file) or {})
+DEAD_SIDS.add("sid-notes")
+BY_SID["sid-notes-2"] = (True, {"handle": "alpha-owner", "email": "a@x.com", "subdomains": ["alpha"], "primary": "alpha"})
+SOURCE_COOKIES[os.path.join(ded, "Default", "Cookies")] = {"substack.sid": "sid-notes-2"}
+raises("401 during create_note_draft: not re-run, list_note_drafts named",
+       lambda: srv.dispatch_tool("create_note_draft", dict(NA, text="hi")), srv.ClientError,
+       ["HTTP 401", "create_note_draft", "check list_note_drafts"])
+DEAD_SIDS.add("sid-notes-2")
+BY_SID["sid-notes-3"] = (True, {"handle": "alpha-owner", "email": "a@x.com", "subdomains": ["alpha"], "primary": "alpha"})
+SOURCE_COOKIES[os.path.join(ded, "Default", "Cookies")] = {"substack.sid": "sid-notes-3"}
+out = payload(srv.dispatch_tool("list_note_drafts", dict(NA)))
+check("401 during list_note_drafts: re-read and re-run", out["client"], "alpha")
+check("note writers are not re-run (write + verify read: a retry after a done write would report a false failure)",
+      [t for t in ("create_note_draft", "schedule_note", "unschedule_note", "update_note_draft", "delete_note_draft",
+                   "publish_note") if t in srv.RETRY_SAFE_TOOLS], [])
+DEAD_SIDS.clear()
+
+print("reauthentication_required: a fresh login is named, the same cookie is not re-read")
+SOURCE_COOKIES[os.path.join(ded, "Default", "Cookies")] = {"substack.sid": "sid-notes-4"}
+FAKE_NOTES.reauth = True
+raises("reauthentication_required during create_note_draft",
+       lambda: srv.dispatch_tool("create_note_draft", dict(NA, text="hi")), srv.ClientError,
+       ["fresh login", "sign out of Substack", "alpha-owner", "refresh_session", "create_note_draft",
+        "check list_note_drafts for a partial result"])
+FAKE_NOTES.reauth = False
+
+
+def _reauth_schedule(self, draft, when):
+    raise NotesHTTPError(403, REAUTH_MSG)
+
+
+FakeApi.schedule_draft = _reauth_schedule
+raises("reauthentication_required during schedule_draft",
+       lambda: srv.dispatch_tool("schedule_draft", dict(NA, draft_id=1, datetime_iso="2099-01-01T10:00:00+00:00",
+                                                        confirm_send_email=True)),
+       srv.ClientError, ["fresh login", "sign out of Substack", "refresh_session", "schedule_draft",
+                         "check list_drafts / get_draft for a partial result"])
+FAKE_NOTES.reauth = True
+try:
+    srv.dispatch_tool("list_note_drafts", dict(NA))
+    read_msg = ""
+except srv.ClientError as e:
+    read_msg = str(e)
+check("reauthentication_required during a read: fresh login named, no partial-result hint",
+      ("list_note_drafts again" in read_msg, "partial result" in read_msg), (True, False))
+FAKE_NOTES.reauth = False
+del FakeApi.schedule_draft
+check("the stored session was kept (re-reading the same cookie cannot fix a reauth)",
+      srv.load_session("alpha")["cookies"]["substack.sid"], "sid-notes-3")
+fake_pcc.chrome_cookies = _profile_chrome_cookies
+
 print("registration & version")
-check("server version", srv.SERVER_VERSION, "0.5.0")
+check("server version", srv.SERVER_VERSION, "0.6.0")
 check("old tool names gone", any(n in srv.TOOL_HANDLERS for n in ("substack_status", "refresh_cookie", "list_profiles")), False)
 check("publication tools require client + expected_publication",
       all(set(t["inputSchema"]["required"]) >= {"client", "expected_publication"}
