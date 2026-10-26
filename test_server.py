@@ -113,11 +113,14 @@ def fake_probe(cookies):
     return BY_SID.get(sid, (False, {"reason": "session_invalid", "status": 401}))
 
 
+REAUTH_MSG = "For your security, please sign out and sign back in to do this."  # live, 2026-10-25
+
+
 class NotesHTTPError(Exception):
     """SubstackAPIException shape: status_code + text."""
 
-    def __init__(self, code):
-        super().__init__("APIError(code=%d)" % code)
+    def __init__(self, code, text=""):
+        super().__init__("APIError(code=%d): %s" % (code, text))
         self.status_code = code
 
 
@@ -139,15 +142,22 @@ class FakeNotes:
 
     def reset(self, page=20):
         self.drafts, self.requests, self.next_id, self.page = {}, [], 100, page
-        self.drop_cards = self.publish_on_patch = False
+        self.drop_cards = self.publish_on_patch = self.reauth = False
 
     def request(self, method, url, json=None, params=None, sid=None):
         path = url.split("/api/v1/", 1)[1]
         self.requests.append((method, path, json, dict(params or {})))
         if sid in globals().get("DEAD_SIDS", ()):
             return FakeResponse(401, {"error": "Not authorized"})
-        cards = lambda ids: [{"id": i, "type": "post", "post": {"id": 7}} for i in ids or []]  # noqa: E731
+        if self.reauth:
+            return FakeResponse(403, {"error": REAUTH_MSG, "type": "reauthentication_required"})
+        cards =lambda ids: [{"id": i, "type": "image"} if i.startswith("img-") else  # noqa: E731
+                             {"id": i, "type": "post", "post": {"id": 7}} for i in ids or []]
+        if method == "POST" and path == "image":
+            return FakeResponse(200, {"url": "https://substack-post-media.s3.amazonaws.com/public/images/x.png"})
         if method == "POST" and path == "comment/attachment":
+            if json.get("type") == "image":
+                return FakeResponse(200, {"id": "img-1", "type": "image"})
             return FakeResponse(200, {"id": "att-1", "type": "post"})
         if method == "POST" and path in ("comment/draft", "comment/feed"):
             self.next_id += 1
@@ -205,7 +215,7 @@ class FakeApi:
     @staticmethod
     def _handle_response(response):
         if not 200 <= response.status_code < 300:
-            raise NotesHTTPError(response.status_code)
+            raise NotesHTTPError(response.status_code, (response.json() or {}).get("error", ""))
         return response.json()
 
     def get_user_profile(self):
@@ -777,7 +787,6 @@ srv.update_client("alpha", act_as="alpha-owner", cookie_source={"type": "user_da
 srv.save_session("alpha", {"substack.sid": "sid-notes"}, {"handle": "alpha-owner"})
 NA = {"client": "alpha", "expected_publication": "alpha.substack.com"}
 FAKE_NOTES.reset(page=1)
-FakeApi.profile = {"handle": "alpha-owner", "primaryPublication": {"subdomain": "alpha"}}
 c1 = payload(srv.dispatch_tool("create_note_draft", dict(NA, text="New post", link_url="https://alpha.substack.com/p/x")))
 check("create_note_draft: the link card is made first, then the draft carries it",
       [(m, p) for m, p, _, _ in FAKE_NOTES.requests if m == "POST"], [("POST", "comment/attachment"), ("POST", "comment/draft")])
@@ -804,11 +813,11 @@ check("update_note_draft sends the new text", [j["bodyJson"]["content"][0]["cont
                                                for m, p, j, _ in FAKE_NOTES.requests if m == "PATCH"][-1], "Edited note")
 FAKE_NOTES.drop_cards = True  # Substack loses the card despite the attachmentIds
 lost = payload(srv.dispatch_tool("schedule_note", dict(NA, note_id=c1["note_id"], datetime_iso="2099-01-03T10:00:00+03:00")))
-check("a card lost on the PATCH is reported, not hidden", "dropped the link card" in lost.get("warning", ""), True)
+check("a card lost on the PATCH is reported, not hidden", "dropped the attachment" in lost.get("warning", ""), True)
 both = {"warning": "Substack still reports a schedule (2099-01-01T07:00:00.000Z)"}
 srv._patch_warnings(both, ["att-1"], True)
 check("a lost card adds to an earlier warning instead of replacing it",
-      ("still reports a schedule" in both["warning"], "dropped the link card" in both["warning"]), (True, True))
+      ("still reports a schedule" in both["warning"], "dropped the attachment" in both["warning"]), (True, True))
 FAKE_NOTES.publish_on_patch = True  # a near-term note publishes between the PATCH and the check
 gone = payload(srv.dispatch_tool("schedule_note", dict(NA, note_id=c1["note_id"], datetime_iso="2099-01-04T10:00:00+03:00")))
 check("a note that publishes right after the PATCH is reported from the PATCH answer, not as an error",
@@ -818,6 +827,49 @@ FAKE_NOTES.publish_on_patch = False
 c1 = payload(srv.dispatch_tool("create_note_draft", dict(NA, text="New post", link_url="https://alpha.substack.com/p/x")))
 FAKE_NOTES.drop_cards = False
 payload(srv.dispatch_tool("unschedule_note", dict(NA, note_id=c1["note_id"])))
+
+print("notes: images")
+_real_requests = sys.modules.get("requests")
+fake_requests = types.ModuleType("requests")
+fake_requests.RequestException = type("RequestException", (Exception,), {})
+fake_requests.get = lambda url, timeout=None: (_ for _ in ()).throw(fake_requests.RequestException("connection refused"))
+sys.modules["requests"] = fake_requests
+raises("fetch_image: a failed download is a ValueError naming the URL",
+       lambda: srv.fetch_image("https://res.cloudinary.com/x/card.png"), ValueError,
+       ["could not be downloaded", "res.cloudinary.com/x/card.png", "connection refused"])
+if _real_requests is not None:
+    sys.modules["requests"] = _real_requests
+else:
+    del sys.modules["requests"]
+srv.fetch_image =lambda url: (b"\x89PNG", "image/png") if url.endswith(".png") else (b"<html>", "text/html")
+FAKE_NOTES.requests.clear()
+ci = payload(srv.dispatch_tool("create_note_draft", dict(NA, text="With a picture", image_url="https://res.cloudinary.com/x/card.png")))
+check("create_note_draft with image_url: upload, image attachment, then the draft",
+      [(m, p, (j or {}).get("type")) for m, p, j, _ in FAKE_NOTES.requests if m == "POST"],
+      [("POST", "image", None), ("POST", "comment/attachment", "image"), ("POST", "comment/draft", None)])
+check("the upload is a data URI of the fetched bytes", [j["image"] for m, p, j, _ in FAKE_NOTES.requests if p == "image"],
+      ["data:image/png;base64,iVBORw=="])
+check("the draft carries the image", [a["type"] for a in ci["attachments"]], ["image"])
+si = payload(srv.dispatch_tool("schedule_note", dict(NA, note_id=ci["note_id"], datetime_iso="2099-02-01T10:00:00+03:00")))
+check("schedule_note keeps the image", ([a["type"] for a in si["attachments"]], "warning" in si), (["image"], False))
+FAKE_NOTES.drop_cards = True
+li = payload(srv.dispatch_tool("unschedule_note", dict(NA, note_id=ci["note_id"])))
+check("a lost image is reported with image_url as the fix", ("a link card or an image" in li.get("warning", ""),
+                                                            "image_url" in li.get("warning", "")), (True, True))
+FAKE_NOTES.drop_cards = False
+payload(srv.dispatch_tool("delete_note_draft", dict(NA, note_id=ci["note_id"])))
+FAKE_NOTES.requests.clear()
+for label, extra, msg in (("http:// image_url", {"image_url": "http://res.cloudinary.com/x/card.png"}, "https URL"),
+                          ("non-image content", {"image_url": "https://example.com/page"}, "is not an image"),
+                          ("link_url and image_url together", {"image_url": "https://res.cloudinary.com/x/card.png",
+                                                               "link_url": "https://alpha.substack.com/p/x"}, "not both")):
+    raises("create_note_draft refuses %s" % label,
+           lambda x=extra: srv.dispatch_tool("create_note_draft", dict(NA, text="hi", **x)), ValueError, [msg])
+check("no note was created by the refused calls", [p for m, p, _, _ in FAKE_NOTES.requests if p == "comment/draft"], [])
+pi = payload(srv.dispatch_tool("publish_note", dict(NA, text="Now with a picture", image_url="https://res.cloudinary.com/x/card.png",
+                                                    confirm_publish_now=True)))
+check("publish_note posts comment/feed with the image", (pi["status"], [a["type"] for a in pi["attachments"]]),
+      ("published", ["image"]))
 lst = payload(srv.dispatch_tool("list_note_drafts", dict(NA)))
 check("list_note_drafts: every page, scheduled first", [(n["note_id"], n["status"]) for n in lst["items"]],
       [(c2["note_id"], "scheduled"), (c1["note_id"], "draft")])
@@ -869,6 +921,39 @@ check("note writers are not re-run (write + verify read: a retry after a done wr
       [t for t in ("create_note_draft", "schedule_note", "unschedule_note", "update_note_draft", "delete_note_draft",
                    "publish_note") if t in srv.RETRY_SAFE_TOOLS], [])
 DEAD_SIDS.clear()
+
+print("reauthentication_required: a fresh login is named, the same cookie is not re-read")
+SOURCE_COOKIES[os.path.join(ded, "Default", "Cookies")] = {"substack.sid": "sid-notes-4"}
+FAKE_NOTES.reauth = True
+raises("reauthentication_required during create_note_draft",
+       lambda: srv.dispatch_tool("create_note_draft", dict(NA, text="hi")), srv.ClientError,
+       ["fresh login", "sign out of Substack", "alpha-owner", "refresh_session", "create_note_draft",
+        "check list_note_drafts for a partial result"])
+FAKE_NOTES.reauth = False
+
+
+def _reauth_schedule(self, draft, when):
+    raise NotesHTTPError(403, REAUTH_MSG)
+
+
+FakeApi.schedule_draft = _reauth_schedule
+raises("reauthentication_required during schedule_draft",
+       lambda: srv.dispatch_tool("schedule_draft", dict(NA, draft_id=1, datetime_iso="2099-01-01T10:00:00+00:00",
+                                                        confirm_send_email=True)),
+       srv.ClientError, ["fresh login", "sign out of Substack", "refresh_session", "schedule_draft",
+                         "check list_drafts / get_draft for a partial result"])
+FAKE_NOTES.reauth = True
+try:
+    srv.dispatch_tool("list_note_drafts", dict(NA))
+    read_msg = ""
+except srv.ClientError as e:
+    read_msg = str(e)
+check("reauthentication_required during a read: fresh login named, no partial-result hint",
+      ("list_note_drafts again" in read_msg, "partial result" in read_msg), (True, False))
+FAKE_NOTES.reauth = False
+del FakeApi.schedule_draft
+check("the stored session was kept (re-reading the same cookie cannot fix a reauth)",
+      srv.load_session("alpha")["cookies"]["substack.sid"], "sid-notes-3")
 fake_pcc.chrome_cookies = _profile_chrome_cookies
 
 print("registration & version")

@@ -49,6 +49,7 @@ Protocol: MCP over stdio, newline-delimited JSON-RPC 2.0. Requires: python-subst
 pycookiecheat optional (bind_client / refresh_session need it).
 """
 
+import base64
 import hashlib
 import json
 import os
@@ -996,6 +997,45 @@ def note_attachment(api, link_url):
     return att
 
 
+def fetch_image(url):
+    """(bytes, mime type) of an image URL; module-level so the tests run offline."""
+    import requests  # noqa: PLC0415  (a python-substack dependency)
+
+    try:
+        r = requests.get(url, timeout=60)
+        r.raise_for_status()
+    except requests.RequestException as exc:
+        raise ValueError("image_url %s could not be downloaded: %s" % (url, exc))
+    return r.content, (r.headers.get("Content-Type") or "").split(";")[0].strip().lower()
+
+
+def note_image_attachment(api, image_url):
+    """An image on a note: uploaded to Substack first (POST image), then attached as type image."""
+    if not (image_url or "").startswith("https://"):
+        raise ValueError("image_url %r must be an https URL" % image_url)
+    data, mime = fetch_image(image_url)
+    if not mime.startswith("image/"):
+        raise ValueError("image_url %s is not an image (Content-Type %r)" % (image_url, mime or None))
+    uploaded = notes_call(api, "POST", "image", {"image": "data:%s;base64,%s" % (mime, base64.b64encode(data).decode())}) or {}
+    if not uploaded.get("url"):
+        raise RuntimeError("Substack returned no image url for %s" % image_url)
+    att = notes_call(api, "POST", "comment/attachment", {"url": uploaded["url"], "type": "image"}) or {}
+    if not att.get("id"):
+        raise RuntimeError("Substack returned no attachment id for the image %s" % image_url)
+    return att
+
+
+def new_note_attachment_ids(api, args):
+    """attachmentIds for a new note: a link card or an image, never both (unverified)."""
+    if args.get("link_url") and args.get("image_url"):
+        raise ValueError("pass link_url or image_url, not both; one attachment per note is all that has been verified")
+    if args.get("link_url"):
+        return [note_attachment(api, args["link_url"])["id"]]
+    if args.get("image_url"):
+        return [note_image_attachment(api, args["image_url"])["id"]]
+    return []
+
+
 def patch_note(api, draft, body_json, trigger):
     """The one PATCH every editing tool uses: the draft's own attachmentIds go along, because a
     PATCH without them drops the link card. -> (stored draft, attachment ids it lost, still
@@ -1045,6 +1085,7 @@ DRAFT_ID = {"draft_id": {"type": ["integer", "string"]}}
 NOTE_ID = {"note_id": {"type": ["integer", "string"]}}
 NOTE_TEXT = {"text": {"type": "string", "description": "The note as plain text: one paragraph per line; bare URLs and [text](url) become links."}}
 NOTE_LINK = {"link_url": {"type": "string", "description": "OPTIONAL. A post or note URL attached as a link card (a note URL makes a quote-restack)."}}
+NOTE_IMAGE = {"image_url": {"type": "string", "description": "OPTIONAL. An https URL of an image to attach (e.g. the card's Cloudinary secure_url); uploaded to Substack first. Not together with link_url."}}
 
 
 def _schema(props, required):
@@ -1206,15 +1247,15 @@ TOOLS = [
     {
         "name": "delete_draft",
         "scope": "publication",
-        "description": "Delete a draft by id.",
+        "description": "Delete a draft by id. A published post's id deletes the live post too (verified); check get_draft's is_published first.",
         "inputSchema": _pub_schema(dict(DRAFT_ID), ["draft_id"]),
     },
     # ---- notes (publication scope; also require the logged-in user to be the publication's author)
     {
         "name": "create_note_draft",
         "scope": "publication",
-        "description": "Save a Substack Note as a DRAFT on the client's profile (not published, not scheduled), optionally with a link card. Returns note_id and the draft as stored. schedule_note then gives it a publish time.",
-        "inputSchema": _pub_schema(dict(NOTE_TEXT, **NOTE_LINK), ["text"]),
+        "description": "Save a Substack Note as a DRAFT on the client's profile (not published, not scheduled), optionally with a link card or an image. Returns note_id and the draft as stored. schedule_note then gives it a publish time.",
+        "inputSchema": _pub_schema(dict(NOTE_TEXT, **NOTE_LINK, **NOTE_IMAGE), ["text"]),
     },
     {
         "name": "schedule_note",
@@ -1250,7 +1291,7 @@ TOOLS = [
         "name": "publish_note",
         "scope": "publication",
         "description": "PUBLISH a note NOW (needs confirm_publish_now). Only on an explicit user instruction; the normal flow is create_note_draft + schedule_note.",
-        "inputSchema": _pub_schema(dict(NOTE_TEXT, confirm_publish_now={"type": "boolean", "default": False}, **NOTE_LINK), ["text"]),
+        "inputSchema": _pub_schema(dict(NOTE_TEXT, confirm_publish_now={"type": "boolean", "default": False}, **NOTE_LINK, **NOTE_IMAGE), ["text"]),
     },
 ]
 TOOL_SCOPES = {t["name"]: t["scope"] for t in TOOLS}
@@ -1737,15 +1778,17 @@ def _patch_warnings(summary, lost, listed):
         _warn(summary, "the note is no longer among the drafts after the change, so it has most likely published "
                        "already; check the profile's notes before scheduling it again")
     if lost:
-        _warn(summary, "Substack dropped the link card(s) %s from this note; check it in the Notes editor, or "
-                       "delete_note_draft and create it again with link_url" % lost)
+        _warn(summary, "Substack dropped the attachment(s) %s (a link card or an image) from this note; check it "
+                       "in the Notes editor, or delete_note_draft and create it again with its link_url or "
+                       "image_url" % lost)
 
 
 def tool_create_note_draft(args, api, ctx):
     require_author_session(api, ctx)
     body = {"bodyJson": note_body_json(args.get("text")), "replyMinimumRole": "everyone"}
-    if args.get("link_url"):
-        body["attachmentIds"] = [note_attachment(api, args["link_url"])["id"]]
+    ids = new_note_attachment_ids(api, args)
+    if ids:
+        body["attachmentIds"] = ids
     note = notes_call(api, "POST", "comment/draft", body) or {}
     stored = note_drafts(api).get(note.get("id"))
     summary = note_summary(stored or note)
@@ -1823,8 +1866,9 @@ def tool_publish_note(args, api, ctx):
                          "confirm_publish_now=true, or use create_note_draft + schedule_note.")
     require_author_session(api, ctx)
     body = {"bodyJson": note_body_json(args.get("text")), "replyMinimumRole": "everyone"}
-    if args.get("link_url"):
-        body["attachmentIds"] = [note_attachment(api, args["link_url"])["id"]]
+    ids = new_note_attachment_ids(api, args)
+    if ids:
+        body["attachmentIds"] = ids
     note = notes_call(api, "POST", "comment/feed", body) or {}
     summary = note_summary(note)
     if note.get("id") and ctx.get("logged_in_as"):
@@ -1862,6 +1906,9 @@ TOOL_HANDLERS = {
 
 
 AUTH_ERROR_RE = re.compile(r"\b(401|403) client error|unauthori[sz]ed|forbidden", re.I)
+# Substack's 403 for a write it wants a recent login for (type reauthentication_required; the
+# library keeps only the message). Re-reading the same cookie cannot fix it.
+REAUTH_RE = re.compile(r"sign out and sign back in", re.I)
 # Handlers that make exactly one Substack call, or only reads: safe to re-run after a
 # session refresh. Multi-step writers (create_draft runs create -> put -> tags -> read) are
 # not re-run blindly: a 401 half-way would leave a first draft behind.
@@ -1934,6 +1981,16 @@ def dispatch_tool(name, args):
         status = auth_error_status(exc)
         if status is None:
             raise
+        if REAUTH_RE.search(str(exc)):
+            _, rec = client_record(client)
+            partial = "" if name in RETRY_SAFE_TOOLS else (
+                "; %s writes in several steps: %s for a partial result first"
+                % (name, PARTIAL_RESULT_HINTS.get(name, "check list_drafts / get_draft")))
+            raise ClientError(
+                "client %r: Substack refused %s and asks for a fresh login (%s); sign out of Substack and "
+                "sign back in as %s in %s, then refresh_session and run %s again%s"
+                % (client, name, exc, ctx.get("logged_in_as"), describe_source(rec.get("cookie_source")), name, partial)
+            )
         log("tool %s: Substack answered HTTP %s for client %s; re-reading the bound source once" % (name, status, client))
         reset_api(client)
         # The bound browser source is re-read unconditionally (the stored cookie may still pass

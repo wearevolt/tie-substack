@@ -88,7 +88,7 @@ Adding a client needs no reinstall: in a chat, `add_client(client, publication_u
 | publication | `update_post_settings` / `apply_tags` / `set_slug` | Fix settings, attach tags (new ones only with `allow_new`), change the slug. |
 | publication | `schedule_draft` / `unschedule_draft` | Schedule at an exact ISO instant (offset required; refuses without `confirm_send_email` when the post emails); cancel. |
 | publication | `get_draft` / `list_drafts` | Inspect drafts (`list_drafts` is a narrower projection; its notes say what is absent). |
-| publication | `publish_draft` / `delete_draft` | Publish **now** (explicit user request only; `confirm_send_email` when emailing); delete. |
+| publication | `publish_draft` / `delete_draft` | Publish **now** (explicit user request only; `confirm_send_email` when emailing); delete (a published post's id deletes the live post). |
 | publication | `create_note_draft` | Save a Substack Note as a draft on the client's profile, optionally with a link card (a post, or a note for a quote-restack). |
 | publication | `schedule_note` / `unschedule_note` | Give a note draft a publish time (offset required; Substack's own scheduler fires it) or take it back; the link card is kept. |
 | publication | `update_note_draft` | Replace a note draft's text; schedule and card stay. |
@@ -194,8 +194,11 @@ own Notes editor.
 - **Author guard.** A note goes out on the logged-in **user's** profile, not on the
   publication. Every note tool therefore refuses unless that user's primary publication is the
   client's (a team member's login would post on the team member's profile).
-- **Link cards survive edits.** Substack drops a note draft's link card on any edit that does
-  not send it again; the tools always re-send it and warn if Substack still lost it.
+- **Images.** `create_note_draft` / `publish_note` take `image_url` (an https image, e.g. a
+  card's Cloudinary URL): it is uploaded to Substack first and attached; one attachment per
+  note, so not together with `link_url`.
+- **Attachments survive edits.** Substack drops a note draft's link card or image on any edit
+  that does not send it again; the tools always re-send it and warn if Substack still lost it.
 - Not covered yet: scheduling a plain (comment-less) restack, Notes statistics.
 
 ## Caveats
