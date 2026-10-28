@@ -199,6 +199,12 @@ own Notes editor.
   note, so not together with `link_url`.
 - **Attachments survive edits.** Substack drops a note draft's link card or image on any edit
   that does not send it again; the tools always re-send it and warn if Substack still lost it.
+- **Rate limits (0.6.1).** Any request to Substack (Notes and posts) that it refuses with 429
+  (Too Many Requests) is retried up to 4 times after a growing pause or its Retry-After; a write
+  is never retried after a lost answer, so nothing doubles. If it still fails, the error says
+  "rate-limited" instead of "Invalid JSON".
+- **Clashes (0.6.1).** `schedule_note` warns when another note is already scheduled within
+  10 minutes; it still schedules.
 - Not covered yet: scheduling a plain (comment-less) restack, Notes statistics.
 
 ## Caveats

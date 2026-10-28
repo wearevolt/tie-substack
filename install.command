@@ -1,5 +1,5 @@
 #!/bin/bash
-# tie-substack installer (macOS), 0.6.0: ONE server entry for every client (0.6.0 adds Notes tools).
+# tie-substack installer (macOS), 0.6.1: ONE server entry for every client (0.6.0 adds Notes tools).
 #
 #   1. One-liner (no clone needed), server.py is fetched from GitHub:
 #        bash -c "$(curl -fsSL https://raw.githubusercontent.com/wearevolt/tie-substack/main/install.command)"
@@ -40,7 +40,7 @@ warn() { printf '  \033[33m!\033[0m %s\n' "$*"; }
 fail() { printf '  \033[31m✗\033[0m %s\n' "$*"; }
 pause() { case "$0" in *.command) read -r -p "Press Enter to close..." _;; esac; }
 
-bold "tie-substack installer (0.6.0)"
+bold "tie-substack installer (0.6.1)"
 echo
 mkdir -p "$INSTALL_DIR"
 chmod 700 "$INSTALL_DIR"
