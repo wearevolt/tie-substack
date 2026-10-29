@@ -143,6 +143,7 @@ class FakeNotes:
     def reset(self, page=20):
         self.drafts, self.requests, self.next_id, self.page = {}, [], 100, page
         self.drop_cards = self.publish_on_patch = self.reauth = False
+        self.rate_limit = 0  # this many next requests answer 429
 
     def request(self, method, url, json=None, params=None, sid=None):
         path = url.split("/api/v1/", 1)[1]
@@ -151,6 +152,9 @@ class FakeNotes:
             return FakeResponse(401, {"error": "Not authorized"})
         if self.reauth:
             return FakeResponse(403, {"error": REAUTH_MSG, "type": "reauthentication_required"})
+        if self.rate_limit:
+            self.rate_limit -= 1
+            return FakeResponse(429, {"error": "Too Many Requests"})
         cards =lambda ids: [{"id": i, "type": "image"} if i.startswith("img-") else  # noqa: E731
                              {"id": i, "type": "post", "post": {"id": 7}} for i in ids or []]
         if method == "POST" and path == "image":
@@ -197,6 +201,9 @@ class _NotesSession:
     def request(self, method, url, json=None, params=None):
         return FAKE_NOTES.request(method, url, json=json, params=params, sid=self.sid)
 
+    def mount(self, prefix, adapter):
+        self.mounted = (prefix, adapter)
+
 
 class FakeApi:
     instances = []
@@ -206,11 +213,8 @@ class FakeApi:
     def __init__(self, cookies_string="", publication_url=""):
         self.cookies_string, self.publication_url = cookies_string, publication_url
         self.calls = []
+        self._session = _NotesSession(cookies_string.split("=", 1)[-1])
         FakeApi.instances.append(self)
-
-    @property
-    def _session(self):
-        return _NotesSession(self.cookies_string.split("=", 1)[-1])
 
     @staticmethod
     def _handle_response(response):
@@ -259,6 +263,9 @@ fake_sub = types.ModuleType("substack")
 fake_sub.Api = FakeApi
 sys.modules["substack"] = fake_sub
 srv.probe_session = fake_probe
+_real_retry_rate_limits = srv.retry_rate_limits
+RATE_LIMITED_SESSIONS = []
+srv.retry_rate_limits = RATE_LIMITED_SESSIONS.append  # the real one needs requests/urllib3; checked below
 
 # ---------------------------------------------------------------- registry
 print("registry: add_client, list_clients, unknown client")
@@ -888,15 +895,26 @@ check("publish_note posts to comment/feed and links the note", (pn["status"], pn
     "https://substack.com/@alpha-owner/note/c-")), ("published", True))
 
 print("notes: the author guard")
+_profile_reads = []
+_get_user_profile = FakeApi.get_user_profile
+FakeApi.get_user_profile = lambda self: (_profile_reads.append(self), _get_user_profile(self))[1]
+srv.reset_api("alpha")  # the guard's pass is remembered per validated session
 FakeApi.profile = {"handle": "alpha-owner", "publicationUsers": [
     {"is_primary": False, "publication": {"subdomain": "beta"}}, {"is_primary": True, "publication": {"subdomain": "alpha"}}]}
 check("primary via publicationUsers[is_primary] accepted",
       payload(srv.dispatch_tool("list_note_drafts", dict(NA)))["client"], "alpha")
+srv.dispatch_tool("list_note_drafts", dict(NA))
+check("a second note tool on the same session does not ask Substack for the profile again", len(_profile_reads), 1)
+srv.reset_api("alpha")
+srv.dispatch_tool("list_note_drafts", dict(NA))
+check("a new session checks the author again", len(_profile_reads), 2)
+FakeApi.get_user_profile = _get_user_profile
 for label, profile in (
         ("several publications, none marked primary", {"handle": "agency", "publicationUsers": [
             {"publication": {"subdomain": "alpha"}}, {"publication": {"subdomain": "beta"}}]}),
         ("another primary publication", {"handle": "agency", "primaryPublication": {"subdomain": "beta"}})):
     FakeApi.profile = profile
+    srv.reset_api("alpha")
     FAKE_NOTES.requests.clear()
     raises("author guard: %s refused" % label,
            lambda: srv.dispatch_tool("create_note_draft", dict(NA, text="hi")), srv.ClientError, ["own profile"])
@@ -956,8 +974,148 @@ check("the stored session was kept (re-reading the same cookie cannot fix a reau
       srv.load_session("alpha")["cookies"]["substack.sid"], "sid-notes-3")
 fake_pcc.chrome_cookies = _profile_chrome_cookies
 
+print("429 Too Many Requests: every method retried on the client's session, then named plainly")
+check("get_api puts every client session through retry_rate_limits",
+      FakeApi.instances[-1]._session in RATE_LIMITED_SESSIONS, True)
+_saved = {m: sys.modules.get(m) for m in ("requests", "requests.adapters", "urllib3", "urllib3.util", "urllib3.util.retry")}
+for m in _saved:
+    sys.modules[m] = types.ModuleType(m)
+sys.modules["requests.adapters"].HTTPAdapter = lambda max_retries: types.SimpleNamespace(max_retries=max_retries)
+
+
+class _FakeRetry:
+    """urllib3's Retry as far as retry_rate_limits uses it: keyword config, history, a backoff."""
+
+    def __init__(self, **kw):
+        self.kw, self.history, self.backoff_factor = kw, (), kw.get("backoff_factor", 0)
+
+
+sys.modules["urllib3.util.retry"].Retry = _FakeRetry
+probe_sess = _NotesSession("sid-x")
+_real_retry_rate_limits(probe_sess)
+for m, mod in _saved.items():
+    if mod is None:
+        del sys.modules[m]
+    else:
+        sys.modules[m] = mod
+prefix, adapter = probe_sess.mounted
+retry = adapter.max_retries
+check("the https adapter retries 429 on every method, never after a read error",
+      (prefix, retry.kw["status_forcelist"], retry.kw["allowed_methods"], retry.kw["read"], retry.kw["other"],
+       retry.kw["respect_retry_after_header"], retry.kw["raise_on_status"]),
+      ("https://", (429,), None, 0, 0, True, False))
+pauses = []
+for n in range(1, 5):
+    retry.history = (None,) * n
+    pauses.append(retry.get_backoff_time())
+check("pauses before each retry: 2, 4, 8, 16 s (no immediate first retry)", pauses, [2, 4, 8, 16])
+FAKE_NOTES.reset()
+FAKE_NOTES.rate_limit = 99
+raises("429 from a writer's handler: named, with the partial-result hint",
+       lambda: srv.dispatch_tool("create_note_draft", dict(NA, text="hi")), srv.ClientError,
+       ["rate-limited create_note_draft", "HTTP 429", "run create_note_draft again",
+        "check list_note_drafts for a partial result"])
+check("a 429 is not taken for an expired session", srv.load_session("alpha")["cookies"]["substack.sid"], "sid-notes-3")
+FAKE_NOTES.rate_limit = 0
+
+
+def _http_429():
+    """requests.HTTPError shape, as probe_session's raise_for_status() raises it."""
+    e = Exception("429 Client Error: Too Many Requests for url")
+    e.response = types.SimpleNamespace(status_code=429)
+    return e
+
+
+srv.reset_api("alpha")
+FAKE_NOTES.requests.clear()
+srv.probe_session = lambda cookies: (_ for _ in ()).throw(_http_429())
+try:
+    srv.dispatch_tool("create_note_draft", dict(NA, text="hi"))
+    probe_msg = ""
+except srv.ClientError as e:
+    probe_msg = str(e)
+srv.probe_session = fake_probe
+check("429 while building the client: named, no partial-result hint (nothing was written)",
+      ("rate-limited create_note_draft" in probe_msg, "partial result" in probe_msg), (True, False))
+check("nothing was sent to Notes", FAKE_NOTES.requests, [])
+fake_pcc.chrome_cookies = lambda url, browser=None, cookie_file=None: dict(SOURCE_COOKIES.get(cookie_file) or {})
+DEAD_SIDS.add("sid-notes-3")
+BY_SID["sid-notes-5"] = (True, {"handle": "alpha-owner", "email": "a@x.com", "subdomains": ["alpha"], "primary": "alpha"})
+SOURCE_COOKIES[os.path.join(ded, "Default", "Cookies")] = {"substack.sid": "sid-notes-5"}
+FAKE_NOTES.rate_limit = 99  # the dead session answers 401 first; the re-run on the fresh one gets 429
+FAKE_NOTES.requests.clear()
+raises("401, re-read, then 429 on the re-run: still named as a rate limit",
+       lambda: srv.dispatch_tool("list_note_drafts", dict(NA)), srv.ClientError,
+       ["rate-limited list_note_drafts", "HTTP 429"])
+FAKE_NOTES.rate_limit = 0
+DEAD_SIDS.clear()
+DEAD_SIDS.add("sid-notes-5")
+SOURCE_COOKIES[os.path.join(ded, "Default", "Cookies")] = {"substack.sid": "sid-notes-6"}
+srv.probe_session = lambda cookies: ((_ for _ in ()).throw(_http_429()) if cookies.get("substack.sid") == "sid-notes-6"
+                                     else fake_probe(cookies))
+raises("a writer's 401, then 429 on the session re-read: the partial-result hint is kept",
+       lambda: srv.dispatch_tool("create_note_draft", dict(NA, text="hi")), srv.ClientError,
+       ["rate-limited create_note_draft", "check list_note_drafts for a partial result"])
+srv.probe_session = fake_probe
+DEAD_SIDS.clear()
+fake_pcc.chrome_cookies = _profile_chrome_cookies
+
+print("session tools: a 429 on the session check is a rate limit, not an expired session")
+srv.chrome_profile_cookie_files = lambda browser, root=None: [(n, os.path.join(std, n, "Cookies")) for n in ("Default", "Profile 1", "Profile 2")]
+srv.local_state_profiles = lambda browser, root=None: [{"dir": "Default", "name": "Personal", "email": "me@x.com"}]
+PROFILE_COOKIES[os.path.join(std, "Default", "Cookies")] = {"substack.sid": "sid-beta"}
+srv.dispatch_tool("add_client", {"client": "beta", "publication_url": "beta.substack.com"})  # the registry was reset above
+srv.save_session("beta", {"substack.sid": "sid-beta"})
+srv.update_client("beta", act_as="beta-owner", cookie_source={"type": "profile", "browser": "chrome", "profile": "Default"})
+_beta_before = (srv.load_session("beta")["cookies"], srv.client_record("beta")[1].get("act_as"))
+srv.probe_session = lambda cookies: (_ for _ in ()).throw(_http_429())
+row = payload(srv.dispatch_tool("clients_status", {"client": "beta"}))["clients"][0]
+check("clients_status: rate_limited, not ready, fix says wait (not refresh_session)",
+      (row["session"], row["ready"], "wait a minute" in row["fix"], "refresh_session" in row["fix"]),
+      ("rate_limited", False, True, False))
+raises("refresh_session: named as a rate limit", lambda: srv.dispatch_tool("refresh_session", {"client": "beta"}),
+       srv.ClientError, ["rate-limited the session check", "HTTP 429", "run refresh_session again"])
+raises("bind_client with a profile: named as a rate limit",
+       lambda: srv.dispatch_tool("bind_client", {"client": "beta", "profile": "Personal"}), srv.ClientError,
+       ["rate-limited the session check", "HTTP 429", "run bind_client again"])
+_scanned = []
+srv.probe_session = lambda cookies: (_scanned.append(cookies.get("substack.sid")), (_ for _ in ()).throw(_http_429()))[1]
+raises("bind_client scan: stops at the first 429 instead of reporting no login",
+       lambda: srv.dispatch_tool("bind_client", {"client": "beta"}), srv.ClientError,
+       ["rate-limited the session check while scanning chrome profiles", "run bind_client again"])
+check("the scan stopped at the first profile", _scanned, ["sid-beta"])
+check("nothing stored after the 429s", (srv.load_session("beta")["cookies"], srv.client_record("beta")[1].get("act_as")),
+      _beta_before)
+srv.probe_session = lambda cookies: (_ for _ in ()).throw(Exception("connection reset"))
+row = payload(srv.dispatch_tool("clients_status", {"client": "beta"}))["clients"][0]
+check("other probe errors unchanged: unreachable, fix refresh_session", (row["session"], row["fix"]),
+      ("unreachable", "refresh_session"))
+srv.probe_session = fake_probe
+srv.chrome_profile_cookie_files, srv.local_state_profiles = _orig_files, _orig_ls
+_reg = srv.load_clients()
+_reg["clients"].pop("beta")
+srv.save_clients(_reg)
+
+print("schedule_note: warns about another note scheduled less than 10 minutes away")
+FAKE_NOTES.reset()
+na = payload(srv.dispatch_tool("create_note_draft", dict(NA, text="First")))
+nb = payload(srv.dispatch_tool("create_note_draft", dict(NA, text="Second")))
+sa = payload(srv.dispatch_tool("schedule_note", dict(NA, note_id=na["note_id"], datetime_iso="2099-03-01T10:00:00+00:00")))
+check("the first note alone: no warning", "warning" in sa, False)
+sb = payload(srv.dispatch_tool("schedule_note", dict(NA, note_id=nb["note_id"], datetime_iso="2099-03-01T03:00:00-07:00")))
+check("the same minute in another offset: warned, naming the other note and still scheduled",
+      ("less than 10 minutes" in sb.get("warning", ""), str(na["note_id"]) in sb.get("warning", ""), sb["status"]),
+      (True, True, "scheduled"))
+check("the warning says why it matters", "compete for the same readers" in sb.get("warning", ""), True)
+sb = payload(srv.dispatch_tool("schedule_note", dict(NA, note_id=nb["note_id"], datetime_iso="2099-03-01T10:09:00+00:00")))
+check("9 minutes apart: warned", "less than 10 minutes" in sb.get("warning", ""), True)
+sb = payload(srv.dispatch_tool("schedule_note", dict(NA, note_id=nb["note_id"], datetime_iso="2099-03-01T10:10:00+00:00")))
+check("exactly 10 minutes apart: no warning", "warning" in sb, False)
+sb = payload(srv.dispatch_tool("schedule_note", dict(NA, note_id=nb["note_id"], datetime_iso="2099-03-01T10:15:00+00:00")))
+check("15 minutes apart, and the note's own old time ignored: no warning", "warning" in sb, False)
+
 print("registration & version")
-check("server version", srv.SERVER_VERSION, "0.6.0")
+check("server version", srv.SERVER_VERSION, "0.6.1")
 check("old tool names gone", any(n in srv.TOOL_HANDLERS for n in ("substack_status", "refresh_cookie", "list_profiles")), False)
 check("publication tools require client + expected_publication",
       all(set(t["inputSchema"]["required"]) >= {"client", "expected_publication"}

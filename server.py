@@ -34,6 +34,12 @@ create_note_draft, schedule_note, unschedule_note, update_note_draft, list_note_
 delete_note_draft, publish_note. Notes belong to the logged-in user, not the publication, so
 every note tool also requires that user's primary publication to be the client's.
 
+0.6.1: every request to Substack on a client's session that is refused with 429 (Too Many
+Requests) is retried up to 4 times after a growing pause or its Retry-After (a write is never
+retried after a read error, so nothing doubles), and named plainly when it still fails, also
+by the session tools (clients_status, refresh_session, bind_client), which no longer report it
+as an expired session; schedule_note warns about another scheduled note less than 10 minutes away.
+
 Env:
   TIE_SUBSTACK_HOME        registry home (default ~/.tie-substack); tests point it at a temp dir
   TIE_SUBSTACK_CLIENT +    an explicit substack.sid for exactly that client (CI-style setups);
@@ -64,7 +70,7 @@ import traceback
 from datetime import datetime, timezone
 
 SERVER_NAME = "tie-substack"
-SERVER_VERSION = "0.6.0"
+SERVER_VERSION = "0.6.1"
 CONFIG_FORMAT_VERSION = 1
 
 AUDIENCE_VALUES = ("everyone", "only_free", "only_paid", "founding")
@@ -77,6 +83,7 @@ CLIENT_RE = re.compile(r"^[a-z][a-z0-9-]{1,30}$")
 NOTE_LINK_RE = re.compile(r"\[([^\]]+)\]\((https?://(?:[^\s()]|\([^\s()]*\))+)\)"
                           r"|(https?://(?:[^\s<>()]|\([^\s<>()]*\))*(?:[^\s<>().,;:!?'\"]|\([^\s<>()]*\)))")
 NOTE_DRAFTS_PAGE = 20  # feed/drafts page size, as the Notes editor requests it
+NOTE_CLASH_WINDOW = 10 * 60  # seconds; schedule_note warns about another scheduled note this close
 RESERVED_NAMES = ("clients.json", "migration.json")
 RESERVED_DIR_PREFIXES = ("sessions", "backup-", "legacy", "venv", "python", "cache", "bin")
 
@@ -404,7 +411,9 @@ def probe_session(cookies):
     'session expired' stays distinguishable from 'no access to this publication'."""
     import requests  # noqa: PLC0415  (a python-substack dependency)
 
-    r = requests.get(
+    session = requests.Session()
+    retry_rate_limits(session)
+    r = session.get(
         "https://substack.com/api/v1/user/profile/self", cookies=cookies, timeout=30
     )
     if r.status_code in (401, 403):
@@ -529,6 +538,25 @@ def _context(slug, rec, probe):
     }
 
 
+def retry_rate_limits(session):
+    """python-substack retries a 429 only on GET/DELETE. Substack refuses a rate-limited
+    request without running it, so every method is retried the same way; read errors are not
+    retried at all (a write may have run before the answer was lost). Used for the client's
+    session and for the identity probe."""
+    from requests.adapters import HTTPAdapter  # noqa: PLC0415  (python-substack dependencies)
+    from urllib3.util.retry import Retry  # noqa: PLC0415
+
+    class RateLimitRetry(Retry):
+        def get_backoff_time(self):
+            # urllib3 retries the first time with no pause, which a rate limit refuses again:
+            # 2, 4, 8, 16 s instead of 0, 2, 4, 8 (a Retry-After from Substack still wins).
+            return self.backoff_factor * 2 ** len(self.history)
+
+    session.mount("https://", HTTPAdapter(max_retries=RateLimitRetry(
+        total=4, connect=4, read=0, other=0, status=4, status_forcelist=(429,), allowed_methods=None,
+        backoff_factor=1, respect_retry_after_header=True, raise_on_status=False)))
+
+
 def get_api(slug, expected_publication, fresh=False, reread_source=False):
     """(api, context) for one client, after every check: registry entry, expected vs
     registry publication, a valid session (one auto-refresh from the bound source), the
@@ -613,6 +641,7 @@ def get_api(slug, expected_publication, fresh=False, reread_source=False):
                 "3.10+ and a pinned library"
             )
         api = Api(cookies_string=cookies_string(cookies), publication_url=pub_url)
+        retry_rate_limits(api._session)
         _api_cache[slug] = {
             "api": api, "handle": probe.get("handle"), "email": probe.get("email"),
             "sid": cookies.get("substack.sid"), "validated_at": time.time(),
@@ -640,6 +669,8 @@ class ProbeFacade:
         try:
             return probe_session(cookies)
         except Exception as e:  # noqa: BLE001
+            if http_status(e) == 429:
+                return False, {"reason": "rate_limited"}
             return False, {"reason": "unreachable", "error": str(e)[:200]}
 
     def reaches(self, probe):
@@ -951,8 +982,10 @@ def note_drafts(api):
         seen.add(cursor)
 
 
-def note_draft(api, note_id):
-    d = note_drafts(api).get(int(note_id)) if str(note_id).isdigit() else None
+def note_draft(api, note_id, drafts=None):
+    if drafts is None:
+        drafts = note_drafts(api)
+    d = drafts.get(int(note_id)) if str(note_id).isdigit() else None
     if d is None:
         raise ClientError("note %s is not among this account's note drafts or scheduled notes "
                           "(list_note_drafts); a published note cannot be changed here" % note_id)
@@ -977,7 +1010,11 @@ def primary_subdomain(profile):
 def require_author_session(api, ctx):
     """Notes go out under the session's own user, not under the publication: a session bound
     through a team member's login would post on that member's profile. So a note tool runs only
-    when the logged-in user's primary publication is the client's."""
+    when the logged-in user's primary publication is the client's. A pass is remembered with the
+    validated client (_api_cache), so a run of note tools asks Substack once per session."""
+    entry = _api_cache.get(ctx["client"])
+    if entry and entry.get("api") is api and entry.get("author_checked"):
+        return
     profile = api.get_user_profile() or {}
     primary = primary_subdomain(profile)
     if primary != subdomain_of(ctx["publication"]):
@@ -985,6 +1022,8 @@ def require_author_session(api, ctx):
             "client %r: notes would be posted on %r's own profile, whose primary publication is %r, "
             "not %s. Bind the client to the publication owner's login (bind_client with "
             "confirm_switch) before using note tools." % (ctx["client"], profile.get("handle"), primary, ctx["publication"]))
+    if entry and entry.get("api") is api:
+        entry["author_checked"] = True
 
 
 def note_attachment(api, link_url):
@@ -1260,7 +1299,7 @@ TOOLS = [
     {
         "name": "schedule_note",
         "scope": "publication",
-        "description": "Schedule (or reschedule) a note draft at an exact instant (datetime_iso MUST carry an offset; past times rejected). Substack's own scheduler publishes it; nothing needs to run here. Keeps the link card. Returns the schedule AS STORED.",
+        "description": "Schedule (or reschedule) a note draft at an exact instant (datetime_iso MUST carry an offset; past times rejected). Substack's own scheduler publishes it; nothing needs to run here. Keeps the link card. Returns the schedule AS STORED. If the result has a `warning` (e.g. another note scheduled less than 10 minutes away), tell the user, naming the other note and its time and why it matters (notes this close compete for the same readers), and ask whether to move one before going on.",
         "inputSchema": _pub_schema(dict(NOTE_ID, datetime_iso={"type": "string"}), ["note_id", "datetime_iso"]),
     },
     {
@@ -1404,6 +1443,10 @@ def _status_for(slug):
                    fix="bind_client" if not row["bound"] else "refresh_session")
         return row
     ok, probe = f.identity(cookies)
+    if not ok and probe.get("reason") == "rate_limited":
+        row.update(session="rate_limited", ready=False,
+                   fix="Substack rate-limited the session check (HTTP 429); wait a minute and run clients_status again")
+        return row
     if not ok:
         row.update(session="expired" if probe.get("reason") == "session_invalid" else probe.get("reason", "unknown"),
                    ready=False, fix="refresh_session")
@@ -1444,6 +1487,10 @@ def _scan_profiles(facade, browser, act_as):
     for name, cf in chrome_profile_cookie_files(browser):
         cookies = read_browser_cookies(pycookiecheat, browser, cf, errors)
         ok, probe = facade.identity(cookies) if cookies else (False, {"reason": "no_session"})
+        if not ok and probe.get("reason") == "rate_limited":
+            # The profiles left would be refused too, and "no profile reaches it" would be wrong.
+            raise rate_limited_error(facade.slug, "the session check while scanning %s profiles" % browser,
+                                     "bind_client")
         reaches = bool(ok and facade.reaches(probe))
         entry = {"profile": name, "reaches_publication": reaches,
                  "logged_in_as": (probe or {}).get("handle") if ok else None}
@@ -1483,6 +1530,8 @@ def tool_bind_client(args, facade):
                       "path": os.path.expanduser(args["cookie_file"])}
         cookies, cf = facade.read_source(source)
         ok, probe = facade.identity(cookies)
+        if not ok and probe.get("reason") == "rate_limited":
+            raise rate_limited_error(slug, "the session check of %s" % describe_source(source), "bind_client")
         if not ok:
             raise ClientError("the session in %s is invalid or expired (%s); log in to Substack there first"
                               % (describe_source(source), probe.get("reason")))
@@ -1544,6 +1593,8 @@ def tool_refresh_session(args, facade):
         raise ClientError("client %r is unbound; run bind_client first" % slug)
     cookies, cf = facade.read_source(source)
     ok, probe = facade.identity(cookies)
+    if not ok and probe.get("reason") == "rate_limited":
+        raise rate_limited_error(slug, "the session check of %s" % describe_source(source), "refresh_session")
     if not ok:
         raise ClientError(
             "the session in %s is invalid or expired (%s); log in to Substack in that browser, "
@@ -1801,12 +1852,20 @@ def tool_create_note_draft(args, api, ctx):
 def tool_schedule_note(args, api, ctx):
     require_author_session(api, ctx)
     when = note_trigger_at(args.get("datetime_iso"))
-    draft = note_draft(api, args.get("note_id"))
+    drafts = note_drafts(api)
+    draft = note_draft(api, args.get("note_id"), drafts)
     stored, lost, listed = patch_note(api, draft, note_draft_body(draft), when)
     summary = note_summary(stored)
     summary["requested_for"] = args["datetime_iso"]
     summary["utc_equivalent"] = when
     _patch_warnings(summary, lost, listed)
+    near = [d for d in drafts.values() if d.get("id") != draft["id"] and d.get("trigger_at")
+            and abs((parse_iso_aware(d["trigger_at"]) - parse_iso_aware(when)).total_seconds()) < NOTE_CLASH_WINDOW]
+    if near:
+        _warn(summary, "tie-substack check: this note goes out less than %d minutes from another scheduled note (%s). "
+                       "Notes this close compete for the same readers in the feed, and the same minute is usually a "
+                       "mistake; reschedule one of them if that was not intended" % (NOTE_CLASH_WINDOW // 60, "; ".join(
+                           "%s at %s, \"%s\"" % (d["id"], d["trigger_at"], (d.get("body") or "")[:40]) for d in near)))
     got = stored.get("trigger_at")
     if not got:
         _warn(summary, "Substack did not report a schedule after the call; verify with list_note_drafts")
@@ -1926,19 +1985,43 @@ PARTIAL_RESULT_HINTS = {
 }
 
 
-def auth_error_status(exc):
-    """401 or 403 when Substack refused the session during a call, else None. python-substack
-    raises SubstackAPIException(status_code, text); requests.HTTPError carries .response. Our
-    own refusals (ClientError, validation ValueErrors) are never auth errors, whatever they say."""
+def partial_hint(name):
+    """What to check before re-running a multi-step writer that failed part-way; '' for others."""
+    if name in RETRY_SAFE_TOOLS:
+        return ""
+    return "; %s writes in several steps: %s for a partial result first" % (
+        name, PARTIAL_RESULT_HINTS.get(name, "check list_drafts / get_draft"))
+
+
+def http_status(exc):
+    """The HTTP status Substack answered with, else None. python-substack raises
+    SubstackAPIException(status_code, text); requests.HTTPError carries .response. Our own
+    refusals (ClientError, validation ValueErrors) never carry one, whatever they say."""
     if isinstance(exc, (ClientError, ValueError, TypeError, KeyError)):
         return None
     code = getattr(exc, "status_code", None)
     if code is None:
         code = getattr(getattr(exc, "response", None), "status_code", None)
     try:
-        code = int(code)
+        return int(code)
     except (TypeError, ValueError):
-        code = None
+        return None
+
+
+def rate_limited_error(slug, what, rerun, hint=""):
+    """The one message for a 429 that outlived retry_rate_limits: Substack refused `what` for
+    rate, not for the session, so the fix is to wait and run `rerun` again."""
+    return ClientError(
+        "client %r: Substack rate-limited %s (HTTP 429, Too Many Requests) and still refused it after "
+        "retries with a growing pause; wait a minute and run %s again%s" % (slug, what, rerun, hint)
+    )
+
+
+def auth_error_status(exc):
+    """401 or 403 when Substack refused the session during a call, else None."""
+    if isinstance(exc, (ClientError, ValueError, TypeError, KeyError)):
+        return None
+    code = http_status(exc)
     if code is not None:
         return code if code in (401, 403) else None
     m = AUTH_ERROR_RE.search(str(exc))
@@ -1973,9 +2056,23 @@ def dispatch_tool(name, args):
                           % (", ".join(sorted(load_clients()["clients"])) or "(none)"))
     if not args.get("expected_publication"):
         raise ClientError("`expected_publication` is required on %s (the brand's publication.domain)" % name)
+    stage = {"handler_ran": False}
+    try:
+        return _run_publication_tool(name, handler, args, stage)
+    except Exception as exc:  # noqa: BLE001
+        if http_status(exc) != 429:
+            raise
+        # Requests were already retried (retry_rate_limits). Once the handler has run, a writer
+        # may have written part-way (also when the 429 hit the session re-read after a 401).
+        raise rate_limited_error(args["client"], name, name, partial_hint(name) if stage["handler_ran"] else "")
+
+
+def _run_publication_tool(name, handler, args, stage):
+    """dispatch_tool's publication path; stage["handler_ran"] records that the handler started."""
     client, expected = args["client"], args["expected_publication"]
     api, ctx = get_api(client, expected)
     try:
+        stage["handler_ran"] = True
         return handler(args, api, ctx)
     except Exception as exc:  # noqa: BLE001
         status = auth_error_status(exc)
@@ -1983,13 +2080,11 @@ def dispatch_tool(name, args):
             raise
         if REAUTH_RE.search(str(exc)):
             _, rec = client_record(client)
-            partial = "" if name in RETRY_SAFE_TOOLS else (
-                "; %s writes in several steps: %s for a partial result first"
-                % (name, PARTIAL_RESULT_HINTS.get(name, "check list_drafts / get_draft")))
             raise ClientError(
                 "client %r: Substack refused %s and asks for a fresh login (%s); sign out of Substack and "
                 "sign back in as %s in %s, then refresh_session and run %s again%s"
-                % (client, name, exc, ctx.get("logged_in_as"), describe_source(rec.get("cookie_source")), name, partial)
+                % (client, name, exc, ctx.get("logged_in_as"), describe_source(rec.get("cookie_source")), name,
+                   partial_hint(name))
             )
         log("tool %s: Substack answered HTTP %s for client %s; re-reading the bound source once" % (name, status, client))
         reset_api(client)
@@ -2006,6 +2101,7 @@ def dispatch_tool(name, args):
             )
         log("tool %s: session re-read from the bound source for client %s; re-running once" % (name, client))
         try:
+            stage["handler_ran"] = True
             return handler(args, api, ctx)
         except Exception as exc2:  # noqa: BLE001
             status2 = auth_error_status(exc2)
