@@ -20,6 +20,9 @@ spec = importlib.util.spec_from_file_location(
 srv = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(srv)
 
+REAL_CDP_COOKIES = srv.cdp_cookies
+srv.on_windows = lambda: False  # the checks run the macOS behaviour on any OS; the Windows ones switch it on
+
 fails = []
 
 
@@ -1280,6 +1283,7 @@ CDP_COOKIES = [{"name": "substack.sid", "value": "sid-w", "domain": ".substack.c
                {"name": "visit_id", "value": "v", "domain": "substack.com"},
                {"name": "pub", "value": "p", "domain": "tim.substack.com"}]
 srv.cdp_call = lambda ws, method: (CALLS.append((ws, method)), {"cookies": CDP_COOKIES} if method == "Storage.getCookies" else {})[1]
+srv.cdp_cookies = REAL_CDP_COOKIES
 DEVTOOLS["/prof/open"] = "ws://open"
 check("an open window is read in place, nothing launched or closed",
       (srv.cdp_cookies("/prof/open", "chrome"), LAUNCHED, CALLS), ({"substack.sid": "sid-w", "visit_id": "v"}, [], [("ws://open", "Storage.getCookies")]))
@@ -1363,8 +1367,7 @@ _cdp["stop_browser"] = srv.stop_browser
 srv.stop_browser(None, stuck)
 check("a browser that ignores Browser.close is killed and reaped (macOS)", (stuck.killed, stuck.waits), (True, 2))
 
-_platform = sys.platform
-sys.platform = "win32"
+srv.on_windows = lambda: True
 try:
     r = payload(srv.dispatch_tool("bind_client", {"client": "win"}))
     check("on Windows, bind_client without a source uses the dedicated window", r["cookie_source"], "dedicated window %s" % ded)
@@ -1393,7 +1396,7 @@ try:
     for k, v in _env.items():
         os.environ.pop(k, None) if v is None else os.environ.__setitem__(k, v)
 finally:
-    sys.platform = _platform
+    srv.on_windows = lambda: False
 for name, fn in _cdp.items():
     setattr(srv, name, fn)
 
@@ -1441,6 +1444,7 @@ srv.devtools_endpoint = lambda path: None
 srv.launch_dedicated = lambda browser, path, headless=False, url="about:blank": FakeProc()
 srv.wait_devtools = lambda path, proc: "ws://headless"
 srv.cdp_call = _slow_call
+srv.cdp_cookies = REAL_CDP_COOKIES
 threads = [threading.Thread(target=srv.cdp_cookies, args=(prof, "chrome")) for _ in range(3)]
 [t.start() for t in threads]
 [t.join() for t in threads]
@@ -1455,14 +1459,13 @@ check("opening the window waits for its DevTools before releasing the profile",
 srv.wait_devtools = lambda path, proc: None
 raises("a window that does not start is reported", lambda: srv.open_dedicated_window({"path": prof}), srv.ClientError, ["did not start"])
 
-_platform = sys.platform
 srv.cdp_cookies = lambda path, browser: {"substack.sid": "sid-ud"}
-sys.platform = "win32"
+srv.on_windows = lambda: True
 try:
     check("on Windows a user_data_dir source is read through DevTools",
           srv.read_source_cookies({"type": "user_data_dir", "browser": "chrome", "path": prof}), ({"substack.sid": "sid-ud"}, None))
 finally:
-    sys.platform = _platform
+    srv.on_windows = lambda: False
 for name, fn in _cdp.items():
     setattr(srv, name, fn)
 

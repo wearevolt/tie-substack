@@ -108,6 +108,11 @@ def home():
     return os.path.expanduser(os.environ.get("TIE_SUBSTACK_HOME", "~/.tie-substack"))
 
 
+def on_windows():
+    """The one platform switch (tests pin it to check either OS's behaviour anywhere)."""
+    return sys.platform == "win32"
+
+
 def clients_path():
     return os.path.join(home(), "clients.json")
 
@@ -299,7 +304,7 @@ WINDOWS_DATA_DIRS = {"chrome": ("Google", "Chrome", "User Data"), "chromium": ("
 
 def browser_data_dir(browser):
     """The browser's STANDARD data dir (holds Local State and the profiles), per OS."""
-    if sys.platform == "win32":
+    if on_windows():
         base, rel = os.environ.get("LOCALAPPDATA"), WINDOWS_DATA_DIRS.get(browser)
         return os.path.join(base, *rel) if base and rel else None
     return CHROME_FAMILY_DATA_DIRS.get(browser)
@@ -451,7 +456,7 @@ def dedicated_profile_dir(slug):
 
 def chrome_executable(browser):
     """The browser binary, launched directly so its flags and process are ours."""
-    if sys.platform == "win32":
+    if on_windows():
         rel = WINDOWS_BROWSERS.get(browser)
         roots = [r for r in (os.environ.get(k) for k in ("PROGRAMFILES", "PROGRAMFILES(X86)", "LOCALAPPDATA")) if r]
         for r in roots if rel else ():
@@ -534,7 +539,7 @@ def stop_browser(ws_url, proc):
     try:
         proc.wait(timeout=5)
     except subprocess.TimeoutExpired:
-        if sys.platform == "win32":
+        if on_windows():
             subprocess.run(["taskkill", "/PID", str(proc.pid), "/T", "/F"],  # noqa: S603, S607
                            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         else:
@@ -681,7 +686,7 @@ def describe_source(source):
 def read_source_cookies(source):
     """Cookies from the bound source. Raises with the fix named."""
     kind = (source or {}).get("type")
-    if kind == "cdp" or (kind == "user_data_dir" and sys.platform == "win32"):  # no Cookies DB read on Windows
+    if kind == "cdp" or (kind == "user_data_dir" and on_windows()):  # no Cookies DB read on Windows
         cookies = cdp_cookies(source.get("path") or "", source.get("browser") or "chrome")
         if "substack.sid" not in cookies:
             raise ClientError(
@@ -1739,7 +1744,7 @@ def tool_list_browser_profiles(args):
 def tool_open_client_browser(args):
     slug, rec = client_record(args.get("client"))
     src = rec.get("cookie_source") or {}
-    if src.get("type") == "cdp" or (src.get("type") == "user_data_dir" and sys.platform == "win32"):
+    if src.get("type") == "cdp" or (src.get("type") == "user_data_dir" and on_windows()):
         state = open_dedicated_window(src)
         return text_result({"window": state, "user_data_dir": os.path.expanduser(src["path"]), "client": slug,
                             "next": "log in to Substack in that window, then refresh_session"})
@@ -1848,10 +1853,10 @@ def tool_bind_client(args, facade):
     if len(chosen) > 1:
         raise ValueError("pass only one of profile, user_data_dir, cookie_file")
     # Windows' Cookies DB cannot be read, so a dedicated window is its default.
-    dedicated = bool(args.get("dedicated")) or (not chosen and sys.platform == "win32")
+    dedicated = bool(args.get("dedicated")) or (not chosen and on_windows())
     if dedicated and chosen:
         raise ValueError("dedicated cannot be combined with profile, user_data_dir or cookie_file")
-    if sys.platform == "win32" and chosen and chosen[0] in ("profile", "cookie_file"):
+    if on_windows() and chosen and chosen[0] in ("profile", "cookie_file"):
         raise ClientError("on Windows a browser's Cookies database cannot be read; bind_client with "
                           "dedicated: true (a window of its own, read through DevTools) instead of %s" % chosen[0])
     current_pin = (rec.get("act_as") or "").strip()
