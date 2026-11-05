@@ -1251,6 +1251,211 @@ srv.reset_api("alpha")
 check("stats tools are read-only, so re-run after a session re-read",
       {"get_note_stats", "list_post_stats", "get_post_stats", "get_reading_times"} <= srv.RETRY_SAFE_TOOLS, True)
 
+print("dedicated window (cdp): reading through DevTools")
+
+
+class FakeProc:
+    def __init__(self, exited=False):
+        self.pid, self.exited, self.killed = 4242, exited, False
+
+    def poll(self):
+        return 0 if self.exited else None
+
+    def wait(self, timeout=None):
+        return 0
+
+    def kill(self):
+        self.killed = True
+
+
+_cdp = {name: getattr(srv, name) for name in ("devtools_endpoint", "launch_dedicated", "wait_devtools", "cdp_call",
+                                              "cdp_cookies", "open_dedicated_window")}
+DEVTOOLS, LAUNCHED, CALLS = {}, [], []
+srv.devtools_endpoint = lambda path: DEVTOOLS.get(path)
+srv.launch_dedicated = lambda browser, path, headless=False, url="about:blank": (LAUNCHED.append((path, headless, url)), FakeProc())[1]
+srv.wait_devtools = lambda path, proc: DEVTOOLS.get(("after-launch", path))
+CDP_COOKIES = [{"name": "substack.sid", "value": "sid-w", "domain": ".substack.com"},
+               {"name": "visit_id", "value": "v", "domain": "substack.com"},
+               {"name": "pub", "value": "p", "domain": "tim.substack.com"}]
+srv.cdp_call = lambda ws, method: (CALLS.append((ws, method)), {"cookies": CDP_COOKIES} if method == "Storage.getCookies" else {})[1]
+DEVTOOLS["/prof/open"] = "ws://open"
+check("an open window is read in place, nothing launched or closed",
+      (srv.cdp_cookies("/prof/open", "chrome"), LAUNCHED, CALLS), ({"substack.sid": "sid-w", "visit_id": "v"}, [], [("ws://open", "Storage.getCookies")]))
+CALLS.clear()
+DEVTOOLS[("after-launch", "/prof/closed")] = "ws://headless"
+check("a closed profile is started headless, read, then closed",
+      (sorted(srv.cdp_cookies("/prof/closed", "chrome")), LAUNCHED, [m for _, m in CALLS]),
+      (["substack.sid", "visit_id"], [("/prof/closed", True, "about:blank")], ["Storage.getCookies", "Browser.close"]))
+raises("a profile already open without DevTools -> close it and retry", lambda: srv.cdp_cookies("/prof/locked", "chrome"),
+       srv.ClientError, ["close it and retry"])
+
+reset_home()
+srv.dispatch_tool("add_client", {"client": "win", "publication_url": "win.substack.com"})
+WIN = {"client": "win", "expected_publication": "win.substack.com"}
+ded = srv.dedicated_profile_dir("win")
+DED_COOKIES, OPENED = {}, []
+srv.cdp_cookies = lambda path, browser: dict(DED_COOKIES.get(path) or {})
+srv.open_dedicated_window = lambda source, url="https://substack.com/sign-in": (OPENED.append(source["path"]), "opened")[1]
+r = payload(srv.dispatch_tool("bind_client", {"client": "win", "dedicated": True}))
+check("dedicated bind without a login: window opened, login_needed, nothing stored",
+      (r["status"], OPENED, srv.client_record("win")[1]["cookie_source"], srv.load_session("win")),
+      ("login_needed", [ded], None, {}))
+os.makedirs(ded)
+DED_COOKIES[ded] = {"substack.sid": "sid-anon"}
+r = payload(srv.dispatch_tool("bind_client", {"client": "win", "dedicated": True}))
+check("an anonymous session in the window is still login_needed", r["status"], "login_needed")
+BY_SID["sid-win"] = (True, {"handle": "win-owner", "email": "w@x.com", "subdomains": ["win"], "primary": "win"})
+DED_COOKIES[ded] = {"substack.sid": "sid-win"}
+r = payload(srv.dispatch_tool("bind_client", {"client": "win", "dedicated": True}))
+rec = srv.client_record("win")[1]
+check("after the login: bound to the dedicated window, act_as pinned",
+      (r["act_as"], r["cookie_source"], rec["cookie_source"]["type"], rec["cookie_source"]["path"]),
+      ("win-owner", "dedicated window %s" % ded, "cdp", ded))
+check("the session is stored with no Cookies DB path", (srv.load_session("win")["cookies"]["substack.sid"], srv.load_session("win")["source_path"]),
+      ("sid-win", None))
+raises("dedicated with another source refused", lambda: srv.dispatch_tool("bind_client", {"client": "win", "dedicated": True, "profile": "Default"}),
+       ValueError, ["dedicated cannot be combined"])
+check("cookie_source_file is None for cdp", srv.cookie_source_file(rec["cookie_source"]), None)
+
+srv.save_session("win", {"substack.sid": "sid-win-stale"}, {"handle": "win-owner"})
+srv.reset_api()
+BY_SID["sid-win-2"] = (True, {"handle": "win-owner", "email": "w@x.com", "subdomains": ["win"], "primary": "win"})
+DED_COOKIES[ded] = {"substack.sid": "sid-win-2"}
+out = payload(srv.dispatch_tool("get_draft", dict(WIN, draft_id=1)))
+check("an expired session is re-read from the dedicated window", (out["logged_in_as"], srv.load_session("win")["cookies"]["substack.sid"]),
+      ("win-owner", "sid-win-2"))
+DED_COOKIES[ded] = {}
+raises("refresh with no login left in the window names the fix", lambda: srv.dispatch_tool("refresh_session", {"client": "win"}),
+       srv.ClientError, ["open_client_browser", "refresh_session"])
+OPENED.clear()
+r = payload(srv.dispatch_tool("open_client_browser", {"client": "win"}))
+check("open_client_browser shows the dedicated window", (r["window"], OPENED), ("opened", [ded]))
+lb = payload(srv.dispatch_tool("list_browser_profiles", {}))
+check("list_browser_profiles lists it as a DevTools-read dedicated browser",
+      [(d["client"], d["read_through"]) for d in lb["dedicated_browsers"]], [("win", "devtools")])
+
+srv.update_client("win", cookie_source=None, act_as=None)
+DED_COOKIES[ded] = {}
+r = payload(srv.dispatch_tool("bind_client", {"client": "win", "dedicated": True, "browser": "brave"}))
+check("login_needed for another browser names it in the retry", 'browser: "brave"' in r["next"], True)
+DED_COOKIES[ded] = {"substack.sid": "sid-win"}
+srv.update_client("win", cookie_source={"type": "cdp", "browser": "brave", "path": ded})
+r = payload(srv.dispatch_tool("bind_client", {"client": "win", "dedicated": True, "confirm_switch": True}))
+check("a rebind without browser keeps the profile's own browser", srv.client_record("win")[1]["cookie_source"]["browser"], "brave")
+
+
+class StuckProc(FakeProc):
+    def __init__(self):
+        super().__init__()
+        self.waits = 0
+
+    def wait(self, timeout=None):
+        self.waits += 1
+        if timeout is not None:
+            raise srv.subprocess.TimeoutExpired("chrome", timeout)
+        return 0
+
+
+stuck = StuckProc()
+_cdp["stop_browser"] = srv.stop_browser
+srv.stop_browser(None, stuck)
+check("a browser that ignores Browser.close is killed and reaped (macOS)", (stuck.killed, stuck.waits), (True, 2))
+
+_platform = sys.platform
+sys.platform = "win32"
+try:
+    r = payload(srv.dispatch_tool("bind_client", {"client": "win"}))
+    check("on Windows, bind_client without a source uses the dedicated window", r["cookie_source"], "dedicated window %s" % ded)
+    progs = tempfile.mkdtemp()
+    os.makedirs(os.path.join(progs, "Google", "Chrome", "Application"))
+    open(os.path.join(progs, "Google", "Chrome", "Application", "chrome.exe"), "w").close()
+    _env = {k: os.environ.get(k) for k in ("PROGRAMFILES", "PROGRAMFILES(X86)", "LOCALAPPDATA")}
+    for k in _env:
+        os.environ.pop(k, None)
+    os.environ["LOCALAPPDATA"] = progs
+    check("chrome_executable finds a per-user Chrome on Windows", srv.chrome_executable("chrome"),
+          os.path.join(progs, "Google", "Chrome", "Application", "chrome.exe"))
+    raises("no Brave on Windows -> named", lambda: srv.chrome_executable("brave"), srv.ClientError, ["not installed"])
+    os.makedirs(os.path.join(progs, "Chromium", "Application"))
+    open(os.path.join(progs, "Chromium", "Application", "chrome.exe"), "w").close()
+    check("chrome_executable finds a per-user Chromium on Windows", srv.chrome_executable("chromium"),
+          os.path.join(progs, "Chromium", "Application", "chrome.exe"))
+    for k, v in _env.items():
+        os.environ.pop(k, None) if v is None else os.environ.__setitem__(k, v)
+finally:
+    sys.platform = _platform
+for name, fn in _cdp.items():
+    setattr(srv, name, fn)
+
+print("dedicated window (cdp): the endpoint is this profile's, one read at a time")
+prof = tempfile.mkdtemp()
+with open(os.path.join(prof, "DevToolsActivePort"), "w") as f:
+    f.write("9333\n/devtools/browser/mine\n")
+
+
+class FakeVersion:
+    def __init__(self, ws):
+        self.ws = ws
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *a):
+        return False
+
+    def read(self):
+        return json.dumps({"webSocketDebuggerUrl": self.ws}).encode()
+
+
+_urlopen = srv.urllib.request.urlopen
+srv.urllib.request.urlopen = lambda url, timeout=None: FakeVersion("ws://127.0.0.1:9333/devtools/browser/mine")
+check("the profile's own browser on its port is used", srv.devtools_endpoint(prof), "ws://127.0.0.1:9333/devtools/browser/mine")
+srv.urllib.request.urlopen = lambda url, timeout=None: FakeVersion("ws://127.0.0.1:9333/devtools/browser/someone-else")
+check("a port reused by another browser is not taken for it", srv.devtools_endpoint(prof), None)
+srv.urllib.request.urlopen = _urlopen
+check("one lock per profile, whatever the spelling", srv.profile_lock(prof) is srv.profile_lock(prof + os.sep), True)
+
+import threading  # noqa: E402
+ACTIVE, PEAK = [0], [0]
+
+
+def _slow_call(ws, method):
+    ACTIVE[0] += 1
+    PEAK[0] = max(PEAK[0], ACTIVE[0])
+    srv.time.sleep(0.05)
+    ACTIVE[0] -= 1
+    return {"cookies": []}
+
+
+srv.devtools_endpoint = lambda path: None
+srv.launch_dedicated = lambda browser, path, headless=False, url="about:blank": FakeProc()
+srv.wait_devtools = lambda path, proc: "ws://headless"
+srv.cdp_call = _slow_call
+threads = [threading.Thread(target=srv.cdp_cookies, args=(prof, "chrome")) for _ in range(3)]
+[t.start() for t in threads]
+[t.join() for t in threads]
+check("concurrent reads of one profile run one at a time", PEAK[0], 1)
+
+WAITED = []
+srv.devtools_endpoint = lambda path: None
+srv.wait_devtools = lambda path, proc: (WAITED.append(path), "ws://window")[1]
+srv.launch_dedicated = lambda browser, path, headless=False, url="about:blank": FakeProc()
+check("opening the window waits for its DevTools before releasing the profile",
+      (srv.open_dedicated_window({"path": prof}), WAITED), ("opened", [prof]))
+srv.wait_devtools = lambda path, proc: None
+raises("a window that does not start is reported", lambda: srv.open_dedicated_window({"path": prof}), srv.ClientError, ["did not start"])
+
+_platform = sys.platform
+srv.cdp_cookies = lambda path, browser: {"substack.sid": "sid-ud"}
+sys.platform = "win32"
+try:
+    check("on Windows a user_data_dir source is read through DevTools",
+          srv.read_source_cookies({"type": "user_data_dir", "browser": "chrome", "path": prof}), ({"substack.sid": "sid-ud"}, None))
+finally:
+    sys.platform = _platform
+for name, fn in _cdp.items():
+    setattr(srv, name, fn)
+
 print("registration & version")
 check("server version", srv.SERVER_VERSION, "0.7.0")
 check("old tool names gone", any(n in srv.TOOL_HANDLERS for n in ("substack_status", "refresh_cookie", "list_profiles")), False)
