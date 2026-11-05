@@ -51,6 +51,14 @@ cookie source and the pinned identity.
   Keychain access), validates it against the client's publication, stores it and pins the
   login as `act_as`. Tool output lists cookie *names* only; the value is never displayed,
   returned to the model, or logged.
+- `bind_client dedicated: true` (0.7.0; the default on Windows) gives the client a browser
+  profile of its own, `~/.tie-substack/browsers/<client>`, read through Chrome DevTools instead
+  of the Cookies database: nothing is decrypted, so it works where pycookiecheat cannot (Chrome
+  on Windows). Without a login there yet it opens that window, answers `login_needed` and stores
+  nothing; the operator logs in to Substack in that window and calls it again. Every later read
+  starts the profile headless for about a second, takes the substack.com cookies and closes it,
+  so an expired session is re-read without anyone opening a window. On macOS it is opt-in and
+  needs `websocket-client` in the venv.
 - `refresh_session` re-reads the bound source after a logout or expiry; it refuses when the
   source is now another login (nothing stored).
 
@@ -72,16 +80,38 @@ ask it to run `clients_status`.
 Adding a client needs no reinstall: in a chat, `add_client(client, publication_url)`, then
 `bind_client(client, …)`.
 
+## Install (Windows, 0.7.0)
+
+A Claude Desktop extension, no Python or terminal needed: download
+[`tie-substack-windows.mcpb`](https://github.com/wearevolt/tie-substack/releases/latest/download/tie-substack-windows.mcpb)
+and add it in Claude: Settings → Extensions. It bundles the Windows embeddable Python 3.12 and
+the dependencies (`build_mcpb.sh`; the `windows-extension` workflow attaches it to every `v*`
+release). Then, in a Cowork chat: "add client <slug> with https://<name>.substack.com, then
+bind it". A Chrome window of its own opens; log in to Substack there as a user of that
+publication and ask to bind again. Chrome is required (Chromium and Brave work too).
+
+Logging in to the dedicated window:
+- If Substack emails a sign-in link, copy it into that window's address bar; a click opens it
+  in your usual browser and logs that one in instead.
+- Ask for the email once and wait a few minutes: repeated requests get "too many login
+  emails" for a while.
+- Don't log out of Substack elsewhere until the dedicated window is logged in.
+
+Claude on Windows is a Microsoft Store (MSIX) app: its config lives under
+`%LOCALAPPDATA%\Claude-Data\claude_<id>\`, and extensions run on Windows itself, not in
+Cowork's Linux VM. Sessions and the registry stay in `%USERPROFILE%\.tie-substack`, so
+installing a newer extension over the old one keeps every client.
+
 ## Tools
 
 | Scope | Tool | What it does |
 |---|---|---|
 | registry | `list_clients` | Configured clients: publication, cookie source, pinned identity, session stored?, bound?. Local only. |
 | registry | `add_client` | Register a client under its brand slug with its `https://<name>.substack.com` URL. |
-| registry | `list_browser_profiles` | Chrome-family profiles (directory, display name, email) from the plaintext Local State, plus the dedicated browsers clients are bound to. No cookies, no Keychain prompt. |
-| registry | `open_client_browser` | OPTIONAL. Launch a client's dedicated browser (its bound `user_data_dir`) for a one-time login. |
+| registry | `list_browser_profiles` | Chrome-family profiles (directory, display name, email) from the plaintext Local State, plus the dedicated browsers and windows clients are bound to. No cookies, no Keychain prompt. |
+| registry | `open_client_browser` | OPTIONAL. Show a client's dedicated browser or window for a one-time login; an open one is left as it is. |
 | probe | `clients_status` | Per client: bound?, session valid / expired / missing, identity matches?, publication reachable?, `logged_in_as`. The readiness signal (`--check-clients` in the installer). |
-| probe | `bind_client` | Bind a cookie source (`profile`, `user_data_dir` or `cookie_file`; with none, scan the browser's standard profiles and accept exactly ONE login that reaches the publication) and pin `act_as`. Switching to a different identity needs `confirm_switch`. |
+| probe | `bind_client` | Bind a cookie source (`profile`, `user_data_dir`, `cookie_file`, or `dedicated: true` for a window of its own read through DevTools; with none, macOS scans the browser's standard profiles and accepts exactly ONE login that reaches the publication, Windows uses `dedicated`) and pin `act_as`. Switching to a different identity needs `confirm_switch`. |
 | probe | `refresh_session` | Re-read the bound source, validate against publication and pin, store. |
 | publication | `get_publication_settings` | Paid subscriptions?, sections, existing tags, unavailable values. Call before offering choices. |
 | publication | `create_draft` | Draft from Markdown with the **slug pinned** + explicit settings → `draft_id`, `slug`, `post_url`, `editor_url`, settings **as stored**. |
@@ -184,9 +214,11 @@ settings validation, tags, the registry, every `expected_publication` mismatch o
 write and a cleanup tool, identity and unbound refusals, the scope drift guard, interleaved
 clients, one-shot auto-refresh, `bind_client` scan/selection/switch, `refresh_session`,
 `clients_status`, and the migration: selection by reference, idempotent import, journal
-conflicts, write-once backup, switch with and without failures, rollback with hash check), and
-the stats tools' parsing of Substack's answers as probed.
-Needs no cookie and makes no network calls.
+conflicts, write-once backup, switch with and without failures, rollback with hash check,
+and the dedicated window: attach vs headless start, the DevTools endpoint check, one read per
+profile at a time, `login_needed`, the Windows defaults and paths), and the stats tools'
+parsing of Substack's answers as probed. Needs no cookie and makes no network calls. CI runs
+it on Linux and on Windows.
 
 ## Substack Notes (0.6.0)
 
