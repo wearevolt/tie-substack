@@ -94,6 +94,9 @@ Adding a client needs no reinstall: in a chat, `add_client(client, publication_u
 | publication | `update_note_draft` | Replace a note draft's text; schedule and card stay. |
 | publication | `list_note_drafts` / `delete_note_draft` | Every note draft and scheduled note, soonest first; delete one (never a published note). |
 | publication | `publish_note` | Publish a note **now** (explicit user request only; `confirm_publish_now`). |
+| publication | `get_note_stats` | Up to 50 published Notes: impressions (total, hourly over the first 48 h), by surface, accounts reached (unconnected / followers / subscribers), interactions. One failing Note goes under `errors`. |
+| publication | `get_reading_times` | When the publication's readers read (the stats Audience tab): reading sessions over the last 3 months per hour of the week, UTC, Monday 00:00 first. |
+| publication | `list_post_stats` / `get_post_stats` | Published posts newest first with views, opens, open rate, clicks, signups, subscribes, shares, reactions, comments; one post adds its first week by day and its traffic sources. |
 
 ## Settings, defaults, and the confirmation gate
 
@@ -181,7 +184,8 @@ settings validation, tags, the registry, every `expected_publication` mismatch o
 write and a cleanup tool, identity and unbound refusals, the scope drift guard, interleaved
 clients, one-shot auto-refresh, `bind_client` scan/selection/switch, `refresh_session`,
 `clients_status`, and the migration: selection by reference, idempotent import, journal
-conflicts, write-once backup, switch with and without failures, rollback with hash check).
+conflicts, write-once backup, switch with and without failures, rollback with hash check), and
+the stats tools' parsing of Substack's answers as probed.
 Needs no cookie and makes no network calls.
 
 ## Substack Notes (0.6.0)
@@ -207,7 +211,21 @@ own Notes editor.
 - **Clashes (0.6.1).** `schedule_note` warns when another note is already scheduled less than
   10 minutes away (notes that close compete for the same readers; the same minute is usually a
   mistake); it still schedules. Notes exactly 10 minutes apart are not flagged.
-- Not covered yet: scheduling a plain (comment-less) restack, Notes statistics.
+- Not covered yet: scheduling a plain (comment-less) restack.
+
+## Statistics (0.7.0)
+
+`get_note_stats`, `list_post_stats`, `get_post_stats` and `get_reading_times` read what the
+author sees in Substack's own stats pages (`note_stats/c-<id>` on substack.com,
+`post_management/*` and `publication/stats/reading_hours` on the publication). Read-only and stored nowhere; the caller keeps what it needs.
+
+- **Author guard.** As the note tools: only on the publication owner's own login.
+- **Missing parts are `null`.** Substack leaves a card out when it has nothing to show (a
+  Note's `interactions` until the first one); the field is then `null`, not 0.
+- **Batches.** `get_note_stats` takes 1-50 ids (`123` or `c-123`) and reads them one by one;
+  a Note Substack refuses (403 for another account's or a deleted Note, 404, 5xx) is listed
+  under `errors`, while an expired session or a rate limit fails the whole call as for every
+  tool (a 403 counts as the Note's only after one profile read shows the session still works).
 
 ## Caveats
 

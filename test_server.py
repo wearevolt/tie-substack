@@ -144,9 +144,12 @@ class FakeNotes:
         self.drafts, self.requests, self.next_id, self.page = {}, [], 100, page
         self.drop_cards = self.publish_on_patch = self.reauth = False
         self.rate_limit = 0  # this many next requests answer 429
+        self.urls, self.note_stats, self.posts, self.traffic = [], {}, [], {}
+        self.reading_hours = {"sessions_by_utc_hour_of_week": [0] * 168}
 
     def request(self, method, url, json=None, params=None, sid=None):
         path = url.split("/api/v1/", 1)[1]
+        self.urls.append(url)
         self.requests.append((method, path, json, dict(params or {})))
         if sid in globals().get("DEAD_SIDS", ()):
             return FakeResponse(401, {"error": "Not authorized"})
@@ -188,6 +191,20 @@ class FakeNotes:
         if method == "DELETE" and path.startswith("comment/"):
             self.drafts.pop(int(path.rsplit("/", 1)[1]), None)
             return FakeResponse(200, None)
+        if method == "GET" and path.startswith("note_stats/c-"):
+            answer = self.note_stats.get(int(path.rsplit("-", 1)[1]), 404)
+            return FakeResponse(answer, {"error": "boom"}) if isinstance(answer, int) else FakeResponse(200, answer)
+        if method == "GET" and path == "post_management/published":
+            start, n = int(params["offset"]), int(params["limit"])
+            return FakeResponse(200, {"posts": self.posts[start:start + n], "offset": start, "limit": n,
+                                      "total": len(self.posts), "isCapped": False})
+        if method == "GET" and path == "publication/stats/reading_hours":
+            return FakeResponse(200, self.reading_hours)
+        if method == "GET" and path.startswith("post_management/detail/"):
+            post_id = int(path.split("/")[2])
+            if path.endswith("/traffic"):
+                return FakeResponse(200, self.traffic.get(post_id, {}))
+            return FakeResponse(200, {"posts": [p for p in self.posts if p["id"] == post_id], "total": 1})
         return FakeResponse(404, {"error": "not found"})
 
 
@@ -211,7 +228,8 @@ class FakeApi:
     profile = {"handle": "alpha-owner", "primaryPublication": {"subdomain": "alpha"}}
 
     def __init__(self, cookies_string="", publication_url=""):
-        self.cookies_string, self.publication_url = cookies_string, publication_url
+        # python-substack keeps the publication's API root there (change_publication)
+        self.cookies_string, self.publication_url = cookies_string, publication_url.rstrip("/") + "/api/v1"
         self.calls = []
         self._session = _NotesSession(cookies_string.split("=", 1)[-1])
         FakeApi.instances.append(self)
@@ -1114,8 +1132,127 @@ check("exactly 10 minutes apart: no warning", "warning" in sb, False)
 sb = payload(srv.dispatch_tool("schedule_note", dict(NA, note_id=nb["note_id"], datetime_iso="2099-03-01T10:15:00+00:00")))
 check("15 minutes apart, and the note's own old time ignored: no warning", "warning" in sb, False)
 
+print("stats: notes and posts as the author sees them (shapes probed on the test publication)")
+FAKE_NOTES.reset()
+FAKE_NOTES.note_stats[11] = {"lastUpdatedAt": "2026-10-29T18:44:43Z", "cards": [
+    {"type": "note", "cardId": "note", "note": {}},
+    {"type": "graphCard", "cardId": "impressions", "headers": [{"title": "Impressions", "value": 13}],
+     "graphData": {"type": "line", "series": [
+         {"label": "Typical", "isPrimary": False, "values": [{"timestamp": "2026-10-28T14:13:17Z", "value": 9}]},
+         {"label": "This note", "isPrimary": True, "values": [{"timestamp": "2026-10-28T14:13:17Z", "value": 1},
+                                                             {"timestamp": "2026-10-28T15:13:17Z", "value": 4}]}]}},
+    {"type": "barList", "cardId": "surfaces", "items": [{"title": "Profile page", "value": 11, "percent": 0.846},
+                                                        {"title": "Search", "value": 2, "percent": 0.154}]},
+    {"type": "barList", "cardId": "audience", "items": [{"title": "Unconnected", "value": 3, "percent": 0.6},
+                                                        {"title": "Followers", "value": 2, "percent": 0.4},
+                                                        {"title": "Subscribers", "value": 0, "percent": 0}]},
+    {"type": "listCard", "cardId": "interactions", "headers": [{"title": "Interactions", "value": 2}],
+     "items": [{"title": "Restack", "value": 2}]}]}
+FAKE_NOTES.note_stats[12] = {"lastUpdatedAt": None, "cards": [{"type": "note", "cardId": "note", "note": {}}]}
+FAKE_NOTES.note_stats[13] = 500
+ns = payload(srv.dispatch_tool("get_note_stats", dict(NA, note_ids=["c-11", 12, "13", 11])))
+n11 = ns["notes"][0]
+check("note_stats: total, the primary series only, surfaces, reached, interactions",
+      (n11["note_id"], n11["impressions"], n11["impressions_series"], n11["surfaces"][0], n11["reached"], n11["interactions"]),
+      (11, 13, [["2026-10-28T14:13:17Z", 1], ["2026-10-28T15:13:17Z", 4]],
+       {"surface": "Profile page", "impressions": 11, "share": 0.846},
+       {"unconnected": 3, "followers": 2, "subscribers": 0}, {"total": 2, "by_type": {"restack": 2}}))
+check("note_stats: cards Substack left out are None",
+      [ns["notes"][1][k] for k in ("impressions", "impressions_series", "surfaces", "reached", "interactions")], [None] * 5)
+check("note_stats: a failing Note is listed under errors, the rest come back, a repeated id is read once",
+      ([n["note_id"] for n in ns["notes"]], [e["note_id"] for e in ns["errors"]], "500" in ns["errors"][0]["error"]),
+      ([11, 12], [13], True))
+check("note_stats: read from substack.com", {u.split("/api/v1/")[0] for u in FAKE_NOTES.urls}, {"https://substack.com"})
+for label, ids, msg in (("an empty list", [], "1-50"), ("51 ids", list(range(1, 52)), "1-50"),
+                        ("a non-numeric id", ["abc"], "not a number")):
+    raises("get_note_stats refuses %s" % label,
+           lambda x=ids: srv.dispatch_tool("get_note_stats", dict(NA, note_ids=x)), ValueError, [msg])
+FAKE_NOTES.note_stats[14] = FAKE_NOTES.note_stats[15] = 403
+_profile_reads = []
+FakeApi.get_user_profile = lambda self: (_profile_reads.append(self), _get_user_profile(self))[1]
+ns = payload(srv.dispatch_tool("get_note_stats", dict(NA, note_ids=[14, 11, 15])))
+check("note_stats: another account's Notes (403 on a valid session) are errors, the rest come back, the session asked once",
+      ([n["note_id"] for n in ns["notes"]], [e["note_id"] for e in ns["errors"]], "not this account's Note" in ns["errors"][0]["error"],
+       len(_profile_reads)), ([11], [14, 15], True, 1))
+FakeApi.get_user_profile = lambda self: (_ for _ in ()).throw(NotesHTTPError(401, "Not authorized"))
+raises("note_stats: a 403 while the session itself is refused fails the call (dispatch re-reads it)",
+       lambda: srv.tool_get_note_stats({"note_ids": [14]}, srv._api_cache["alpha"]["api"],
+                                       {"client": "alpha", "publication": "alpha.substack.com"}),
+       NotesHTTPError, ["403"])
+FakeApi.get_user_profile = lambda self: (_ for _ in ()).throw(NotesHTTPError(429, "Too Many Requests"))
+raises("note_stats: a 429 on that profile check is a rate limit, not a session problem",
+       lambda: srv.dispatch_tool("get_note_stats", dict(NA, note_ids=[14])), srv.ClientError, ["rate-limited"])
+FakeApi.get_user_profile = _get_user_profile
+FAKE_NOTES.note_stats[13] = 429
+FAKE_NOTES.rate_limit = 0
+raises("note_stats: a 429 fails the call (rate-limited), not one Note",
+       lambda: srv.dispatch_tool("get_note_stats", dict(NA, note_ids=[11, 13])), srv.ClientError, ["rate-limited"])
+
+FAKE_NOTES.posts = [
+    {"id": 300 - i, "title": "Post %d" % i, "slug": "post-%d" % i, "post_date": "2026-10-%02dT13:00:00Z" % (26 - i),
+     "audience": "everyone", "email_sent_at": None, "reaction_count": i, "comment_count": 1,
+     "stats": {"views": 10 * i, "opens": i, "open_rate": 0.5, "clicks": 0, "click_through_rate": 0, "sent": 4,
+               "delivered": 4, "signups": 1, "subscribes": 0, "shares": 2, "estimated_value": 0,
+               "firstWeekDailyStats": [{"day_n": 0, "dt": "2026-10-26T00:00:00.000Z", "views": 1, "cumulative_views": 1,
+                                        "signups": 0, "subscribes": 0, "comps": {"avg_cumulative_views": 7}}]}}
+    for i in range(3)]
+FAKE_NOTES.traffic[300] = {
+    "referrers": [{"source": "substack app", "source_category": "Substack", "views": 1, "percent_of_total_views": "0.500000",
+                   "signups": 0, "subscribes": 0}],
+    "categories": [{"category_type": "Direct", "category_views": 1, "view_count": 1, "percent_of_total_views": 0.5}],
+    "devices": [{"device_type": "Desktop Web", "views": 2, "percent_of_total_views": 1}]}
+FAKE_NOTES.urls.clear()
+lp = payload(srv.dispatch_tool("list_post_stats", dict(NA, limit=2, offset=1)))
+check("list_post_stats: the page asked for, newest first, from the publication's API",
+      ([p["post_id"] for p in lp["posts"]], lp["total"], FAKE_NOTES.requests[-1][3]["order_by"],
+       {u.split("/api/v1/")[0] for u in FAKE_NOTES.urls}),
+      ([299, 298], 3, "post_date", {"https://alpha.substack.com"}))
+check("list_post_stats: post fields and stats, reactions and comments from the post",
+      {k: lp["posts"][0][k] for k in ("title", "url", "views", "opens", "open_rate", "shares", "reactions", "comments")},
+      {"title": "Post 1", "url": "https://alpha.substack.com/p/post-1", "views": 10, "opens": 1, "open_rate": 0.5,
+       "shares": 2, "reactions": 1, "comments": 1})
+check("list_post_stats: limit clamped to 50", payload(srv.dispatch_tool("list_post_stats", dict(NA, limit=500)))["limit"], 50)
+gp = payload(srv.dispatch_tool("get_post_stats", dict(NA, post_id=300)))
+check("get_post_stats: first week by day and traffic",
+      (gp["views"], gp["first_week_daily"], gp["traffic"]),
+      (0, [{"day": 0, "date": "2026-10-26", "views": 1, "cumulative_views": 1, "signups": 0, "subscribes": 0,
+            "typical_cumulative_views": 7}],
+       {"referrers": [{"source": "substack app", "category": "Substack", "views": 1, "share": 0.5, "signups": 0, "subscribes": 0}],
+        "categories": [{"category": "Direct", "views": 1, "share": 0.5}],
+        "devices": [{"device": "Desktop Web", "views": 2, "share": 1.0}]}))
+check("get_post_stats: a post without traffic gets empty lists",
+      payload(srv.dispatch_tool("get_post_stats", dict(NA, post_id=299)))["traffic"],
+      {"referrers": [], "categories": [], "devices": []})
+raises("get_post_stats: an unknown post is refused", lambda: srv.dispatch_tool("get_post_stats", dict(NA, post_id=1)),
+       srv.ClientError, ["list_post_stats"])
+raises("get_post_stats: a non-numeric id is refused", lambda: srv.dispatch_tool("get_post_stats", dict(NA, post_id="x")),
+       ValueError, ["post id"])
+FAKE_NOTES.reading_hours = {"sessions_by_utc_hour_of_week": [h % 24 for h in range(168)]}
+FAKE_NOTES.urls.clear()
+rt = payload(srv.dispatch_tool("get_reading_times", dict(NA)))
+check("get_reading_times: 168 hourly counts as given, Monday 00:00 UTC first, from the publication's API",
+      (len(rt["sessions_by_utc_hour_of_week"]), rt["sessions_by_utc_hour_of_week"][:3], rt["week_starts"], rt["total"],
+       {u.split("/api/v1/")[0] for u in FAKE_NOTES.urls}),
+      (168, [0, 1, 2], "Monday 00:00 UTC", 7 * sum(range(24)), {"https://alpha.substack.com"}))
+FAKE_NOTES.reading_hours = {"sessions_by_utc_hour_of_week": [1] * 24}
+raises("get_reading_times: another shape is refused, not reshaped", lambda: srv.dispatch_tool("get_reading_times", dict(NA)),
+       srv.ClientError, ["unknown shape"])
+FAKE_NOTES.reading_hours = {"sessions_by_utc_hour_of_week": [0] * 168}
+FakeApi.profile = {"handle": "agency", "primaryPublication": {"subdomain": "beta"}}
+for tool, extra in (("get_note_stats", {"note_ids": [11]}), ("list_post_stats", {}), ("get_post_stats", {"post_id": 300}),
+                    ("get_reading_times", {})):
+    srv.reset_api("alpha")
+    FAKE_NOTES.requests.clear()
+    raises("author guard: %s refused for another user's login" % tool,
+           lambda t=tool, x=extra: srv.dispatch_tool(t, dict(NA, **x)), srv.ClientError, ["own profile"])
+    check("author guard: %s made no stats request" % tool, FAKE_NOTES.requests, [])
+FakeApi.profile = {"handle": "alpha-owner", "primaryPublication": {"subdomain": "alpha"}}
+srv.reset_api("alpha")
+check("stats tools are read-only, so re-run after a session re-read",
+      {"get_note_stats", "list_post_stats", "get_post_stats", "get_reading_times"} <= srv.RETRY_SAFE_TOOLS, True)
+
 print("registration & version")
-check("server version", srv.SERVER_VERSION, "0.6.1")
+check("server version", srv.SERVER_VERSION, "0.7.0")
 check("old tool names gone", any(n in srv.TOOL_HANDLERS for n in ("substack_status", "refresh_cookie", "list_profiles")), False)
 check("publication tools require client + expected_publication",
       all(set(t["inputSchema"]["required"]) >= {"client", "expected_publication"}
