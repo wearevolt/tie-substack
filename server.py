@@ -82,7 +82,7 @@ import urllib.request
 from datetime import datetime, timezone
 
 SERVER_NAME = "tie-substack"
-SERVER_VERSION = "0.7.0"
+SERVER_VERSION = "0.8.0"
 CONFIG_FORMAT_VERSION = 1
 
 AUDIENCE_VALUES = ("everyone", "only_free", "only_paid", "founding")

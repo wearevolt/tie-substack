@@ -4,8 +4,9 @@
 # dependencies; server type "binary" points Claude at the bundled python.exe.
 # Runs on Linux or macOS (CI: .github/workflows/mcpb.yml): every dependency is a prebuilt wheel.
 #
-#   ./build_mcpb.sh            -> dist/tie-substack-windows.mcpb (the version is in its manifest; a fixed
-#                                 name keeps .../releases/latest/download/tie-substack-windows.mcpb stable)
+#   ./build_mcpb.sh            -> dist/tie-substack.mcpb (the version is in its manifest; a fixed name,
+#                                 with no platform in it, keeps .../releases/latest/download/tie-substack.mcpb
+#                                 stable when a macOS build joins the same file)
 set -euo pipefail
 
 PY_VERSION="3.12.10"
@@ -17,7 +18,7 @@ cd "$(dirname "$0")"
 VERSION="$(python3 -c 'import re,sys; print(re.search(r"^SERVER_VERSION = \"([^\"]+)\"", open("server.py").read(), re.M).group(1))')"
 BUILD="$(mktemp -d)"
 trap 'rm -rf "$BUILD"' EXIT
-OUT="dist/tie-substack-windows.mcpb"
+OUT="dist/tie-substack.mcpb"
 
 curl -fsSL "https://www.python.org/ftp/python/${PY_VERSION}/${PY_ZIP}" -o "$BUILD/$PY_ZIP"
 echo "${PY_SHA256}  $BUILD/$PY_ZIP" | shasum -a 256 -c - >/dev/null || { echo "checksum mismatch for $PY_ZIP" >&2; exit 1; }
@@ -37,7 +38,7 @@ cat > "$BUILD/ext/manifest.json" <<EOF
   "name": "tie-substack",
   "display_name": "TIE Substack",
   "version": "${VERSION}",
-  "description": "Substack drafts, Notes and restacks for the TIE Social plugin's clients. A client's Substack login is taken from a dedicated browser window of its own and stays on this computer.",
+  "description": "Substack drafts, Notes, restacks and stats for the TIE Social plugin's clients. A client's Substack login is taken from a dedicated browser window of its own and stays on this computer.",
   "author": { "name": "Volt" },
   "server": {
     "type": "binary",

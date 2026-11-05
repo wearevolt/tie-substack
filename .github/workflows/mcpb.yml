@@ -1,8 +1,8 @@
-name: windows-extension
+name: extension
 
-# Builds the Windows Claude Desktop extension (build_mcpb.sh). On a pull request and by hand
-# it is a downloadable artifact; on a v* tag it goes to that tag's GitHub release (created if
-# missing), so .../releases/latest/download/tie-substack-windows.mcpb is the stable link.
+# Builds the Claude Desktop extension (build_mcpb.sh; Windows for now). On a pull request and by
+# hand it is a downloadable artifact; on a v* tag it goes to that tag's GitHub release (created if
+# missing), so .../releases/latest/download/tie-substack.mcpb is the stable link.
 on:
   pull_request:
   workflow_dispatch:
@@ -20,17 +20,17 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
-      - name: Build tie-substack-windows.mcpb
+      - name: Build tie-substack.mcpb
         run: ./build_mcpb.sh
       - uses: actions/upload-artifact@v4
         with:
-          name: tie-substack-windows
-          path: dist/tie-substack-windows.mcpb
+          name: tie-substack
+          path: dist/tie-substack.mcpb
       - name: Attach to the release
         if: startsWith(github.ref, 'refs/tags/v')
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
           gh release view "${GITHUB_REF_NAME}" >/dev/null 2>&1 \
-            || gh release create "${GITHUB_REF_NAME}" --title "${GITHUB_REF_NAME}" --notes "Windows extension: tie-substack-windows.mcpb (Claude Desktop, Settings -> Extensions)."
-          gh release upload "${GITHUB_REF_NAME}" dist/tie-substack-windows.mcpb --clobber
+            || gh release create "${GITHUB_REF_NAME}" --title "${GITHUB_REF_NAME}" --notes "Claude Desktop extension (Windows for now): tie-substack.mcpb, Settings -> Extensions."
+          gh release upload "${GITHUB_REF_NAME}" dist/tie-substack.mcpb --clobber

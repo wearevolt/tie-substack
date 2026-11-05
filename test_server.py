@@ -1470,7 +1470,7 @@ for name, fn in _cdp.items():
     setattr(srv, name, fn)
 
 print("registration & version")
-check("server version", srv.SERVER_VERSION, "0.7.0")
+check("server version", srv.SERVER_VERSION, "0.8.0")
 check("old tool names gone", any(n in srv.TOOL_HANDLERS for n in ("substack_status", "refresh_cookie", "list_profiles")), False)
 check("publication tools require client + expected_publication",
       all(set(t["inputSchema"]["required"]) >= {"client", "expected_publication"}

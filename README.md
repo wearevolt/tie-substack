@@ -51,7 +51,7 @@ cookie source and the pinned identity.
   Keychain access), validates it against the client's publication, stores it and pins the
   login as `act_as`. Tool output lists cookie *names* only; the value is never displayed,
   returned to the model, or logged.
-- `bind_client dedicated: true` (0.7.0; the default on Windows) gives the client a browser
+- `bind_client dedicated: true` (0.8.0; the default on Windows) gives the client a browser
   profile of its own, `~/.tie-substack/browsers/<client>`, read through Chrome DevTools instead
   of the Cookies database: nothing is decrypted, so it works where pycookiecheat cannot (Chrome
   on Windows). Without a login there yet it opens that window, answers `login_needed` and stores
@@ -80,13 +80,13 @@ ask it to run `clients_status`.
 Adding a client needs no reinstall: in a chat, `add_client(client, publication_url)`, then
 `bind_client(client, …)`.
 
-## Install (Windows, 0.7.0)
+## Install (Windows, 0.8.0)
 
 A Claude Desktop extension, no Python or terminal needed: download
-[`tie-substack-windows.mcpb`](https://github.com/wearevolt/tie-substack/releases/latest/download/tie-substack-windows.mcpb)
+[`tie-substack.mcpb`](https://github.com/wearevolt/tie-substack/releases/latest/download/tie-substack.mcpb)
 and add it in Claude: Settings → Extensions. It bundles the Windows embeddable Python 3.12 and
-the dependencies (`build_mcpb.sh`; the `windows-extension` workflow attaches it to every `v*`
-release). Then, in a Cowork chat: "add client <slug> with https://<name>.substack.com, then
+the dependencies (`build_mcpb.sh`; the `extension` workflow attaches it to every `v*`
+release). The name carries no platform: a macOS build is meant to join the same file. Then, in a Cowork chat: "add client <slug> with https://<name>.substack.com, then
 bind it". A Chrome window of its own opens; log in to Substack there as a user of that
 publication and ask to bind again. Chrome is required (Chromium and Brave work too).
 
