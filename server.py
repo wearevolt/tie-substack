@@ -40,6 +40,9 @@ retried after a read error, so nothing doubles), and named plainly when it still
 by the session tools (clients_status, refresh_session, bind_client), which no longer report it
 as an expired session; schedule_note warns about another scheduled note less than 10 minutes away.
 
+0.7.0: read-only stats as the author sees them: get_note_stats, list_post_stats,
+get_post_stats, get_reading_times. Owner's login only; nothing stored.
+
 Env:
   TIE_SUBSTACK_HOME        registry home (default ~/.tie-substack); tests point it at a temp dir
   TIE_SUBSTACK_CLIENT +    an explicit substack.sid for exactly that client (CI-style setups);
@@ -70,7 +73,7 @@ import traceback
 from datetime import datetime, timezone
 
 SERVER_NAME = "tie-substack"
-SERVER_VERSION = "0.6.1"
+SERVER_VERSION = "0.7.0"
 CONFIG_FORMAT_VERSION = 1
 
 AUDIENCE_VALUES = ("everyone", "only_free", "only_paid", "founding")
@@ -896,12 +899,13 @@ def validate_slug(slug):
 # ---------------------------------------------------------------- notes helpers
 
 
-def notes_call(api, method, path, body=None, params=None):
+def notes_call(api, method, path, body=None, params=None, base=None):
     """One Notes request on the client's session. python-substack has no Notes methods, so
-    this follows its own pattern (base_url, _handle_response): errors carry status_code."""
+    this follows its own pattern (base_url, _handle_response): errors carry status_code.
+    base=api.publication_url targets the publication's API."""
     from substack import Api  # noqa: PLC0415
 
-    response = api._session.request(method, "%s/%s" % (api.base_url, path), json=body, params=params)
+    response = api._session.request(method, "%s/%s" % (base or api.base_url, path), json=body, params=params)
     if 200 <= response.status_code < 300 and not response.content:
         return {}  # DELETE answers with an empty body
     return Api._handle_response(response=response)
@@ -1019,9 +1023,9 @@ def require_author_session(api, ctx):
     primary = primary_subdomain(profile)
     if primary != subdomain_of(ctx["publication"]):
         raise ClientError(
-            "client %r: notes would be posted on %r's own profile, whose primary publication is %r, "
-            "not %s. Bind the client to the publication owner's login (bind_client with "
-            "confirm_switch) before using note tools." % (ctx["client"], profile.get("handle"), primary, ctx["publication"]))
+            "client %r: notes would be posted on (and stats read from) %r's own profile, whose primary "
+            "publication is %r, not %s. Bind the client to the publication owner's login (bind_client with "
+            "confirm_switch) before using note or stats tools." % (ctx["client"], profile.get("handle"), primary, ctx["publication"]))
     if entry and entry.get("api") is api:
         entry["author_checked"] = True
 
@@ -1104,6 +1108,105 @@ def text_result(payload, ctx=None):
                        "act_as": ctx.get("act_as"), "logged_in_as": ctx.get("logged_in_as"),
                        "items": payload}
     return {"content": [{"type": "text", "text": json.dumps(payload, indent=2)}]}
+
+
+# ---------------------------------------------------------------- stats helpers
+
+NOTE_STATS_MAX = 50
+POST_STAT_FIELDS = ("views", "opens", "open_rate", "clicks", "click_through_rate", "sent", "delivered",
+                    "signups", "subscribes", "shares")
+
+
+def stat_note_ids(raw):
+    """note_ids -> distinct ints; the c- prefix of note URLs is dropped."""
+    if not isinstance(raw, list) or not 1 <= len(raw) <= NOTE_STATS_MAX:
+        raise ValueError("note_ids must be a list of 1-%d note ids" % NOTE_STATS_MAX)
+    ids = []
+    for v in raw:
+        s = str(v).strip()
+        s = s[2:] if s.lower().startswith("c-") else s
+        if not s.isdigit():
+            raise ValueError("note id %r is not a number (c-123 is accepted too)" % v)
+        if int(s) not in ids:
+            ids.append(int(s))
+    return ids
+
+
+def _card(cards, card_id):
+    return next((c for c in cards if isinstance(c, dict) and c.get("cardId") == card_id), None)
+
+
+def _items(rows):
+    return [r for r in rows or [] if isinstance(r, dict)]
+
+
+def _header_value(card):
+    headers = _items(card.get("headers"))
+    return headers[0].get("value") if headers else None
+
+
+def _share(v):
+    try:
+        return float(v)
+    except (TypeError, ValueError):
+        return None
+
+
+def note_stats(note_id, raw):
+    """note_stats cards -> one record; a missing card is None, not 0."""
+    raw = raw if isinstance(raw, dict) else {}
+    cards = raw.get("cards") or []
+    imp, surfaces, audience, inter = (_card(cards, c) for c in ("impressions", "surfaces", "audience", "interactions"))
+    out = {"note_id": note_id, "impressions": None, "impressions_series": None, "surfaces": None,
+           "reached": None, "interactions": None, "updated_at": raw.get("lastUpdatedAt")}
+    if imp:
+        out["impressions"] = _header_value(imp)
+        primary = next((s for s in _items((imp.get("graphData") or {}).get("series")) if s.get("isPrimary")), None)
+        if primary:
+            out["impressions_series"] = [[v.get("timestamp"), v.get("value")] for v in _items(primary.get("values"))]
+    if surfaces:
+        out["surfaces"] = [{"surface": i.get("title"), "impressions": i.get("value"), "share": _share(i.get("percent"))}
+                           for i in _items(surfaces.get("items"))]
+    if audience:
+        by = {str(i.get("title")).lower(): i.get("value") for i in _items(audience.get("items"))}
+        out["reached"] = {k: by.get(k) for k in ("unconnected", "followers", "subscribers")}
+    if inter:
+        out["interactions"] = {"total": _header_value(inter),
+                               "by_type": {str(i.get("title")).lower(): i.get("value") for i in _items(inter.get("items"))}}
+    return out
+
+
+def post_stats(post, publication):
+    """A post_management post -> the list fields."""
+    stats = post.get("stats") or {}
+    out = {"post_id": post.get("id"), "title": post.get("title"), "slug": post.get("slug"),
+           "url": post_url_for_slug(publication, post.get("slug")), "post_date": post.get("post_date"),
+           "audience": post.get("audience"), "email_sent_at": post.get("email_sent_at"),
+           "reactions": post.get("reaction_count"), "comments": post.get("comment_count")}
+    out.update({k: stats.get(k) for k in POST_STAT_FIELDS})
+    return out
+
+
+def first_week_daily(stats):
+    """firstWeekDailyStats -> day rows; typical_* is the publication's average."""
+    return [{"day": d.get("day_n"), "date": (d.get("dt") or "")[:10] or None, "views": d.get("views"),
+             "cumulative_views": d.get("cumulative_views"), "signups": d.get("signups"),
+             "subscribes": d.get("subscribes"),
+             "typical_cumulative_views": (d.get("comps") or {}).get("avg_cumulative_views")}
+            for d in _items(stats.get("firstWeekDailyStats"))]
+
+
+def post_traffic(raw):
+    raw = raw if isinstance(raw, dict) else {}
+    return {
+        "referrers": [{"source": r.get("source"), "category": r.get("source_category"), "views": r.get("views"),
+                       "share": _share(r.get("percent_of_total_views")), "signups": r.get("signups"),
+                       "subscribes": r.get("subscribes")} for r in _items(raw.get("referrers"))],
+        "categories": [{"category": c.get("category_type"), "views": c.get("view_count"),
+                        "share": _share(c.get("percent_of_total_views"))} for c in _items(raw.get("categories"))],
+        "devices": [{"device": d.get("device_type"), "views": d.get("views"),
+                     "share": _share(d.get("percent_of_total_views"))} for d in _items(raw.get("devices"))],
+    }
 
 
 # ---------------------------------------------------------------- tool schemas
@@ -1256,7 +1359,7 @@ TOOLS = [
     {
         "name": "schedule_draft",
         "scope": "publication",
-        "description": "Schedule a draft to publish at an exact instant (datetime_iso MUST carry an offset; past times rejected). Returns the schedule AS STORED. REFUSES without confirm_send_email when the post emails subscribers.",
+        "description": "Schedule a draft to publish at an exact instant (datetime_iso MUST carry an offset; past times rejected). Returns the schedule AS STORED. REFUSES without confirm_send_email when the post emails subscribers. When the user has not settled the time yet, offer the tie-social substack-analytics timing hint first (how active the readers are in that hour).",
         "inputSchema": _pub_schema(dict(DRAFT_ID, datetime_iso={"type": "string"}, confirm_send_email={"type": "boolean", "default": False}), ["draft_id", "datetime_iso"]),
     },
     {
@@ -1299,7 +1402,7 @@ TOOLS = [
     {
         "name": "schedule_note",
         "scope": "publication",
-        "description": "Schedule (or reschedule) a note draft at an exact instant (datetime_iso MUST carry an offset; past times rejected). Substack's own scheduler publishes it; nothing needs to run here. Keeps the link card. Returns the schedule AS STORED. If the result has a `warning` (e.g. another note scheduled less than 10 minutes away), tell the user, naming the other note and its time and why it matters (notes this close compete for the same readers), and ask whether to move one before going on.",
+        "description": "Schedule (or reschedule) a note draft at an exact instant (datetime_iso MUST carry an offset; past times rejected). Substack's own scheduler publishes it; nothing needs to run here. Keeps the link card. Returns the schedule AS STORED. If the result has a `warning` (e.g. another note scheduled less than 10 minutes away), tell the user, naming the other note and its time and why it matters (notes this close compete for the same readers), and ask whether to move one before going on. When the user has not settled the time yet, offer the tie-social substack-analytics timing hint first (how active the audience is in that hour, how that slot has done).",
         "inputSchema": _pub_schema(dict(NOTE_ID, datetime_iso={"type": "string"}), ["note_id", "datetime_iso"]),
     },
     {
@@ -1331,6 +1434,33 @@ TOOLS = [
         "scope": "publication",
         "description": "PUBLISH a note NOW (needs confirm_publish_now). Only on an explicit user instruction; the normal flow is create_note_draft + schedule_note.",
         "inputSchema": _pub_schema(dict(NOTE_TEXT, confirm_publish_now={"type": "boolean", "default": False}, **NOTE_LINK, **NOTE_IMAGE), ["text"]),
+    },
+    {
+        "name": "get_note_stats",
+        "scope": "publication",
+        "description": "Statistics of the client's own published Notes as the author sees them: impressions (total and hourly cumulative over the first 48 hours), by surface, unique accounts reached (unconnected / followers / subscribers), interactions. A Note that fails is listed under errors; the others still come back.",
+        "inputSchema": _pub_schema({"note_ids": {"type": "array", "minItems": 1, "maxItems": NOTE_STATS_MAX,
+                                                 "items": {"type": ["integer", "string"]},
+                                                 "description": "1-50 published note ids (123 or c-123)."}}, ["note_ids"]),
+    },
+    {
+        "name": "list_post_stats",
+        "scope": "publication",
+        "description": "The publication's published posts, newest first, with their statistics: views, opens, open rate, clicks, signups, subscribes, shares, reactions, comments.",
+        "inputSchema": _pub_schema({"limit": {"type": "integer", "minimum": 1, "maximum": 50, "default": 20},
+                                    "offset": {"type": "integer", "minimum": 0, "default": 0}}),
+    },
+    {
+        "name": "get_reading_times",
+        "scope": "publication",
+        "description": "When the publication's readers read (Substack's stats Audience tab): reading sessions on the web and in the app over the last 3 months, per hour of the week in UTC, index 0 = Monday 00:00 UTC.",
+        "inputSchema": _pub_schema({}),
+    },
+    {
+        "name": "get_post_stats",
+        "scope": "publication",
+        "description": "One published post's statistics: the list_post_stats fields, its first week by day (with the publication's typical cumulative views) and traffic sources (referrers, categories, devices).",
+        "inputSchema": _pub_schema({"post_id": {"type": ["integer", "string"]}}, ["post_id"]),
     },
 ]
 TOOL_SCOPES = {t["name"]: t["scope"] for t in TOOLS}
@@ -1935,6 +2065,81 @@ def tool_publish_note(args, api, ctx):
     return text_result(summary, ctx)
 
 
+# ---------------------------------------------------------------- stats tools
+
+
+NOTE_STATS_403 = ("no access to this Note's stats: not this account's Note, deleted or not "
+                  "published (HTTP 403)")
+
+
+def session_still_valid(api):
+    """False only when Substack refuses the session; a rate limit or anything else propagates."""
+    try:
+        api.get_user_profile()
+        return True
+    except Exception as exc:  # noqa: BLE001
+        if auth_error_status(exc) is None:
+            raise
+        return False
+
+
+def tool_get_note_stats(args, api, ctx):
+    require_author_session(api, ctx)
+    notes, errors, session_ok = [], [], False
+    for note_id in stat_note_ids(args.get("note_ids")):
+        try:
+            notes.append(note_stats(note_id, notes_call(api, "GET", "note_stats/c-%s" % note_id)))
+        except Exception as exc:  # noqa: BLE001
+            # Another account's Note answers 403: the Note's error only while the session works.
+            status = http_status(exc)
+            if status in (None, 401, 429):
+                raise
+            if status == 403:
+                session_ok = session_ok or session_still_valid(api)
+                if not session_ok:
+                    raise
+            errors.append({"note_id": note_id, "error": NOTE_STATS_403 if status == 403 else str(exc)})
+    return text_result({"notes": notes, "errors": errors}, ctx)
+
+
+def tool_list_post_stats(args, api, ctx):
+    require_author_session(api, ctx)
+    limit = max(1, min(50, int(args.get("limit") or 20)))
+    offset = max(0, int(args.get("offset") or 0))
+    data = notes_call(api, "GET", "post_management/published", base=api.publication_url,
+                      params={"offset": offset, "limit": limit, "order_by": "post_date",
+                              "order_direction": "desc"}) or {}
+    return text_result({"posts": [post_stats(p, ctx["publication"]) for p in _items(data.get("posts"))],
+                        "total": data.get("total"), "offset": offset, "limit": limit}, ctx)
+
+
+def tool_get_reading_times(_args, api, ctx):
+    require_author_session(api, ctx)
+    raw = notes_call(api, "GET", "publication/stats/reading_hours", base=api.publication_url) or {}
+    hours = raw.get("sessions_by_utc_hour_of_week") if isinstance(raw, dict) else None
+    # Index 0 = Monday 00:00 UTC, as the stats page reads it; any other shape is refused.
+    if not (isinstance(hours, list) and len(hours) == 168 and all(isinstance(v, (int, float)) for v in hours)):
+        raise ClientError("reading_hours came back in an unknown shape (%s); expected 168 hourly counts"
+                          % (sorted(raw) if isinstance(raw, dict) else type(raw).__name__))
+    return text_result({"sessions_by_utc_hour_of_week": hours, "week_starts": "Monday 00:00 UTC",
+                        "window": "last 3 months", "total": sum(hours)}, ctx)
+
+
+def tool_get_post_stats(args, api, ctx):
+    require_author_session(api, ctx)
+    post_id = str(args.get("post_id") or "").strip()
+    if not post_id.isdigit():
+        raise ValueError("post_id must be a post id (list_post_stats gives them)")
+    detail = notes_call(api, "GET", "post_management/detail/%s" % post_id, base=api.publication_url) or {}
+    post = next(iter(_items(detail.get("posts"))), None)
+    if post is None:
+        raise ClientError("post %s is not among the publication's published posts (list_post_stats)" % post_id)
+    traffic = notes_call(api, "GET", "post_management/detail/%s/traffic" % post_id, base=api.publication_url)
+    out = post_stats(post, ctx["publication"])
+    out.update(first_week_daily=first_week_daily(post.get("stats") or {}), traffic=post_traffic(traffic))
+    return text_result(out, ctx)
+
+
 TOOL_HANDLERS = {
     "list_clients": tool_list_clients,
     "add_client": tool_add_client,
@@ -1961,6 +2166,10 @@ TOOL_HANDLERS = {
     "list_note_drafts": tool_list_note_drafts,
     "delete_note_draft": tool_delete_note_draft,
     "publish_note": tool_publish_note,
+    "get_note_stats": tool_get_note_stats,
+    "list_post_stats": tool_list_post_stats,
+    "get_post_stats": tool_get_post_stats,
+    "get_reading_times": tool_get_reading_times,
 }
 
 
@@ -1973,7 +2182,8 @@ REAUTH_RE = re.compile(r"sign out and sign back in", re.I)
 # not re-run blindly: a 401 half-way would leave a first draft behind.
 RETRY_SAFE_TOOLS = {"get_publication_settings", "get_draft", "list_drafts", "set_slug",
                     "unschedule_draft", "delete_draft",
-                    "list_note_drafts"}
+                    "list_note_drafts", "get_note_stats", "list_post_stats", "get_post_stats",
+                    "get_reading_times"}
 # Where to look for a partial result when a writer is not re-run; post writers by default.
 PARTIAL_RESULT_HINTS = {
     "create_note_draft": "check list_note_drafts",
