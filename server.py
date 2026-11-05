@@ -40,11 +40,8 @@ retried after a read error, so nothing doubles), and named plainly when it still
 by the session tools (clients_status, refresh_session, bind_client), which no longer report it
 as an expired session; schedule_note warns about another scheduled note less than 10 minutes away.
 
-0.7.0: read-only statistics as the author sees them: get_note_stats (a Note's impressions,
-hourly for its first 48 hours, by surface, accounts reached), list_post_stats and
-get_post_stats (views, opens, signups, the first week by day, traffic sources), and
-get_reading_times (when readers read, per hour of the week). Nothing is stored; like the
-note tools they require the publication owner's own login.
+0.7.0: read-only stats as the author sees them: get_note_stats, list_post_stats,
+get_post_stats, get_reading_times. Owner's login only; nothing stored.
 
 Env:
   TIE_SUBSTACK_HOME        registry home (default ~/.tie-substack); tests point it at a temp dir
@@ -905,7 +902,7 @@ def validate_slug(slug):
 def notes_call(api, method, path, body=None, params=None, base=None):
     """One Notes request on the client's session. python-substack has no Notes methods, so
     this follows its own pattern (base_url, _handle_response): errors carry status_code.
-    base=api.publication_url sends it to the publication's API instead of substack.com's."""
+    base=api.publication_url targets the publication's API."""
     from substack import Api  # noqa: PLC0415
 
     response = api._session.request(method, "%s/%s" % (base or api.base_url, path), json=body, params=params)
@@ -1156,8 +1153,7 @@ def _share(v):
 
 
 def note_stats(note_id, raw):
-    """note_stats/c-<id> (cards by cardId, probed 2026-10-23/29) -> one record; a card
-    Substack leaves out is None (interactions has no card until the first one)."""
+    """note_stats cards -> one record; a missing card is None, not 0."""
     raw = raw if isinstance(raw, dict) else {}
     cards = raw.get("cards") or []
     imp, surfaces, audience, inter = (_card(cards, c) for c in ("impressions", "surfaces", "audience", "interactions"))
@@ -1181,7 +1177,7 @@ def note_stats(note_id, raw):
 
 
 def post_stats(post, publication):
-    """A post_management post -> the list fields; reactions and comments sit outside stats."""
+    """A post_management post -> the list fields."""
     stats = post.get("stats") or {}
     out = {"post_id": post.get("id"), "title": post.get("title"), "slug": post.get("slug"),
            "url": post_url_for_slug(publication, post.get("slug")), "post_date": post.get("post_date"),
@@ -1192,7 +1188,7 @@ def post_stats(post, publication):
 
 
 def first_week_daily(stats):
-    """firstWeekDailyStats -> day rows; typical_* is Substack's average for the publication's posts."""
+    """firstWeekDailyStats -> day rows; typical_* is the publication's average."""
     return [{"day": d.get("day_n"), "date": (d.get("dt") or "")[:10] or None, "views": d.get("views"),
              "cumulative_views": d.get("cumulative_views"), "signups": d.get("signups"),
              "subscribes": d.get("subscribes"),
@@ -2094,9 +2090,7 @@ def tool_get_note_stats(args, api, ctx):
         try:
             notes.append(note_stats(note_id, notes_call(api, "GET", "note_stats/c-%s" % note_id)))
         except Exception as exc:  # noqa: BLE001
-            # One Note's refusal is that Note's; a session or rate problem is the call's. Substack
-            # answers another account's Note with 403, so a 403 counts as the Note's only while
-            # the session still reads the profile (asked once per call).
+            # Another account's Note answers 403: the Note's error only while the session works.
             status = http_status(exc)
             if status in (None, 401, 429):
                 raise
@@ -2123,8 +2117,7 @@ def tool_get_reading_times(_args, api, ctx):
     require_author_session(api, ctx)
     raw = notes_call(api, "GET", "publication/stats/reading_hours", base=api.publication_url) or {}
     hours = raw.get("sessions_by_utc_hour_of_week") if isinstance(raw, dict) else None
-    # The stats page reads index 0 as Monday 00:00 UTC (probed 2026-11-05); any other shape is
-    # reported as it came, never reshaped by guess.
+    # Index 0 = Monday 00:00 UTC, as the stats page reads it; any other shape is refused.
     if not (isinstance(hours, list) and len(hours) == 168 and all(isinstance(v, (int, float)) for v in hours)):
         raise ClientError("reading_hours came back in an unknown shape (%s); expected 168 hourly counts"
                           % (sorted(raw) if isinstance(raw, dict) else type(raw).__name__))
