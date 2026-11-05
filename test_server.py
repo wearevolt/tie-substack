@@ -300,7 +300,8 @@ srv.dispatch_tool("add_client", {"client": "beta", "publication_url": "https://b
 lst = payload(srv.dispatch_tool("list_clients", {}))
 check("list_clients shows both, unbound", [(c["client"], c["bound"]) for c in lst["clients"]],
       [("alpha", False), ("beta", False)])
-check("registry file is 0600", oct(os.stat(srv.clients_path()).st_mode & 0o777), "0o600")
+if sys.platform != "win32":  # Windows has no POSIX modes; the user profile's ACL guards the file
+    check("registry file is 0600", oct(os.stat(srv.clients_path()).st_mode & 0o777), "0o600")
 raises("unknown client lists configured ones", lambda: srv.dispatch_tool("get_draft", {
     "client": "gamma", "expected_publication": "gamma.substack.com", "draft_id": 1}), srv.ClientError, ["alpha", "beta"])
 raises("client required on publication tools", lambda: srv.dispatch_tool("get_draft", {
@@ -317,7 +318,8 @@ srv.update_client("alpha", act_as="alpha-owner", cookie_source={"type": "user_da
 srv.save_session("alpha", {"substack.sid": "sid-alpha"}, {"handle": "alpha-owner"})
 srv.update_client("beta", act_as="beta-owner", cookie_source={"type": "user_data_dir", "browser": "chrome", "path": "/tmp/x/beta"}, bound_at="2026-10-06T10:00:00+00:00")
 srv.save_session("beta", {"substack.sid": "sid-beta"}, {"handle": "beta-owner"})
-check("session file is 0600", oct(os.stat(srv.session_path("alpha")).st_mode & 0o777), "0o600")
+if sys.platform != "win32":
+    check("session file is 0600", oct(os.stat(srv.session_path("alpha")).st_mode & 0o777), "0o600")
 
 # ---------------------------------------------------------------- expected_publication, three cases × read/write/cleanup
 print("expected_publication check")
@@ -634,7 +636,7 @@ os.makedirs(reserved_dir)
 reserved_cfg = os.path.join(reserved_dir, "config.json")
 acme_browser = tempfile.mkdtemp()
 for path, data in ((legacy_default, {"publication_url": "https://tie-pub.substack.com", "act_as": "owner",
-                                      "cookie_file": os.path.expanduser("~/Library/Application Support/Google/Chrome/Profile 2/Cookies"),
+                                      "cookie_file": os.path.join(os.path.expanduser(srv.browser_data_dir("chrome")), "Profile 2", "Cookies"),
                                       "cookies": {"substack.sid": "sid-tie"}}),
                    (legacy_acme, {"publication_url": "https://acme.substack.com", "act_as": "acme-owner",
                                   "cookie_file": os.path.join(acme_browser, "Default", "Cookies"),
@@ -1380,6 +1382,14 @@ try:
     open(os.path.join(progs, "Chromium", "Application", "chrome.exe"), "w").close()
     check("chrome_executable finds a per-user Chromium on Windows", srv.chrome_executable("chromium"),
           os.path.join(progs, "Chromium", "Application", "chrome.exe"))
+    check("browser data dirs come from LOCALAPPDATA on Windows",
+          (srv.browser_data_dir("chrome"), srv.browser_data_dir("brave"), srv.browser_data_dir("firefox")),
+          (os.path.join(progs, "Google", "Chrome", "User Data"), os.path.join(progs, "BraveSoftware", "Brave-Browser", "User Data"), None))
+    check("local_state_path follows them", srv.local_state_path("chrome"), os.path.join(progs, "Google", "Chrome", "User Data", "Local State"))
+    raises("a browser profile cannot be bound on Windows -> dedicated named",
+           lambda: srv.dispatch_tool("bind_client", {"client": "win", "profile": "Default"}), srv.ClientError, ["dedicated: true"])
+    raises("nor a cookie file", lambda: srv.dispatch_tool("bind_client", {"client": "win", "cookie_file": "C:/x/Cookies"}),
+           srv.ClientError, ["dedicated: true"])
     for k, v in _env.items():
         os.environ.pop(k, None) if v is None else os.environ.__setitem__(k, v)
 finally:

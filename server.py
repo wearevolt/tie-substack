@@ -293,13 +293,23 @@ CHROME_FAMILY_DATA_DIRS = {
     "brave": "~/Library/Application Support/BraveSoftware/Brave-Browser",
 }
 BROWSER_APPS = {"chrome": "Google Chrome", "chromium": "Chromium", "brave": "Brave Browser"}
+WINDOWS_DATA_DIRS = {"chrome": ("Google", "Chrome", "User Data"), "chromium": ("Chromium", "User Data"),
+                     "brave": ("BraveSoftware", "Brave-Browser", "User Data")}
+
+
+def browser_data_dir(browser):
+    """The browser's STANDARD data dir (holds Local State and the profiles), per OS."""
+    if sys.platform == "win32":
+        base, rel = os.environ.get("LOCALAPPDATA"), WINDOWS_DATA_DIRS.get(browser)
+        return os.path.join(base, *rel) if base and rel else None
+    return CHROME_FAMILY_DATA_DIRS.get(browser)
 
 
 def chrome_profile_cookie_files(browser, root=None):
     """(profile_name, cookie_file) for every profile of the browser's STANDARD data dir
     (Default, Profile 1, ...). A dedicated --user-data-dir lives elsewhere and is bound
     explicitly (bind_client user_data_dir=)."""
-    base = root or CHROME_FAMILY_DATA_DIRS.get(browser)
+    base = root or browser_data_dir(browser)
     if not base:
         return []
     base = os.path.expanduser(base)
@@ -319,14 +329,15 @@ def standard_install_browser(path):
     if not path:
         return None
     p = os.path.expanduser(path)
-    for b, root in CHROME_FAMILY_DATA_DIRS.items():
-        if p.startswith(os.path.expanduser(root) + os.sep):
+    for b in CHROME_FAMILY_DATA_DIRS:
+        root = browser_data_dir(b)
+        if root and p.startswith(os.path.expanduser(root) + os.sep):
             return b
     return None
 
 
 def local_state_path(browser, root=None):
-    base = root or CHROME_FAMILY_DATA_DIRS.get(browser)
+    base = root or browser_data_dir(browser)
     if not base:
         return None
     return os.path.join(os.path.expanduser(base), "Local State")
@@ -362,7 +373,7 @@ def resolve_profile_selector(selector, browser, root=None):
     if not profiles:
         raise RuntimeError(
             'no browser profiles found: no "Local State" file under %s (is %s installed?)'
-            % (root or CHROME_FAMILY_DATA_DIRS.get(browser), browser)
+            % (root or browser_data_dir(browser), browser)
         )
     sel = (selector or "").strip().lower()
     if not sel:
@@ -1840,6 +1851,9 @@ def tool_bind_client(args, facade):
     dedicated = bool(args.get("dedicated")) or (not chosen and sys.platform == "win32")
     if dedicated and chosen:
         raise ValueError("dedicated cannot be combined with profile, user_data_dir or cookie_file")
+    if sys.platform == "win32" and chosen and chosen[0] in ("profile", "cookie_file"):
+        raise ClientError("on Windows a browser's Cookies database cannot be read; bind_client with "
+                          "dedicated: true (a window of its own, read through DevTools) instead of %s" % chosen[0])
     current_pin = (rec.get("act_as") or "").strip()
     target = facade.subdomain()
     if not target:
