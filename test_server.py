@@ -1277,7 +1277,7 @@ _cdp = {name: getattr(srv, name) for name in ("devtools_endpoint", "launch_dedic
                                               "cdp_cookies", "open_dedicated_window")}
 DEVTOOLS, LAUNCHED, CALLS = {}, [], []
 srv.devtools_endpoint = lambda path: DEVTOOLS.get(path)
-srv.launch_dedicated = lambda browser, path, headless=False, url="about:blank": (LAUNCHED.append((path, headless, url)), FakeProc())[1]
+srv.launch_dedicated = lambda browser, path, headless=False, url="about:blank", devtools=True: (LAUNCHED.append((path, headless, url)), FakeProc())[1]
 srv.wait_devtools = lambda path, proc: DEVTOOLS.get(("after-launch", path))
 CDP_COOKIES = [{"name": "substack.sid", "value": "sid-w", "domain": ".substack.com"},
                {"name": "visit_id", "value": "v", "domain": "substack.com"},
@@ -1441,7 +1441,7 @@ def _slow_call(ws, method):
 
 
 srv.devtools_endpoint = lambda path: None
-srv.launch_dedicated = lambda browser, path, headless=False, url="about:blank": FakeProc()
+srv.launch_dedicated = lambda browser, path, headless=False, url="about:blank", devtools=True: FakeProc()
 srv.wait_devtools = lambda path, proc: "ws://headless"
 srv.cdp_call = _slow_call
 srv.cdp_cookies = REAL_CDP_COOKIES
@@ -1450,14 +1450,43 @@ threads = [threading.Thread(target=srv.cdp_cookies, args=(prof, "chrome")) for _
 [t.join() for t in threads]
 check("concurrent reads of one profile run one at a time", PEAK[0], 1)
 
-WAITED = []
+LOGIN, CLAIMED = [], []
+_wait_claimed = srv.wait_claimed
+srv.wait_claimed = lambda path, proc: (CLAIMED.append(path), True)[1]
 srv.devtools_endpoint = lambda path: None
-srv.wait_devtools = lambda path, proc: (WAITED.append(path), "ws://window")[1]
-srv.launch_dedicated = lambda browser, path, headless=False, url="about:blank": FakeProc()
-check("opening the window waits for its DevTools before releasing the profile",
-      (srv.open_dedicated_window({"path": prof}), WAITED), ("opened", [prof]))
-srv.wait_devtools = lambda path, proc: None
-raises("a window that does not start is reported", lambda: srv.open_dedicated_window({"path": prof}), srv.ClientError, ["did not start"])
+srv.launch_dedicated = lambda browser, path, headless=False, url="about:blank", devtools=True: (
+    LOGIN.append((path, headless, url, devtools)), FakeProc())[1]
+check("the login window opens without DevTools, on the sign-in page",
+      (srv.open_dedicated_window({"path": prof}), LOGIN), ("opened", [(prof, False, "https://substack.com/sign-in", False)]))
+check("the profile is held until the window has claimed it", CLAIMED, [prof])
+srv.wait_claimed = lambda path, proc: False
+LOGIN.clear()
+raises("a window that fails to start is reported", lambda: srv.open_dedicated_window({"path": prof}),
+       srv.ClientError, ["did not start"])
+srv.wait_claimed = _wait_claimed
+marker = os.path.join(prof, "SingletonLock")
+open(marker, "w").close()
+t0 = srv.time.time()
+check("a claimed profile releases at once", (srv.wait_claimed(prof, FakeProc()), srv.time.time() - t0 < 0.2), (True, True))
+check("a launch that handed off to the open window is fine", srv.wait_claimed(prof, FakeProc(exited=True)), True)
+os.remove(marker)
+check("a launch that exited without claiming the profile failed", srv.wait_claimed(prof, FakeProc(exited=True)), False)
+srv.devtools_endpoint = lambda path: "ws://window"
+LOGIN.clear()
+check("a window already open with DevTools is left as it is",
+      (srv.open_dedicated_window({"path": prof}), LOGIN), ("already open", []))
+
+POPEN = []
+_popen, _exe = srv.subprocess.Popen, srv.chrome_executable
+srv.subprocess.Popen = lambda cmd, **kw: POPEN.append(cmd)
+srv.chrome_executable = lambda browser: "chrome"
+try:
+    _cdp["launch_dedicated"]("chrome", prof, url="https://substack.com/sign-in", devtools=False)
+    _cdp["launch_dedicated"]("chrome", prof, headless=True)
+finally:
+    srv.subprocess.Popen, srv.chrome_executable = _popen, _exe
+check("no debugging port on the login window", "--remote-debugging-port=0" in POPEN[0], False)
+check("the headless read keeps its debugging port", ("--remote-debugging-port=0" in POPEN[1], "--headless=new" in POPEN[1]), (True, True))
 
 srv.cdp_cookies = lambda path, browser: {"substack.sid": "sid-ud"}
 srv.on_windows = lambda: True
@@ -1470,7 +1499,7 @@ for name, fn in _cdp.items():
     setattr(srv, name, fn)
 
 print("registration & version")
-check("server version", srv.SERVER_VERSION, "0.8.0")
+check("server version", srv.SERVER_VERSION, "0.8.1")
 check("old tool names gone", any(n in srv.TOOL_HANDLERS for n in ("substack_status", "refresh_cookie", "list_profiles")), False)
 check("publication tools require client + expected_publication",
       all(set(t["inputSchema"]["required"]) >= {"client", "expected_publication"}
