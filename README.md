@@ -55,7 +55,9 @@ cookie source and the pinned identity.
   profile of its own, `~/.tie-substack/browsers/<client>`, read through Chrome DevTools instead
   of the Cookies database: nothing is decrypted, so it works where pycookiecheat cannot (Chrome
   on Windows). Without a login there yet it opens that window, answers `login_needed` and stores
-  nothing; the operator logs in to Substack in that window and calls it again. Every later read
+  nothing; the operator logs in to Substack in that window, closes it and calls it again (0.8.1:
+  the login window has no debugging port, since Substack's sign-in sends no email to a browser
+  with one; the profile is read once the window is closed). Every later read
   starts the profile headless for about a second, takes the substack.com cookies and closes it,
   so an expired session is re-read without anyone opening a window. On macOS it is opt-in and
   needs `websocket-client` in the venv.
@@ -80,7 +82,7 @@ ask it to run `clients_status`.
 Adding a client needs no reinstall: in a chat, `add_client(client, publication_url)`, then
 `bind_client(client, …)`.
 
-## Install (Windows, 0.8.0)
+## Install (Windows, 0.8.1)
 
 A Claude Desktop extension, no Python or terminal needed: download
 [`tie-substack.mcpb`](https://github.com/wearevolt/tie-substack/releases/latest/download/tie-substack.mcpb)
@@ -88,11 +90,13 @@ and add it in Claude: Settings → Extensions. It bundles the Windows embeddable
 the dependencies (`build_mcpb.sh`; the `extension` workflow attaches it to every `v*`
 release). The name carries no platform: a macOS build is meant to join the same file. Then, in a Cowork chat: "add client <slug> with https://<name>.substack.com, then
 bind it". A Chrome window of its own opens; log in to Substack there as a user of that
-publication and ask to bind again. Chrome is required (Chromium and Brave work too).
+publication, close the window and ask to bind again. Chrome is required (Chromium and Brave
+work too). If Claude does not see the tools after installing, quit it from the system tray and
+reopen it.
 
 Logging in to the dedicated window:
-- If Substack emails a sign-in link, copy it into that window's address bar; a click opens it
-  in your usual browser and logs that one in instead.
+- Substack emails a code (type it in that window) or a sign-in link (copy it into that
+  window's address bar; a click opens it in your usual browser and logs that one in instead).
 - Ask for the email once and wait a few minutes: repeated requests get "too many login
   emails" for a while.
 - Don't log out of Substack elsewhere until the dedicated window is logged in.
