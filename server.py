@@ -43,6 +43,13 @@ as an expired session; schedule_note warns about another scheduled note less tha
 0.7.0: read-only stats as the author sees them: get_note_stats, list_post_stats,
 get_post_stats, get_reading_times. Owner's login only; nothing stored.
 
+0.8.0: a dedicated browser window per client, read through Chrome DevTools (cookie source
+`cdp`): bind_client dedicated=true opens ~/.tie-substack/browsers/<client> for a one-time
+Substack login, and every later read (refresh_session, the automatic re-read) starts that
+profile headless for a second, takes the substack.com cookies and closes it. Nothing is
+decrypted, so it works where the Cookies DB cannot be read (Chrome on Windows); the default
+there, opt-in on macOS (needs websocket-client).
+
 Env:
   TIE_SUBSTACK_HOME        registry home (default ~/.tie-substack); tests point it at a temp dir
   TIE_SUBSTACK_CLIENT +    an explicit substack.sid for exactly that client (CI-style setups);
@@ -55,7 +62,8 @@ CLI (used by install.command for the 0.4 -> 0.5 migration; offline except check-
   server.py rollback --desktop-config PATH [--last]
 
 Protocol: MCP over stdio, newline-delimited JSON-RPC 2.0. Requires: python-substack;
-pycookiecheat optional (bind_client / refresh_session need it).
+pycookiecheat optional (bind_client / refresh_session need it for a browser profile);
+websocket-client optional (a dedicated window, cookie source `cdp`, needs it).
 """
 
 import base64
@@ -70,10 +78,11 @@ import sys
 import threading
 import time
 import traceback
+import urllib.request
 from datetime import datetime, timezone
 
 SERVER_NAME = "tie-substack"
-SERVER_VERSION = "0.7.0"
+SERVER_VERSION = "0.8.0"
 CONFIG_FORMAT_VERSION = 1
 
 AUDIENCE_VALUES = ("everyone", "only_free", "only_paid", "founding")
@@ -97,6 +106,11 @@ _api_cache = {}  # slug -> {"api", "handle", "email", "sid", "validated_at"}
 
 def home():
     return os.path.expanduser(os.environ.get("TIE_SUBSTACK_HOME", "~/.tie-substack"))
+
+
+def on_windows():
+    """The one platform switch (tests pin it to check either OS's behaviour anywhere)."""
+    return sys.platform == "win32"
 
 
 def clients_path():
@@ -284,13 +298,23 @@ CHROME_FAMILY_DATA_DIRS = {
     "brave": "~/Library/Application Support/BraveSoftware/Brave-Browser",
 }
 BROWSER_APPS = {"chrome": "Google Chrome", "chromium": "Chromium", "brave": "Brave Browser"}
+WINDOWS_DATA_DIRS = {"chrome": ("Google", "Chrome", "User Data"), "chromium": ("Chromium", "User Data"),
+                     "brave": ("BraveSoftware", "Brave-Browser", "User Data")}
+
+
+def browser_data_dir(browser):
+    """The browser's STANDARD data dir (holds Local State and the profiles), per OS."""
+    if on_windows():
+        base, rel = os.environ.get("LOCALAPPDATA"), WINDOWS_DATA_DIRS.get(browser)
+        return os.path.join(base, *rel) if base and rel else None
+    return CHROME_FAMILY_DATA_DIRS.get(browser)
 
 
 def chrome_profile_cookie_files(browser, root=None):
     """(profile_name, cookie_file) for every profile of the browser's STANDARD data dir
     (Default, Profile 1, ...). A dedicated --user-data-dir lives elsewhere and is bound
     explicitly (bind_client user_data_dir=)."""
-    base = root or CHROME_FAMILY_DATA_DIRS.get(browser)
+    base = root or browser_data_dir(browser)
     if not base:
         return []
     base = os.path.expanduser(base)
@@ -310,14 +334,15 @@ def standard_install_browser(path):
     if not path:
         return None
     p = os.path.expanduser(path)
-    for b, root in CHROME_FAMILY_DATA_DIRS.items():
-        if p.startswith(os.path.expanduser(root) + os.sep):
+    for b in CHROME_FAMILY_DATA_DIRS:
+        root = browser_data_dir(b)
+        if root and p.startswith(os.path.expanduser(root) + os.sep):
             return b
     return None
 
 
 def local_state_path(browser, root=None):
-    base = root or CHROME_FAMILY_DATA_DIRS.get(browser)
+    base = root or browser_data_dir(browser)
     if not base:
         return None
     return os.path.join(os.path.expanduser(base), "Local State")
@@ -353,7 +378,7 @@ def resolve_profile_selector(selector, browser, root=None):
     if not profiles:
         raise RuntimeError(
             'no browser profiles found: no "Local State" file under %s (is %s installed?)'
-            % (root or CHROME_FAMILY_DATA_DIRS.get(browser), browser)
+            % (root or browser_data_dir(browser), browser)
         )
     sel = (selector or "").strip().lower()
     if not sel:
@@ -404,6 +429,166 @@ def import_pycookiecheat():
             "(it installs it) before binding or refreshing sessions"
         )
     return pycookiecheat
+
+
+# ---------------------------------------------------------------- dedicated window (DevTools)
+
+CDP_TIMEOUT = 30  # seconds for a started profile to open DevTools (a cold first start took 14), and for one answer
+WINDOWS_BROWSERS = {"chrome": ("Google", "Chrome", "Application", "chrome.exe"),
+                    "chromium": ("Chromium", "Application", "chrome.exe"),
+                    "brave": ("BraveSoftware", "Brave-Browser", "Application", "brave.exe")}
+
+
+def import_websocket():
+    try:
+        import websocket  # noqa: PLC0415  (websocket-client)
+    except ImportError:
+        raise RuntimeError(
+            "websocket-client is not installed in the server's environment; a dedicated window is "
+            "read through it (the Windows extension bundles it; elsewhere: pip install websocket-client)"
+        )
+    return websocket
+
+
+def dedicated_profile_dir(slug):
+    return os.path.join(home(), "browsers", slug)
+
+
+def chrome_executable(browser):
+    """The browser binary, launched directly so its flags and process are ours."""
+    if on_windows():
+        rel = WINDOWS_BROWSERS.get(browser)
+        roots = [r for r in (os.environ.get(k) for k in ("PROGRAMFILES", "PROGRAMFILES(X86)", "LOCALAPPDATA")) if r]
+        for r in roots if rel else ():
+            if os.path.isfile(os.path.join(r, *rel)):
+                return os.path.join(r, *rel)
+        raise ClientError("%s is not installed in the standard places (%s)" % (browser, ", ".join(roots)))
+    app = BROWSER_APPS.get(browser, "Google Chrome")
+    path = "/Applications/%s.app/Contents/MacOS/%s" % (app, app)
+    if not os.path.isfile(path):
+        raise ClientError("%s is not installed at %s" % (app, path))
+    return path
+
+
+def devtools_endpoint(user_data_dir):
+    """The browser websocket of a running profile with DevTools on, else None. Chrome writes
+    <user_data_dir>/DevToolsActivePort (the port, then the browser's websocket path) when started
+    with --remote-debugging-port; the path is checked so a port reused by another browser after
+    this one quit is never taken for it."""
+    try:
+        with open(os.path.join(user_data_dir, "DevToolsActivePort")) as f:
+            port, ws_path = int(f.readline().strip()), f.readline().strip()
+    except (OSError, ValueError):
+        return None
+    try:
+        with urllib.request.urlopen("http://127.0.0.1:%d/json/version" % port, timeout=2) as r:
+            ws_url = json.load(r).get("webSocketDebuggerUrl") or ""
+    except Exception:  # noqa: BLE001  (a file left by a browser that has quit)
+        return None
+    return ws_url if ws_path and ws_url.endswith(ws_path) else None
+
+
+def launch_dedicated(browser, user_data_dir, headless=False, url="about:blank"):
+    """Start the dedicated profile with DevTools on a free port. The browser's own console
+    output goes to DEVNULL: this process's stdout carries JSON-RPC."""
+    os.makedirs(user_data_dir, exist_ok=True)
+    try:
+        os.remove(os.path.join(user_data_dir, "DevToolsActivePort"))
+    except OSError:
+        pass
+    cmd = [chrome_executable(browser), "--user-data-dir=%s" % user_data_dir, "--remote-debugging-port=0",
+           "--no-first-run", "--no-default-browser-check"] + (["--headless=new"] if headless else []) + [url]
+    return subprocess.Popen(cmd, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,  # noqa: S603
+                            stderr=subprocess.DEVNULL)
+
+
+def wait_devtools(user_data_dir, proc):
+    deadline = time.time() + CDP_TIMEOUT
+    while time.time() < deadline:
+        ws_url = devtools_endpoint(user_data_dir)
+        if ws_url:
+            return ws_url
+        if proc.poll() is not None:
+            return None  # handed off to a window already open on this profile without DevTools
+        time.sleep(0.25)
+    return None
+
+
+def cdp_call(ws_url, method):
+    """One DevTools command on the browser target; its result."""
+    websocket = import_websocket()
+    ws = websocket.create_connection(ws_url, timeout=CDP_TIMEOUT, suppress_origin=True)
+    try:
+        ws.send(json.dumps({"id": 1, "method": method}))
+        while True:
+            msg = json.loads(ws.recv())
+            if msg.get("id") == 1:
+                if msg.get("error"):
+                    raise RuntimeError("DevTools %s: %s" % (method, msg["error"].get("message")))
+                return msg.get("result") or {}
+    finally:
+        ws.close()
+
+
+def stop_browser(ws_url, proc):
+    if ws_url:
+        try:
+            cdp_call(ws_url, "Browser.close")
+        except Exception:  # noqa: BLE001  (the browser may go before it answers)
+            pass
+    try:
+        proc.wait(timeout=5)
+    except subprocess.TimeoutExpired:
+        if on_windows():
+            subprocess.run(["taskkill", "/PID", str(proc.pid), "/T", "/F"],  # noqa: S603, S607
+                           stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        else:
+            proc.kill()
+            proc.wait()
+
+
+def cdp_cookies(user_data_dir, browser):
+    """The substack.com cookies of a dedicated profile through DevTools: from its window when it
+    is open with DevTools on, else from the profile started headless for the read and closed."""
+    user_data_dir = os.path.expanduser(user_data_dir)
+    with profile_lock(user_data_dir):
+        ws_url, proc = devtools_endpoint(user_data_dir), None
+        if not ws_url:
+            proc = launch_dedicated(browser, user_data_dir, headless=True)
+            ws_url = wait_devtools(user_data_dir, proc)
+        try:
+            if not ws_url:
+                raise ClientError(
+                    "the dedicated window %s did not open DevTools; if it is open, close it and retry"
+                    % user_data_dir)
+            cookies = cdp_call(ws_url, "Storage.getCookies").get("cookies") or []
+        finally:
+            if proc is not None:
+                stop_browser(ws_url, proc)
+    return {c["name"]: c["value"] for c in cookies if (c.get("domain") or "").lstrip(".") == "substack.com"}
+
+
+def open_dedicated_window(source, url="https://substack.com/sign-in"):
+    """Show the dedicated profile for a login; an open window is left as it is."""
+    path = os.path.expanduser(source["path"])
+    with profile_lock(path):
+        if devtools_endpoint(path):
+            return "already open"
+        proc = launch_dedicated(source.get("browser") or "chrome", path, url=url)
+        # Hold the profile until the window is up, so a concurrent read attaches to it instead
+        # of starting a second browser on the same profile (and closing the login window).
+        if not wait_devtools(path, proc):
+            raise ClientError("the dedicated window %s did not start; if it is open, close it and retry" % path)
+    return "opened"
+
+
+_profile_locks = {}  # user_data_dir -> Lock: one launch/read/close of a profile at a time
+_profile_locks_guard = threading.Lock()
+
+
+def profile_lock(user_data_dir):
+    with _profile_locks_guard:
+        return _profile_locks.setdefault(os.path.normcase(os.path.abspath(user_data_dir)), threading.Lock())
 
 
 # ---------------------------------------------------------------- probes
@@ -482,7 +667,7 @@ def cookie_source_file(source):
         return os.path.join(os.path.expanduser(source.get("path") or ""), "Default", "Cookies")
     if kind == "cookie_file":
         return os.path.expanduser(source.get("path") or "")
-    return None
+    return None  # cdp: read through DevTools, never from the Cookies DB
 
 
 def describe_source(source):
@@ -493,11 +678,21 @@ def describe_source(source):
         return "%s profile %r" % (source.get("browser") or "chrome", source.get("profile"))
     if kind == "user_data_dir":
         return "dedicated browser %s" % source.get("path")
+    if kind == "cdp":
+        return "dedicated window %s" % source.get("path")
     return "cookie file %s" % source.get("path")
 
 
 def read_source_cookies(source):
     """Cookies from the bound source. Raises with the fix named."""
+    kind = (source or {}).get("type")
+    if kind == "cdp" or (kind == "user_data_dir" and on_windows()):  # no Cookies DB read on Windows
+        cookies = cdp_cookies(source.get("path") or "", source.get("browser") or "chrome")
+        if "substack.sid" not in cookies:
+            raise ClientError(
+                "no Substack login in %s; open it (open_client_browser), log in to Substack there, "
+                "then refresh_session" % describe_source(source))
+        return cookies, None
     pycookiecheat = import_pycookiecheat()
     cf = cookie_source_file(source)
     if not cf or not os.path.isfile(cf):
@@ -681,6 +876,15 @@ class ProbeFacade:
 
     def read_source(self, source):
         return read_source_cookies(source)
+
+    def read_dedicated(self, source):
+        """A dedicated profile's cookies, {} when it has none yet (no error: bind asks for a login)."""
+        if not os.path.isdir(os.path.expanduser(source["path"])):
+            return {}
+        return cdp_cookies(source["path"], source.get("browser") or "chrome")
+
+    def open_window(self, source):
+        return open_dedicated_window(source)
 
     def persist(self, cookies, probe, source_path, **record_fields):
         save_session(self.slug, cookies, probe, source_path)
@@ -1267,7 +1471,7 @@ TOOLS = [
     {
         "name": "open_client_browser",
         "scope": "registry",
-        "description": "OPTIONAL. Launch the client's dedicated browser (its bound user_data_dir) for a one-time Substack login. macOS only.",
+        "description": "OPTIONAL. Show the client's dedicated browser (bound with dedicated or user_data_dir) for a one-time Substack login; an open window is left as it is.",
         "inputSchema": _schema(dict(CLIENT_PROP), ["client"]),
     },
     # ---- probe scope (identity and access only)
@@ -1280,11 +1484,12 @@ TOOLS = [
     {
         "name": "bind_client",
         "scope": "probe",
-        "description": "Bind a client to a cookie source and pin its identity: a standard browser profile (`profile`, by directory name / display name / email), a dedicated browser (`user_data_dir`), or an explicit `cookie_file`. With none of them, every standard profile of `browser` is scanned and exactly ONE login reaching the publication is accepted (several: refuses with the candidates). The session is validated against the publication and stored; `act_as` is pinned to that login. Rebinding to a DIFFERENT identity needs confirm_switch=true, only on the user's explicit ask. Cookie values never surface.",
+        "description": "Bind a client to a cookie source and pin its identity: a standard browser profile (`profile`, by directory name / display name / email), a dedicated browser (`user_data_dir`), an explicit `cookie_file`, or a dedicated window read through DevTools (`dedicated: true`; the default on Windows): without a login there yet it opens the window, answers status=login_needed and stores nothing; call again after the login. With none of them (macOS), every standard profile of `browser` is scanned and exactly ONE login reaching the publication is accepted (several: refuses with the candidates). The session is validated against the publication and stored; `act_as` is pinned to that login. Rebinding to a DIFFERENT identity needs confirm_switch=true, only on the user's explicit ask. Cookie values never surface.",
         "inputSchema": _schema(dict(CLIENT_PROP, **{
             "profile": {"type": "string"},
             "user_data_dir": {"type": "string"},
             "cookie_file": {"type": "string"},
+            "dedicated": {"type": "boolean", "default": False},
             "browser": {"type": "string", "enum": ["chrome", "chromium", "brave"], "default": "chrome"},
             "confirm_switch": {"type": "boolean", "default": False},
         }), ["client"]),
@@ -1523,9 +1728,10 @@ def tool_list_browser_profiles(args):
         p["bound_to"] = bound.get((browser, p["dir"]))
     dedicated = [
         {"client": slug, "user_data_dir": rec["cookie_source"].get("path"),
-         "browser": rec["cookie_source"].get("browser") or "chrome"}
+         "browser": rec["cookie_source"].get("browser") or "chrome",
+         "read_through": "devtools" if rec["cookie_source"].get("type") == "cdp" else "cookies_db"}
         for slug, rec in sorted(clients.items())
-        if (rec.get("cookie_source") or {}).get("type") == "user_data_dir"
+        if (rec.get("cookie_source") or {}).get("type") in ("user_data_dir", "cdp")
     ]
     out = {"browser": browser, "root": os.path.dirname(path) if path else None,
            "profiles": profiles, "count": len(profiles), "dedicated_browsers": dedicated,
@@ -1538,10 +1744,14 @@ def tool_list_browser_profiles(args):
 def tool_open_client_browser(args):
     slug, rec = client_record(args.get("client"))
     src = rec.get("cookie_source") or {}
+    if src.get("type") == "cdp" or (src.get("type") == "user_data_dir" and on_windows()):
+        state = open_dedicated_window(src)
+        return text_result({"window": state, "user_data_dir": os.path.expanduser(src["path"]), "client": slug,
+                            "next": "log in to Substack in that window, then refresh_session"})
     if src.get("type") != "user_data_dir":
         raise ClientError(
-            "client %r is not bound to a dedicated browser (%s); bind_client with user_data_dir "
-            "first" % (slug, describe_source(src))
+            "client %r is not bound to a dedicated browser (%s); bind_client with dedicated or "
+            "user_data_dir first" % (slug, describe_source(src))
         )
     app = BROWSER_APPS.get(src.get("browser") or "chrome", "Google Chrome")
     path = os.path.expanduser(src["path"])
@@ -1642,24 +1852,47 @@ def tool_bind_client(args, facade):
     chosen = [k for k in ("profile", "user_data_dir", "cookie_file") if args.get(k)]
     if len(chosen) > 1:
         raise ValueError("pass only one of profile, user_data_dir, cookie_file")
+    # Windows' Cookies DB cannot be read, so a dedicated window is its default.
+    dedicated = bool(args.get("dedicated")) or (not chosen and on_windows())
+    if dedicated and chosen:
+        raise ValueError("dedicated cannot be combined with profile, user_data_dir or cookie_file")
+    if on_windows() and chosen and chosen[0] in ("profile", "cookie_file"):
+        raise ClientError("on Windows a browser's Cookies database cannot be read; bind_client with "
+                          "dedicated: true (a window of its own, read through DevTools) instead of %s" % chosen[0])
     current_pin = (rec.get("act_as") or "").strip()
     target = facade.subdomain()
     if not target:
         raise ClientError("client %r has no https://<name>.substack.com publication_url" % slug)
 
-    if chosen:
-        kind = chosen[0]
-        if kind == "profile":
-            prof = resolve_profile_selector(args["profile"], browser)
-            source = {"type": "profile", "browser": browser, "profile": prof["dir"]}
-        elif kind == "user_data_dir":
-            source = {"type": "user_data_dir", "browser": browser,
-                      "path": os.path.expanduser(args["user_data_dir"]).rstrip("/")}
+    if chosen or dedicated:
+        if dedicated:
+            bound = rec.get("cookie_source") or {}
+            if not args.get("browser") and bound.get("type") == "cdp":
+                browser = bound.get("browser") or "chrome"  # the profile belongs to the browser that made it
+            source = {"type": "cdp", "browser": browser, "path": dedicated_profile_dir(slug)}
+            cookies, cf = facade.read_dedicated(source), None
+            ok, probe = facade.identity(cookies)
+            if not ok and probe.get("reason") in ("no_session", "session_invalid"):
+                window = facade.open_window(source)
+                return text_result({
+                    "client": slug, "publication": target, "status": "login_needed",
+                    "cookie_source": describe_source(source), "window": window,
+                    "next": "log in to Substack in that window as a user of %s, then bind_client again "
+                            "(dedicated: true%s); nothing was stored"
+                            % (target, "" if browser == "chrome" else ', browser: "%s"' % browser)})
         else:
-            source = {"type": "cookie_file", "browser": browser,
-                      "path": os.path.expanduser(args["cookie_file"])}
-        cookies, cf = facade.read_source(source)
-        ok, probe = facade.identity(cookies)
+            kind = chosen[0]
+            if kind == "profile":
+                prof = resolve_profile_selector(args["profile"], browser)
+                source = {"type": "profile", "browser": browser, "profile": prof["dir"]}
+            elif kind == "user_data_dir":
+                source = {"type": "user_data_dir", "browser": browser,
+                          "path": os.path.normpath(os.path.expanduser(args["user_data_dir"]))}
+            else:
+                source = {"type": "cookie_file", "browser": browser,
+                          "path": os.path.expanduser(args["cookie_file"])}
+            cookies, cf = facade.read_source(source)
+            ok, probe = facade.identity(cookies)
         if not ok and probe.get("reason") == "rate_limited":
             raise rate_limited_error(slug, "the session check of %s" % describe_source(source), "bind_client")
         if not ok:
