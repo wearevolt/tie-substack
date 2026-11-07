@@ -46,12 +46,10 @@ only in `~/.tie-substack/sessions/<client>.json` (file mode 0600); the registry
 `~/.tie-substack/clients.json` (0600) holds no secrets, only the publication, the bound
 cookie source and the pinned identity.
 
-- `bind_client` reads the cookie straight from a local Chrome-family profile or a dedicated
-  browser via [pycookiecheat](https://github.com/n8henrie/pycookiecheat) (macOS asks for
-  Keychain access), validates it against the client's publication, stores it and pins the
-  login as `act_as`. Tool output lists cookie *names* only; the value is never displayed,
-  returned to the model, or logged.
-- `bind_client dedicated: true` (0.8.0; the default on Windows) gives the client a browser
+- `bind_client` reads the client's session, validates it against the client's publication,
+  stores it and pins the login as `act_as`. Tool output lists cookie *names* only; the value is
+  never displayed, returned to the model, or logged.
+- `bind_client dedicated: true` (0.8.0; the default since 0.9.0, on macOS too) gives the client a browser
   profile of its own, `~/.tie-substack/browsers/<client>`, read through Chrome DevTools instead
   of the Cookies database: nothing is decrypted, so it works where pycookiecheat cannot (Chrome
   on Windows). Without a login there yet it opens that window, answers `login_needed` and stores
@@ -59,40 +57,42 @@ cookie source and the pinned identity.
   the login window has no debugging port, since Substack's sign-in sends no email to a browser
   with one; the profile is read once the window is closed). Every later read
   starts the profile headless for about a second, takes the substack.com cookies and closes it,
-  so an expired session is re-read without anyone opening a window. On macOS it is opt-in and
-  needs `websocket-client` in the venv.
+  so an expired session is re-read without anyone opening a window.
+- On macOS an explicit `profile` (a standard Chrome-family profile) or `cookie_file` still binds
+  through [pycookiecheat](https://github.com/n8henrie/pycookiecheat) (macOS asks for Keychain
+  access). Before 0.9.0, `bind_client` with no source scanned the standard profiles; that scan is
+  gone.
 - `refresh_session` re-reads the bound source after a logout or expiry; it refuses when the
   source is now another login (nothing stored).
 
 The cookie is a full-access credential for the Substack account that owns the session:
 treat the session files like passwords.
 
-## Install (macOS)
-
-```
-bash -c "$(curl -fsSL https://raw.githubusercontent.com/wearevolt/tie-substack/main/install.command)"
-```
-
-Or from a clone (`./install.command`, also by double-click). The installer creates a venv in
-`~/.tie-substack/`, installs `python-substack` + `pycookiecheat`, **migrates any 0.4 configs**
-(below), verifies every client live, and registers **one** server entry (`tie-substack`) in
-Claude Desktop's `claude_desktop_config.json`. Then quit Claude fully (Cmd-Q), reopen, and
-ask it to run `clients_status`.
-
-Adding a client needs no reinstall: in a chat, `add_client(client, publication_url)`, then
-`bind_client(client, …)`.
-
-## Install (Windows, 0.8.1)
+## Install (macOS and Windows, 0.9.0)
 
 A Claude Desktop extension, no Python or terminal needed: download
 [`tie-substack.mcpb`](https://github.com/wearevolt/tie-substack/releases/latest/download/tie-substack.mcpb)
-and add it in Claude: Settings → Extensions. It bundles the Windows embeddable Python 3.12 and
-the dependencies (`build_mcpb.sh`; the `extension` workflow attaches it to every `v*`
-release). The name carries no platform: a macOS build is meant to join the same file. Then, in a Cowork chat: "add client <slug> with https://<name>.substack.com, then
-bind it". A Chrome window of its own opens; log in to Substack there as a user of that
-publication, close the window and ask to bind again. Chrome is required (Chromium and Brave
-work too). If Claude does not see the tools after installing, quit it from the system tray and
-reopen it.
+and add it in Claude: Settings → Desktop app → Extensions (Manage) → Advanced settings →
+Install extension. It is a `uv` extension (`build_mcpb.sh`; the `extension` workflow builds it,
+starts it on macOS and Windows and attaches it to every `v*` release): Claude Desktop uses the
+`uv` it finds or downloads its own, and installs Python 3.12 and the locked dependencies
+(`uv.lock`) into the extension's folder, so installing needs network. Then quit Claude fully
+(Cmd-Q on macOS; on Windows Quit from the system tray) and reopen it, and in a Cowork chat:
+"add client <slug> with https://<name>.substack.com, then bind it". A Chrome window of its own
+opens; log in to Substack there as a user of that publication, close the window and ask to bind
+again. Chrome is required (Chromium and Brave work too). Adding a client needs no reinstall.
+
+**Moving from `install.command` (macOS).** The installer's entry in `claude_desktop_config.json`
+would run a second tie-substack beside the extension, so remove it first (backed up; the registry
+and sessions stay, the extension reads them):
+
+```
+bash -c "$(curl -fsSL https://raw.githubusercontent.com/wearevolt/tie-substack/main/install.command)" _ --to-extension
+```
+
+Then quit Claude, reopen it and install the extension. Clients bound to a browser profile keep
+working; 0.4 entries the migration left on `legacy/server.py` stay as they are. `--rollback=last`
+brings the entry back. `install.command` itself stays one more release (for this and rollback).
 
 Logging in to the dedicated window:
 - Substack emails a code (type it in that window) or a sign-in link (copy it into that
@@ -115,7 +115,7 @@ installing a newer extension over the old one keeps every client.
 | registry | `list_browser_profiles` | Chrome-family profiles (directory, display name, email) from the plaintext Local State, plus the dedicated browsers and windows clients are bound to. No cookies, no Keychain prompt. |
 | registry | `open_client_browser` | OPTIONAL. Show a client's dedicated browser or window for a one-time login; an open one is left as it is. |
 | probe | `clients_status` | Per client: bound?, session valid / expired / missing, identity matches?, publication reachable?, `logged_in_as`. The readiness signal (`--check-clients` in the installer). |
-| probe | `bind_client` | Bind a cookie source (`profile`, `user_data_dir`, `cookie_file`, or `dedicated: true` for a window of its own read through DevTools; with none, macOS scans the browser's standard profiles and accepts exactly ONE login that reaches the publication, Windows uses `dedicated`) and pin `act_as`. Switching to a different identity needs `confirm_switch`. |
+| probe | `bind_client` | Bind a cookie source (`dedicated: true`, a window of its own read through DevTools, the default; or, macOS only, `profile` / `cookie_file`; `user_data_dir` for a dedicated browser) and pin `act_as`. Switching to a different identity needs `confirm_switch`. |
 | probe | `refresh_session` | Re-read the bound source, validate against publication and pin, store. |
 | publication | `get_publication_settings` | Paid subscriptions?, sections, existing tags, unavailable values. Call before offering choices. |
 | publication | `create_draft` | Draft from Markdown with the **slug pinned** + explicit settings → `draft_id`, `slug`, `post_url`, `editor_url`, settings **as stored**. |
@@ -216,13 +216,14 @@ rejects non-Substack domains.
 `python3 test_server.py`: offline regression checks (URL normalization, draft summaries,
 settings validation, tags, the registry, every `expected_publication` mismatch on a read, a
 write and a cleanup tool, identity and unbound refusals, the scope drift guard, interleaved
-clients, one-shot auto-refresh, `bind_client` scan/selection/switch, `refresh_session`,
-`clients_status`, and the migration: selection by reference, idempotent import, journal
-conflicts, write-once backup, switch with and without failures, rollback with hash check,
-and the dedicated window: attach vs headless start, the DevTools endpoint check, one read per
-profile at a time, `login_needed`, the Windows defaults and paths), and the stats tools'
-parsing of Substack's answers as probed. Needs no cookie and makes no network calls. CI runs
-it on Linux and on Windows.
+clients, one-shot auto-refresh, `bind_client` selection/switch and its dedicated default,
+`refresh_session`, `clients_status`, and the migration: selection by reference, idempotent
+import, journal conflicts, write-once backup, switch with and without failures, rollback with
+hash check, `remove-entry`, and the dedicated window: attach vs headless start, the DevTools
+endpoint check, one read per profile at a time, `login_needed`, the Windows paths), and the
+stats tools' parsing of Substack's answers as probed. Needs no cookie and makes no network
+calls. CI runs it on Linux and on Windows; the `extension` workflow also starts the built
+`.mcpb` on macOS and Windows.
 
 ## Substack Notes (0.6.0)
 
