@@ -1304,8 +1304,12 @@ DEVTOOLS[("after-launch", "/prof/closed")] = "ws://headless"
 check("a closed profile is started headless, read, then closed",
       (sorted(srv.cdp_cookies("/prof/closed", "chrome")), LAUNCHED, [m for _, m in CALLS]),
       (["substack.sid", "visit_id"], [("/prof/closed", True, "about:blank")], ["Storage.getCookies", "Browser.close"]))
-raises("a profile already open without DevTools -> close it and retry", lambda: srv.cdp_cookies("/prof/locked", "chrome"),
+raises("a profile already open without DevTools -> quit it (macOS) and retry", lambda: srv.cdp_cookies("/prof/locked", "chrome"),
+       srv.ClientError, ["Cmd+Q", "and retry"])
+srv.on_windows = lambda: True
+raises("on Windows closing the window is enough", lambda: srv.cdp_cookies("/prof/locked", "chrome"),
        srv.ClientError, ["close it and retry"])
+srv.on_windows = lambda: False
 
 reset_home()
 srv.dispatch_tool("add_client", {"client": "win", "publication_url": "win.substack.com"})
@@ -1318,6 +1322,7 @@ r = payload(srv.dispatch_tool("bind_client", {"client": "win", "dedicated": True
 check("dedicated bind without a login: window opened, login_needed, nothing stored",
       (r["status"], OPENED, srv.client_record("win")[1]["cookie_source"], srv.load_session("win")),
       ("login_needed", [ded], None, {}))
+check("on macOS login_needed says to quit that Chrome", "Cmd+Q" in r["next"], True)
 os.makedirs(ded)
 DED_COOKIES[ded] = {"substack.sid": "sid-anon"}
 r = payload(srv.dispatch_tool("bind_client", {"client": "win", "dedicated": True}))

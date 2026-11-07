@@ -79,7 +79,8 @@ starts it on macOS and Windows and attaches it to every `v*` release): Claude De
 (`uv.lock`) into the extension's folder, so installing needs network. Then quit Claude fully
 (Cmd-Q on macOS; on Windows Quit from the system tray) and reopen it, and in a Cowork chat:
 "add client <slug> with https://<name>.substack.com, then bind it". A Chrome window of its own
-opens; log in to Substack there as a user of that publication, close the window and ask to bind
+opens; log in to Substack there as a user of that publication, close the window (on macOS quit
+that Chrome with Cmd+Q: closing its window leaves it running and holding the profile) and ask to bind
 again. Chrome is required (Chromium and Brave work too). Adding a client needs no reinstall.
 
 **Moving from `install.command` (macOS).** The installer's entry in `claude_desktop_config.json`

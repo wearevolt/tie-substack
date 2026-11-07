@@ -122,6 +122,12 @@ def on_windows():
     return sys.platform == "win32"
 
 
+def close_hint():
+    """How a user releases the login window's profile: closing the last window ends Chrome on
+    Windows, not on macOS, where it keeps running (and holding the profile) until quit."""
+    return "close it" if on_windows() else "quit that Chrome (Cmd+Q in its window; closing the window leaves it running)"
+
+
 def clients_path():
     return os.path.join(home(), "clients.json")
 
@@ -569,8 +575,8 @@ def cdp_cookies(user_data_dir, browser):
         try:
             if not ws_url:
                 raise ClientError(
-                    "the dedicated window %s did not open DevTools; if the login window is still open, "
-                    "close it and retry" % user_data_dir)
+                    "the dedicated window %s did not open DevTools; if the login window is still running, "
+                    "%s and retry" % (user_data_dir, close_hint()))
             cookies = cdp_call(ws_url, "Storage.getCookies").get("cookies") or []
         finally:
             if proc is not None:
@@ -587,7 +593,7 @@ def open_dedicated_window(source, url="https://substack.com/sign-in"):
         proc = launch_dedicated(source.get("browser") or "chrome", path, url=url, devtools=False)
         # Held until the window owns the profile, so a concurrent headless read cannot take it.
         if not wait_claimed(path, proc):
-            raise ClientError("the dedicated window %s did not start; if it is open, close it and retry" % path)
+            raise ClientError("the dedicated window %s did not start; if it is open, %s and retry" % (path, close_hint()))
     return "opened"
 
 
@@ -714,7 +720,7 @@ def read_source_cookies(source):
         if "substack.sid" not in cookies:
             raise ClientError(
                 "no Substack login in %s; open it (open_client_browser), log in to Substack there, "
-                "close it, then refresh_session" % describe_source(source))
+                "%s, then refresh_session" % (describe_source(source), close_hint()))
         return cookies, None
     pycookiecheat = import_pycookiecheat()
     cf = cookie_source_file(source)
@@ -1494,7 +1500,7 @@ TOOLS = [
     {
         "name": "open_client_browser",
         "scope": "registry",
-        "description": "OPTIONAL. Show the client's dedicated browser (bound with dedicated or user_data_dir) for a one-time Substack login; an open window is left as it is. The window of a `dedicated: true` binding is read only after it is closed.",
+        "description": "OPTIONAL. Show the client's dedicated browser (bound with dedicated or user_data_dir) for a one-time Substack login; an open window is left as it is. The window of a `dedicated: true` binding is read only after it is closed (macOS: that Chrome quit with Cmd+Q).",
         "inputSchema": _schema(dict(CLIENT_PROP), ["client"]),
     },
     # ---- probe scope (identity and access only)
@@ -1507,7 +1513,7 @@ TOOLS = [
     {
         "name": "bind_client",
         "scope": "probe",
-        "description": "Bind a client and pin its identity. Default: call it with no source (even when another client uses a browser profile); that is a dedicated window read through DevTools (`dedicated: true`): without a login there yet it opens the window, answers status=login_needed and stores nothing; call again once the user has logged in and closed that window. Only when the user explicitly asks for it: an existing dedicated browser (`user_data_dir`; read through DevTools on Windows), or, macOS only, a standard browser profile (`profile`, by directory name / display name / email) or a `cookie_file`; on macOS these read Chrome's Cookies database and macOS asks for Keychain access. The session is validated against the publication and stored; `act_as` is pinned to that login. Rebinding to a DIFFERENT identity needs confirm_switch=true, only on the user's explicit ask. Cookie values never surface.",
+        "description": "Bind a client and pin its identity. Default: call it with no source (even when another client uses a browser profile); that is a dedicated window read through DevTools (`dedicated: true`): without a login there yet it opens the window, answers status=login_needed and stores nothing; call again once the user has logged in and closed that window (macOS: quit that Chrome with Cmd+Q). Only when the user explicitly asks for it: an existing dedicated browser (`user_data_dir`; read through DevTools on Windows), or, macOS only, a standard browser profile (`profile`, by directory name / display name / email) or a `cookie_file`; on macOS these read Chrome's Cookies database and macOS asks for Keychain access. The session is validated against the publication and stored; `act_as` is pinned to that login. Rebinding to a DIFFERENT identity needs confirm_switch=true, only on the user's explicit ask. Cookie values never surface.",
         "inputSchema": _schema(dict(CLIENT_PROP, **{
             "profile": {"type": "string"},
             "user_data_dir": {"type": "string"},
@@ -1770,7 +1776,7 @@ def tool_open_client_browser(args):
     if src.get("type") == "cdp" or (src.get("type") == "user_data_dir" and on_windows()):
         state = open_dedicated_window(src)
         return text_result({"window": state, "user_data_dir": os.path.expanduser(src["path"]), "client": slug,
-                            "next": "log in to Substack in that window, close it, then refresh_session"})
+                            "next": "log in to Substack in that window, %s, then refresh_session" % close_hint()})
     if src.get("type") != "user_data_dir":
         raise ClientError(
             "client %r is not bound to a dedicated browser (%s); bind_client with dedicated or "
@@ -1866,9 +1872,9 @@ def tool_bind_client(args, facade):
             return text_result({
                 "client": slug, "publication": target, "status": "login_needed",
                 "cookie_source": describe_source(source), "window": window,
-                "next": "log in to Substack in that window as a user of %s, close it, then bind_client again "
+                "next": "log in to Substack in that window as a user of %s, %s, then bind_client again "
                         "(dedicated: true%s); nothing was stored"
-                        % (target, "" if browser == "chrome" else ', browser: "%s"' % browser)})
+                        % (target, close_hint(), "" if browser == "chrome" else ', browser: "%s"' % browser)})
     else:
         kind = chosen[0]
         if kind == "profile":
