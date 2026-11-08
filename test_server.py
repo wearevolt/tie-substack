@@ -1322,7 +1322,18 @@ r = payload(srv.dispatch_tool("bind_client", {"client": "win", "dedicated": True
 check("dedicated bind without a login: window opened, login_needed, nothing stored",
       (r["status"], OPENED, srv.client_record("win")[1]["cookie_source"], srv.load_session("win")),
       ("login_needed", [ded], None, {}))
-check("on macOS login_needed says to quit that Chrome", "Cmd+Q" in r["next"], True)
+check("login_needed tells the user what to do and to reply done (macOS: Cmd+Q)",
+      ("win.substack.com" in r["tell_user"], "Cmd+Q" in r["tell_user"], "reply done" in r["tell_user"], "relay tell_user" in r["next"]),
+      (True, True, True, True))
+srv.on_windows = lambda: True
+check("on Windows closing the window is enough", ("close that window" in srv.login_tell_user("win"), "Cmd+Q" in srv.login_tell_user("win")),
+      (True, False))
+srv.on_windows = lambda: False
+check("tell_user names the browser actually opened", ("Brave Browser window" in srv.login_tell_user("win", "brave"),
+      "quit Brave Browser with Cmd+Q" in srv.login_tell_user("win", "brave"), "Chrome" in srv.login_tell_user("win", "brave")),
+      (True, True, False))
+check("a Cookies-DB read (macOS user_data_dir) needs no quit", srv.login_tell_user("win", release=False),
+      "Log in to Substack in the separate Google Chrome window that opened as a user of win.substack.com, then reply done.")
 os.makedirs(ded)
 DED_COOKIES[ded] = {"substack.sid": "sid-anon"}
 r = payload(srv.dispatch_tool("bind_client", {"client": "win", "dedicated": True}))
@@ -1353,6 +1364,8 @@ raises("refresh with no login left in the window names the fix", lambda: srv.dis
 OPENED.clear()
 r = payload(srv.dispatch_tool("open_client_browser", {"client": "win"}))
 check("open_client_browser shows the dedicated window", (r["window"], OPENED), ("opened", [ded]))
+check("open_client_browser: tell_user, then refresh_session on done", ("reply done" in r["tell_user"], "refresh_session" in r["next"]),
+      (True, True))
 lb = payload(srv.dispatch_tool("list_browser_profiles", {}))
 check("list_browser_profiles lists it as a DevTools-read dedicated browser",
       [(d["client"], d["read_through"]) for d in lb["dedicated_browsers"]], [("win", "devtools")])

@@ -128,6 +128,21 @@ def close_hint():
     return "close it" if on_windows() else "quit that Chrome (Cmd+Q in its window; closing the window leaves it running)"
 
 
+def login_tell_user(subdomain=None, browser="chrome", release=True):
+    """The sentence the model relays word for word when a login window opens: what to do and what
+    to answer, so the next step (bind again / refresh) has a cue. release=False: the profile is
+    read from its Cookies DB (macOS user_data_dir), so the window may stay open."""
+    app = BROWSER_APPS.get(browser or "chrome", "Google Chrome")
+    who = " as a user of %s.substack.com" % subdomain if subdomain else ""
+    if not release:
+        done = ""
+    elif on_windows():
+        done = " close that window and"
+    else:
+        done = " quit %s with Cmd+Q (closing the window is not enough) and" % app
+    return "Log in to Substack in the separate %s window that opened%s, then%s reply done." % (app, who, done)
+
+
 def clients_path():
     return os.path.join(home(), "clients.json")
 
@@ -1500,7 +1515,7 @@ TOOLS = [
     {
         "name": "open_client_browser",
         "scope": "registry",
-        "description": "OPTIONAL. Show the client's dedicated browser (bound with dedicated or user_data_dir) for a one-time Substack login; an open window is left as it is. The window of a `dedicated: true` binding is read only after it is closed (macOS: that Chrome quit with Cmd+Q).",
+        "description": "OPTIONAL. Show the client's dedicated browser (bound with dedicated or user_data_dir) for a one-time Substack login; an open window is left as it is. The window of a `dedicated: true` binding is read only after it is closed (macOS: that Chrome quit with Cmd+Q): relay the answer's `tell_user` word for word and call refresh_session when the user replies done.",
         "inputSchema": _schema(dict(CLIENT_PROP), ["client"]),
     },
     # ---- probe scope (identity and access only)
@@ -1513,7 +1528,7 @@ TOOLS = [
     {
         "name": "bind_client",
         "scope": "probe",
-        "description": "Bind a client and pin its identity. Default: call it with no source (even when another client uses a browser profile); that is a dedicated window read through DevTools (`dedicated: true`): without a login there yet it opens the window, answers status=login_needed and stores nothing; call again once the user has logged in and closed that window (macOS: quit that Chrome with Cmd+Q). Only when the user explicitly asks for it: an existing dedicated browser (`user_data_dir`; read through DevTools on Windows), or, macOS only, a standard browser profile (`profile`, by directory name / display name / email) or a `cookie_file`; on macOS these read Chrome's Cookies database and macOS asks for Keychain access. The session is validated against the publication and stored; `act_as` is pinned to that login. Rebinding to a DIFFERENT identity needs confirm_switch=true, only on the user's explicit ask. Cookie values never surface.",
+        "description": "Bind a client and pin its identity. Default: call it with no source (even when another client uses a browser profile); that is a dedicated window read through DevTools (`dedicated: true`): without a login there yet it opens the window, answers status=login_needed and stores nothing; relay its `tell_user` word for word and call again when the user replies done (logged in and closed that window; macOS: quit that Chrome with Cmd+Q). Only when the user explicitly asks for it: an existing dedicated browser (`user_data_dir`; read through DevTools on Windows), or, macOS only, a standard browser profile (`profile`, by directory name / display name / email) or a `cookie_file`; on macOS these read Chrome's Cookies database and macOS asks for Keychain access. The session is validated against the publication and stored; `act_as` is pinned to that login. Rebinding to a DIFFERENT identity needs confirm_switch=true, only on the user's explicit ask. Cookie values never surface.",
         "inputSchema": _schema(dict(CLIENT_PROP, **{
             "profile": {"type": "string"},
             "user_data_dir": {"type": "string"},
@@ -1776,7 +1791,8 @@ def tool_open_client_browser(args):
     if src.get("type") == "cdp" or (src.get("type") == "user_data_dir" and on_windows()):
         state = open_dedicated_window(src)
         return text_result({"window": state, "user_data_dir": os.path.expanduser(src["path"]), "client": slug,
-                            "next": "log in to Substack in that window, %s, then refresh_session" % close_hint()})
+                            "tell_user": login_tell_user(subdomain_of(rec.get("publication_url")), src.get("browser")),
+                            "next": "relay tell_user to the user word for word; when they reply done, call refresh_session"})
     if src.get("type") != "user_data_dir":
         raise ClientError(
             "client %r is not bound to a dedicated browser (%s); bind_client with dedicated or "
@@ -1790,7 +1806,9 @@ def tool_open_client_browser(args):
     except Exception as e:  # noqa: BLE001
         raise RuntimeError("could not launch %s: %s (run: %s)" % (app, e, " ".join(cmd)))
     return text_result({"launched": app, "user_data_dir": path, "client": slug,
-                        "next": "log in to Substack in that window, then refresh_session"})
+                        "tell_user": login_tell_user(subdomain_of(rec.get("publication_url")), src.get("browser"),
+                                                     release=False),
+                        "next": "relay tell_user to the user word for word; when they reply done, call refresh_session"})
 
 
 # ---------------------------------------------------------------- probe tools
@@ -1872,9 +1890,10 @@ def tool_bind_client(args, facade):
             return text_result({
                 "client": slug, "publication": target, "status": "login_needed",
                 "cookie_source": describe_source(source), "window": window,
-                "next": "log in to Substack in that window as a user of %s, %s, then bind_client again "
+                "tell_user": login_tell_user(target, browser),
+                "next": "relay tell_user to the user word for word; when they reply done, call bind_client again "
                         "(dedicated: true%s); nothing was stored"
-                        % (target, close_hint(), "" if browser == "chrome" else ', browser: "%s"' % browser)})
+                        % ("" if browser == "chrome" else ', browser: "%s"' % browser)})
     else:
         kind = chosen[0]
         if kind == "profile":
