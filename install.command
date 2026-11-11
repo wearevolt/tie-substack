@@ -1,5 +1,6 @@
 #!/bin/bash
-# tie-substack installer (macOS), 0.8.1: ONE server entry for every client (0.6.0 adds Notes tools, 0.7.0 stats tools, 0.8.0 the dedicated window).
+# tie-substack installer (macOS), 0.9.0: ONE server entry for every client (0.6.0 adds Notes tools, 0.7.0 stats tools, 0.8.0 the dedicated window).
+# Since 0.9.0 the Claude Desktop extension (tie-substack.mcpb) replaces it; kept one release for --to-extension and rollback.
 #
 #   1. One-liner (no clone needed), server.py is fetched from GitHub:
 #        bash -c "$(curl -fsSL https://raw.githubusercontent.com/wearevolt/tie-substack/main/install.command)"
@@ -11,6 +12,8 @@
 #   Flags:
 #     --rollback        restore the pre-migration 0.4 state from ~/.tie-substack/backup-original
 #     --rollback=last   restore only the latest per-run backup
+#     --to-extension    0.9.0: remove this installer's entry before installing tie-substack.mcpb
+#                       (the registry and sessions stay; the extension reads them)
 #
 # What it does: creates a venv in ~/.tie-substack/, installs deps, migrates any 0.4 configs
 # (one per client) into the 0.5 client registry (clients.json + sessions/), backs everything
@@ -40,7 +43,7 @@ warn() { printf '  \033[33m!\033[0m %s\n' "$*"; }
 fail() { printf '  \033[31m✗\033[0m %s\n' "$*"; }
 pause() { case "$0" in *.command) read -r -p "Press Enter to close..." _;; esac; }
 
-bold "tie-substack installer (0.8.1)"
+bold "tie-substack installer (0.9.0)"
 echo
 mkdir -p "$INSTALL_DIR"
 chmod 700 "$INSTALL_DIR"
@@ -94,10 +97,10 @@ else
   ok "venv exists: $VENV"
 fi
 if [ -x "$UV" ]; then
-  uv_run pip install --python "$VENV/bin/python3" 'python-substack>=0.3.0,<0.5' pycookiecheat \
+  uv_run pip install --python "$VENV/bin/python3" 'python-substack>=0.3.0,<0.5' pycookiecheat websocket-client \
     && ok "dependencies installed with uv" || { fail "dependency install failed"; exit 1; }
 else
-  "$VENV/bin/pip" install -q --upgrade pip 'python-substack>=0.3.0,<0.5' pycookiecheat \
+  "$VENV/bin/pip" install -q --upgrade pip 'python-substack>=0.3.0,<0.5' pycookiecheat websocket-client \
     && ok "dependencies installed" || { fail "pip install failed"; exit 1; }
 fi
 PYV="$VENV/bin/python3"
@@ -127,6 +130,15 @@ for arg in "$@"; do
       TIE_SUBSTACK_HOME="$INSTALL_DIR" "$PYV" "$NEW_SERVER" rollback --desktop-config "$CONFIG" --last \
         && ok "restored the latest per-run backup" || { fail "rollback refused"; rm -f "$NEW_SERVER"; pause; exit 1; }
       rm -f "$NEW_SERVER"; echo "  Quit Claude completely (Cmd-Q) and reopen it."; pause; exit 0;;
+    --to-extension)
+      bold "Move to the Claude Desktop extension"
+      TIE_SUBSTACK_HOME="$INSTALL_DIR" "$PYV" "$NEW_SERVER" remove-entry --desktop-config "$CONFIG" \
+        && ok "the installer's entry is removed (backed up; --rollback=last brings it back)" \
+        || { fail "could not remove the entry (see the message above)"; rm -f "$NEW_SERVER"; pause; exit 1; }
+      rm -f "$NEW_SERVER"
+      echo "  Quit Claude completely (Cmd-Q), reopen it and install tie-substack.mcpb:"
+      echo "  https://github.com/wearevolt/tie-substack/releases/latest/download/tie-substack.mcpb"
+      pause; exit 0;;
   esac
 done
 

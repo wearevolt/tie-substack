@@ -553,18 +553,13 @@ st = payload(srv.dispatch_tool("clients_status", {}))
 check("status before binding: missing sessions, fix bind_client",
       [(r["client"], r["session"], r["fix"]) for r in st["clients"]],
       [("alpha", "missing", "bind_client"), ("beta", "missing", "bind_client")])
-b = payload(srv.dispatch_tool("bind_client", {"client": "alpha"}))
-check("scan found the one login reaching alpha", (b["cookie_source"], b["act_as"]), ("chrome profile 'Profile 2'", "alpha-owner"))
-check("scan result lists every profile", len(b["profiles_scanned"]), 3)
+b = payload(srv.dispatch_tool("bind_client", {"client": "alpha", "profile": "alpha work"}))
+check("explicit profile binds and pins on macOS", (b["cookie_source"], b["act_as"]), ("chrome profile 'Profile 2'", "alpha-owner"))
+check("no profile scan in the result (gone in 0.9.0)", "profiles_scanned" in b, False)
 check("session persisted", srv.load_session("alpha")["cookies"]["substack.sid"], "sid-alpha")
 PROFILE_COOKIES[os.path.join(std, "Profile 1", "Cookies")] = {"substack.sid": "sid-intruder"}
 raises("bind_client on an unknown client refused", lambda: srv.dispatch_tool("bind_client", {"client": "gamma-nope"}),
        srv.ClientError, ["unknown client"])
-srv.update_client("alpha", act_as=None, cookie_source=None)
-raises("two logins reach the publication -> refuse to guess", lambda: srv.dispatch_tool("bind_client", {"client": "alpha"}),
-       srv.ClientError, ["2 Substack logins", "alpha-owner", "intruder"])
-b = payload(srv.dispatch_tool("bind_client", {"client": "alpha", "profile": "alpha work"}))
-check("explicit profile binds and pins", (b["cookie_source"], b["act_as"]), ("chrome profile 'Profile 2'", "alpha-owner"))
 raises("rebinding to another identity needs confirm_switch",
        lambda: srv.dispatch_tool("bind_client", {"client": "alpha", "profile": "Profile 1"}), srv.ClientError, ["confirm_switch"])
 b = payload(srv.dispatch_tool("bind_client", {"client": "alpha", "profile": "Profile 1", "confirm_switch": True}))
@@ -780,6 +775,29 @@ check("the claimants keep their configs", (dcfg["tie-substack-legacy"]["env"], d
 rep2 = srv.migrate_import(dup_desktop, default_slug="tie")
 check("re-run after the switch still sees the clash (legacy + tie)", sorted(u["entry"] for u in rep2["unresolvable"]),
       ["tie-substack-legacy", "tie-substack-tie"])
+
+print("remove-entry (0.9.0): only the installer's 0.5 entry goes, the kept 0.4 entries stay")
+with open(dup_desktop) as f:
+    _d = json.load(f)
+_d["mcpServers"]["other-server"] = {"command": "node", "args": ["x.js"]}
+with open(dup_desktop, "w") as f:
+    json.dump(_d, f)
+re_ = srv.remove_entry(dup_desktop)
+dcfg = json.load(open(dup_desktop))["mcpServers"]
+check("the 0.5 entry is removed; legacy entries and other servers stay",
+      (re_["removed"], sorted(dcfg), re_["kept_legacy_entries"]),
+      (True, ["other-server", "tie-substack-legacy", "tie-substack-tie"], ["tie-substack-legacy", "tie-substack-tie"]))
+check("a per-run backup holds the config as it was", "tie-substack" in json.load(
+    open(os.path.join(re_["backup"], "dup_desktop.json")))["mcpServers"], True)
+check("a second run finds nothing to do", srv.remove_entry(dup_desktop)["removed"], False)
+srv.rollback(dup_desktop, last=True)
+check("rollback --last brings the entry back", "tie-substack" in json.load(open(dup_desktop))["mcpServers"], True)
+plain04 = os.path.join(HOME, "plain04_desktop.json")
+with open(plain04, "w") as f:
+    json.dump({"mcpServers": {"tie-substack": {"command": "python3", "args": ["/old/server.py"]}}}, f)
+check("a 0.4 default entry (no TIE_SUBSTACK_HOME) is not ours to remove",
+      (srv.remove_entry(plain04)["removed"], sorted(json.load(open(plain04))["mcpServers"])), (False, ["tie-substack"]))
+check("the CLI runs it", srv.cli(["remove-entry", "--desktop-config", dup_desktop]), 0)
 
 # ---------------------------------------------------------------- notes
 print("notes: text -> ProseMirror, schedule times")
@@ -1101,12 +1119,6 @@ raises("refresh_session: named as a rate limit", lambda: srv.dispatch_tool("refr
 raises("bind_client with a profile: named as a rate limit",
        lambda: srv.dispatch_tool("bind_client", {"client": "beta", "profile": "Personal"}), srv.ClientError,
        ["rate-limited the session check", "HTTP 429", "run bind_client again"])
-_scanned = []
-srv.probe_session = lambda cookies: (_scanned.append(cookies.get("substack.sid")), (_ for _ in ()).throw(_http_429()))[1]
-raises("bind_client scan: stops at the first 429 instead of reporting no login",
-       lambda: srv.dispatch_tool("bind_client", {"client": "beta"}), srv.ClientError,
-       ["rate-limited the session check while scanning chrome profiles", "run bind_client again"])
-check("the scan stopped at the first profile", _scanned, ["sid-beta"])
 check("nothing stored after the 429s", (srv.load_session("beta")["cookies"], srv.client_record("beta")[1].get("act_as")),
       _beta_before)
 srv.probe_session = lambda cookies: (_ for _ in ()).throw(Exception("connection reset"))
@@ -1292,8 +1304,12 @@ DEVTOOLS[("after-launch", "/prof/closed")] = "ws://headless"
 check("a closed profile is started headless, read, then closed",
       (sorted(srv.cdp_cookies("/prof/closed", "chrome")), LAUNCHED, [m for _, m in CALLS]),
       (["substack.sid", "visit_id"], [("/prof/closed", True, "about:blank")], ["Storage.getCookies", "Browser.close"]))
-raises("a profile already open without DevTools -> close it and retry", lambda: srv.cdp_cookies("/prof/locked", "chrome"),
+raises("a profile already open without DevTools -> quit it (macOS) and retry", lambda: srv.cdp_cookies("/prof/locked", "chrome"),
+       srv.ClientError, ["Cmd+Q", "and retry"])
+srv.on_windows = lambda: True
+raises("on Windows closing the window is enough", lambda: srv.cdp_cookies("/prof/locked", "chrome"),
        srv.ClientError, ["close it and retry"])
+srv.on_windows = lambda: False
 
 reset_home()
 srv.dispatch_tool("add_client", {"client": "win", "publication_url": "win.substack.com"})
@@ -1306,6 +1322,18 @@ r = payload(srv.dispatch_tool("bind_client", {"client": "win", "dedicated": True
 check("dedicated bind without a login: window opened, login_needed, nothing stored",
       (r["status"], OPENED, srv.client_record("win")[1]["cookie_source"], srv.load_session("win")),
       ("login_needed", [ded], None, {}))
+check("login_needed tells the user what to do and to reply done (macOS: Cmd+Q)",
+      ("win.substack.com" in r["tell_user"], "Cmd+Q" in r["tell_user"], "reply done" in r["tell_user"], "relay tell_user" in r["next"]),
+      (True, True, True, True))
+srv.on_windows = lambda: True
+check("on Windows closing the window is enough", ("close that window" in srv.login_tell_user("win"), "Cmd+Q" in srv.login_tell_user("win")),
+      (True, False))
+srv.on_windows = lambda: False
+check("tell_user names the browser actually opened", ("Brave Browser window" in srv.login_tell_user("win", "brave"),
+      "quit Brave Browser with Cmd+Q" in srv.login_tell_user("win", "brave"), "Chrome" in srv.login_tell_user("win", "brave")),
+      (True, True, False))
+check("a Cookies-DB read (macOS user_data_dir) needs no quit", srv.login_tell_user("win", release=False),
+      "Log in to Substack in the separate Google Chrome window that opened as a user of win.substack.com, then reply done.")
 os.makedirs(ded)
 DED_COOKIES[ded] = {"substack.sid": "sid-anon"}
 r = payload(srv.dispatch_tool("bind_client", {"client": "win", "dedicated": True}))
@@ -1336,6 +1364,8 @@ raises("refresh with no login left in the window names the fix", lambda: srv.dis
 OPENED.clear()
 r = payload(srv.dispatch_tool("open_client_browser", {"client": "win"}))
 check("open_client_browser shows the dedicated window", (r["window"], OPENED), ("opened", [ded]))
+check("open_client_browser: tell_user, then refresh_session on done", ("reply done" in r["tell_user"], "refresh_session" in r["next"]),
+      (True, True))
 lb = payload(srv.dispatch_tool("list_browser_profiles", {}))
 check("list_browser_profiles lists it as a DevTools-read dedicated browser",
       [(d["client"], d["read_through"]) for d in lb["dedicated_browsers"]], [("win", "devtools")])
@@ -1361,6 +1391,9 @@ class StuckProc(FakeProc):
             raise srv.subprocess.TimeoutExpired("chrome", timeout)
         return 0
 
+
+r = payload(srv.dispatch_tool("bind_client", {"client": "win"}))
+check("on macOS too (0.9.0), bind_client without a source uses the dedicated window", r["cookie_source"], "dedicated window %s" % ded)
 
 stuck = StuckProc()
 _cdp["stop_browser"] = srv.stop_browser
@@ -1499,7 +1532,10 @@ for name, fn in _cdp.items():
     setattr(srv, name, fn)
 
 print("registration & version")
-check("server version", srv.SERVER_VERSION, "0.8.1")
+check("server version", srv.SERVER_VERSION, "0.9.0")
+sys.modules["pycookiecheat"] = None  # an extension without it (Windows): import fails
+raises("without pycookiecheat the fix is the dedicated window", srv.import_pycookiecheat, RuntimeError, ["dedicated: true"])
+sys.modules["pycookiecheat"] = fake_pcc
 check("old tool names gone", any(n in srv.TOOL_HANDLERS for n in ("substack_status", "refresh_cookie", "list_profiles")), False)
 check("publication tools require client + expected_publication",
       all(set(t["inputSchema"]["required"]) >= {"client", "expected_publication"}
