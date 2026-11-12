@@ -63,12 +63,19 @@ cookie source and the pinned identity.
   access). Before 0.9.0, `bind_client` with no source scanned the standard profiles; that scan is
   gone.
 - `refresh_session` re-reads the bound source after a logout or expiry; it refuses when the
-  source is now another login (nothing stored).
+  source is now another login (nothing stored). When a dedicated window has lost its login
+  (0.9.1), it opens that window and answers `login_needed` with the same `tell_user` sentence as
+  the first bind, instead of an error.
+- One Substack account, one client (0.9.1): `bind_client` refuses an account already pinned to
+  another client, since two clients on one account share every draft and Note;
+  `confirm_shared_identity` overrides it on the user's explicit ask. Every tool's `client`
+  parameter tells the model to ask when more than one client is registered and the request
+  names none.
 
 The cookie is a full-access credential for the Substack account that owns the session:
 treat the session files like passwords.
 
-## Install (macOS and Windows, 0.9.0)
+## Install (macOS and Windows, 0.9.1)
 
 A Claude Desktop extension, no Python or terminal needed: download
 [`tie-substack.mcpb`](https://github.com/wearevolt/tie-substack/releases/latest/download/tie-substack.mcpb)
@@ -116,8 +123,8 @@ installing a newer extension over the old one keeps every client.
 | registry | `list_browser_profiles` | Chrome-family profiles (directory, display name, email) from the plaintext Local State, plus the dedicated browsers and windows clients are bound to. No cookies, no Keychain prompt. |
 | registry | `open_client_browser` | OPTIONAL. Show a client's dedicated browser or window for a one-time login; an open one is left as it is. |
 | probe | `clients_status` | Per client: bound?, session valid / expired / missing, identity matches?, publication reachable?, `logged_in_as`. The readiness signal (`--check-clients` in the installer). |
-| probe | `bind_client` | Bind a cookie source (`dedicated: true`, a window of its own read through DevTools, the default; or, macOS only, `profile` / `cookie_file`; `user_data_dir` for a dedicated browser) and pin `act_as`. Switching to a different identity needs `confirm_switch`. |
-| probe | `refresh_session` | Re-read the bound source, validate against publication and pin, store. |
+| probe | `bind_client` | Bind a cookie source (`dedicated: true`, a window of its own read through DevTools, the default; or, macOS only, `profile` / `cookie_file`; `user_data_dir` for a dedicated browser) and pin `act_as`. Switching to a different identity needs `confirm_switch`; an account already pinned to another client needs `confirm_shared_identity`. |
+| probe | `refresh_session` | Re-read the bound source, validate against publication and pin, store. A dedicated window without a login: opens it, `login_needed` + `tell_user`. |
 | publication | `get_publication_settings` | Paid subscriptions?, sections, existing tags, unavailable values. Call before offering choices. |
 | publication | `create_draft` | Draft from Markdown with the **slug pinned** + explicit settings → `draft_id`, `slug`, `post_url`, `editor_url`, settings **as stored**. |
 | publication | `update_post_settings` / `apply_tags` / `set_slug` | Fix settings, attach tags (new ones only with `allow_new`), change the slug. |

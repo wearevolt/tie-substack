@@ -1351,6 +1351,70 @@ raises("dedicated with another source refused", lambda: srv.dispatch_tool("bind_
        ValueError, ["dedicated cannot be combined"])
 check("cookie_source_file is None for cdp", srv.cookie_source_file(rec["cookie_source"]), None)
 
+srv.dispatch_tool("add_client", {"client": "win-b", "publication_url": "win.substack.com"})
+ded_b = srv.dedicated_profile_dir("win-b")
+os.makedirs(ded_b)
+DED_COOKIES[ded_b] = {"substack.sid": "sid-win"}
+raises("0.9.1: an account already pinned to another client is refused, named",
+       lambda: srv.dispatch_tool("bind_client", {"client": "win-b"}),
+       srv.ClientError, ["win-owner is already pinned to client 'win'", "confirm_shared_identity"])
+check("nothing was stored for the refused client",
+      (srv.client_record("win-b")[1]["act_as"], srv.load_session("win-b")), (None, {}))
+r = payload(srv.dispatch_tool("bind_client", {"client": "win-b", "confirm_shared_identity": True}))
+check("with confirm_shared_identity it binds and names the other client",
+      (r["act_as"], r["shared_identity_with"]), ("win-owner", ["win"]))
+raises("rebinding win now names win-b, which shares its account",
+       lambda: srv.dispatch_tool("bind_client", {"client": "win", "dedicated": True}),
+       srv.ClientError, ["already pinned to client 'win-b'"])
+srv.update_client("win-b", cookie_source=None, act_as=None)
+r = payload(srv.dispatch_tool("bind_client", {"client": "win", "dedicated": True}))
+check("rebinding a client to its own pinned account is no shared identity", ("shared_identity_with" in r, r["act_as"]),
+      (False, "win-owner"))
+check("same_account: by user id when both sides have it, a changed handle still matches",
+      srv.same_account({"handle": "new-handle", "user_id": 42}, {"act_as": "old-handle", "act_as_user_id": 42}), True)
+check("same_account: one display name on two accounts is not one account",
+      srv.same_account({"handle": "Jane Doe", "user_id": 7}, {"act_as": "Jane Doe", "act_as_user_id": 8}), False)
+check("same_account: a pre-0.9.1 record without an id falls back to the pin",
+      (srv.same_account({"handle": "win-owner", "user_id": 9}, {"act_as": "win-owner"}),
+       srv.same_account({"handle": "x"}, {"act_as": ""})), (True, False))
+srv.update_client("win", act_as_user_id=None)
+srv.backfill_user_id("win", srv.client_record("win")[1], {"handle": "someone-else", "user_id": 66})
+check("backfill: a login that is not the pin writes no id", srv.client_record("win")[1].get("act_as_user_id"), None)
+srv.backfill_user_id("win", srv.client_record("win")[1], {"handle": "win-owner", "user_id": 55})
+check("backfill: a pre-0.9.1 binding gets its id once a session matches its pin",
+      srv.client_record("win")[1].get("act_as_user_id"), 55)
+srv.backfill_user_id("win", srv.client_record("win")[1], {"handle": "win-owner", "user_id": 99})
+check("backfill: an id already stored is never overwritten", srv.client_record("win")[1].get("act_as_user_id"), 55)
+srv.update_client("win", act_as_user_id=None)
+saved_win = srv.load_session("win")
+BY_SID["sid-legacy"] = (True, {"handle": "renamed-before-upgrade", "email": "r@x.com", "user_id": 808,
+                               "subdomains": ["win"], "primary": "win"})
+srv.save_session("win", {"substack.sid": "sid-legacy"}, {"handle": "win-owner"})
+BY_SID["sid-legacy-b"] = (True, {"handle": "renamed-before-upgrade", "email": "r@x.com", "user_id": 808,
+                                 "subdomains": ["win"], "primary": "win"})
+DED_COOKIES[ded_b] = {"substack.sid": "sid-legacy-b"}
+srv.update_client("win-b", cookie_source=None, act_as=None, act_as_user_id=None)
+raises("a pre-0.9.1 binding renamed before any validation: its id comes from its own stored session",
+       lambda: srv.dispatch_tool("bind_client", {"client": "win-b"}), srv.ClientError, ["already pinned to client 'win'"])
+check("...and is written to the legacy record", srv.client_record("win")[1].get("act_as_user_id"), 808)
+srv.save_session("win", saved_win["cookies"], {"handle": "win-owner"})
+srv.update_client("win", act_as_user_id=None)
+BY_SID["sid-renamed"] = (True, {"handle": "win-owner-renamed", "email": "w2@x.com", "user_id": 501,
+                                "subdomains": ["win"], "primary": "win"})
+srv.update_client("win", act_as_user_id=501)
+DED_COOKIES[ded_b] = {"substack.sid": "sid-renamed"}
+raises("a handle changed after the bind is still caught by the stored user id",
+       lambda: srv.dispatch_tool("bind_client", {"client": "win-b"}), srv.ClientError, ["already pinned to client 'win'"])
+srv.update_client("win", act_as_user_id=None)
+srv.update_client("win-b", cookie_source=None, act_as=None)
+BY_SID["sid-renamed"] = (True, {"handle": "b-owner", "email": "b@x.com", "user_id": 777, "subdomains": ["win"], "primary": "win"})
+payload(srv.dispatch_tool("bind_client", {"client": "win-b"}))
+check("a fresh bind pins act_as_user_id", srv.client_record("win-b")[1].get("act_as_user_id"), 777)
+srv.update_client("win-b", cookie_source=None, act_as=None, act_as_user_id=None)
+check("the client parameter tells the model to ask when no client is named",
+      "ask which; never reuse a client from earlier in the chat for a write" in
+      next(t for t in srv.TOOLS if t["name"] == "create_note_draft")["inputSchema"]["properties"]["client"]["description"], True)
+
 srv.save_session("win", {"substack.sid": "sid-win-stale"}, {"handle": "win-owner"})
 srv.reset_api()
 BY_SID["sid-win-2"] = (True, {"handle": "win-owner", "email": "w@x.com", "subdomains": ["win"], "primary": "win"})
@@ -1359,8 +1423,22 @@ out = payload(srv.dispatch_tool("get_draft", dict(WIN, draft_id=1)))
 check("an expired session is re-read from the dedicated window", (out["logged_in_as"], srv.load_session("win")["cookies"]["substack.sid"]),
       ("win-owner", "sid-win-2"))
 DED_COOKIES[ded] = {}
-raises("refresh with no login left in the window names the fix", lambda: srv.dispatch_tool("refresh_session", {"client": "win"}),
-       srv.ClientError, ["open_client_browser", "refresh_session"])
+OPENED.clear()
+stored_sid = srv.load_session("win")["cookies"]["substack.sid"]
+r = payload(srv.dispatch_tool("refresh_session", {"client": "win"}))
+check("refresh with no login left in the window (0.9.1): window opened, login_needed, nothing stored",
+      (r["status"], OPENED, srv.load_session("win")["cookies"]["substack.sid"]), ("login_needed", [ded], stored_sid))
+check("it tells the user what to do, and refresh_session follows done",
+      (r["tell_user"] == srv.login_tell_user("win", "chrome"), "refresh_session" in r["next"], "relay tell_user" in r["next"]),
+      (True, True, True))
+OPENED.clear()
+DED_COOKIES[ded] = {"substack.sid": "sid-gone"}
+BY_SID["sid-gone"] = (False, {"reason": "session_invalid"})
+r = payload(srv.dispatch_tool("refresh_session", {"client": "win"}))
+check("a login the window still holds but Substack refuses -> the same login_needed", (r["status"], OPENED), ("login_needed", [ded]))
+raises("a NoLoginInWindow is still a ClientError for every other caller", lambda: srv.read_source_cookies(
+    {"type": "cdp", "browser": "chrome", "path": "/nowhere"}), srv.NoLoginInWindow, ["open_client_browser", "refresh_session"])
+DED_COOKIES[ded] = {}
 OPENED.clear()
 r = payload(srv.dispatch_tool("open_client_browser", {"client": "win"}))
 check("open_client_browser shows the dedicated window", (r["window"], OPENED), ("opened", [ded]))
@@ -1532,7 +1610,7 @@ for name, fn in _cdp.items():
     setattr(srv, name, fn)
 
 print("registration & version")
-check("server version", srv.SERVER_VERSION, "0.9.0")
+check("server version", srv.SERVER_VERSION, "0.9.1")
 sys.modules["pycookiecheat"] = None  # an extension without it (Windows): import fails
 raises("without pycookiecheat the fix is the dedicated window", srv.import_pycookiecheat, RuntimeError, ["dedicated: true"])
 sys.modules["pycookiecheat"] = fake_pcc

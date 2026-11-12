@@ -58,6 +58,10 @@ source opens the dedicated window on macOS too (the standard-profile scan is gon
 profile or cookie file still binds on macOS. `remove-entry` drops the installer's config entry
 so it does not run beside the extension.
 
+0.9.1: client isolation. bind_client refuses an account already pinned to another client
+(confirm_shared_identity overrides); `client` asks the model to ask when none is named;
+refresh_session reopens a dedicated window that lost its login (login_needed + tell_user).
+
 Env:
   TIE_SUBSTACK_HOME        registry home (default ~/.tie-substack); tests point it at a temp dir
   TIE_SUBSTACK_CLIENT +    an explicit substack.sid for exactly that client (CI-style setups);
@@ -91,7 +95,7 @@ import urllib.request
 from datetime import datetime, timezone
 
 SERVER_NAME = "tie-substack"
-SERVER_VERSION = "0.9.0"
+SERVER_VERSION = "0.9.1"
 CONFIG_FORMAT_VERSION = 1
 
 AUDIENCE_VALUES = ("everyone", "only_free", "only_paid", "founding")
@@ -109,6 +113,7 @@ RESERVED_NAMES = ("clients.json", "migration.json")
 RESERVED_DIR_PREFIXES = ("sessions", "backup-", "legacy", "venv", "python", "cache", "bin")
 
 _write_lock = threading.Lock()
+_bind_lock = threading.Lock()  # shared-account check + pin, atomically
 _api_lock = threading.Lock()
 _api_cache = {}  # slug -> {"api", "handle", "email", "sid", "validated_at"}
 
@@ -181,6 +186,10 @@ def reply_error(req_id, code, message):
 
 class ClientError(RuntimeError):
     """A refusal the caller can act on (unknown client, unbound, mismatch)."""
+
+
+class NoLoginInWindow(ClientError):
+    """The dedicated window has no Substack login."""
 
 
 class PublicationMismatch(ClientError):
@@ -279,10 +288,15 @@ def save_session(slug, cookies, probe=None, source_path=None):
 def session_cookies(slug):
     """The client's stored cookies. An env token applies to exactly the client named by
     TIE_SUBSTACK_CLIENT (CI-style setups) and never to anyone else."""
-    token = os.environ.get("SUBSTACK_SESSION_TOKEN")
-    if token and os.environ.get("TIE_SUBSTACK_CLIENT", "").strip().lower() == slug:
-        return {"substack.sid": token}
+    if env_override_for(slug):
+        return {"substack.sid": os.environ["SUBSTACK_SESSION_TOKEN"]}
     return load_session(slug).get("cookies") or {}
+
+
+def env_override_for(slug):
+    """Does SUBSTACK_SESSION_TOKEN override this client's session?"""
+    return bool(os.environ.get("SUBSTACK_SESSION_TOKEN")) and \
+        os.environ.get("TIE_SUBSTACK_CLIENT", "").strip().lower() == slug
 
 
 # ---------------------------------------------------------------- URLs
@@ -684,6 +698,45 @@ def accessible_publications(probe):
     return sorted(out)
 
 
+def same_account(probe, rec):
+    """Is the probed login the account `rec` is pinned to? By user id when both have it
+    (handles change), else by the pin (records bound before 0.9.1)."""
+    pin = ((rec or {}).get("act_as") or "").strip()
+    if not pin:
+        return False
+    pinned_id, live_id = (rec or {}).get("act_as_user_id"), (probe or {}).get("user_id")
+    if pinned_id is not None and live_id is not None:
+        return str(pinned_id) == str(live_id)
+    return identity_matches(probe, pin)
+
+
+def backfill_user_id(slug, rec, probe):
+    """Store act_as_user_id on a pre-0.9.1 record once a session matches its pin."""
+    user_id = (probe or {}).get("user_id")
+    if user_id is None or (rec or {}).get("act_as_user_id") is not None:
+        return
+    if not identity_matches(probe, ((rec or {}).get("act_as") or "").strip()) or not (rec or {}).get("act_as"):
+        return
+    update_client(slug, act_as_user_id=user_id)
+
+
+def backfill_legacy_ids(except_slug):
+    """Give other pre-0.9.1 records their user id from their own stored session, which always
+    belongs to the pinned account (so no pin comparison, which a rename would break)."""
+    for other, r in load_clients()["clients"].items():
+        if other == except_slug or not (r.get("act_as") or "").strip() or r.get("act_as_user_id") is not None:
+            continue
+        cookies = load_session(other).get("cookies") or {}  # stored, not the env override
+        if not cookies.get("substack.sid"):
+            continue
+        try:
+            ok, p = probe_session(cookies)
+        except Exception:  # noqa: BLE001  (the pin decides)
+            continue
+        if ok and p.get("user_id") is not None:
+            update_client(other, act_as_user_id=p["user_id"])
+
+
 def identity_matches(probe, act_as):
     """Does the probed session belong to the pinned identity (handle, or email as a
     hand-typed convenience)? An unset pin matches everything."""
@@ -733,7 +786,7 @@ def read_source_cookies(source):
     if kind == "cdp" or (kind == "user_data_dir" and on_windows()):  # no Cookies DB read on Windows
         cookies = cdp_cookies(source.get("path") or "", source.get("browser") or "chrome")
         if "substack.sid" not in cookies:
-            raise ClientError(
+            raise NoLoginInWindow(
                 "no Substack login in %s; open it (open_client_browser), log in to Substack there, "
                 "%s, then refresh_session" % (describe_source(source), close_hint()))
         return cookies, None
@@ -874,6 +927,8 @@ def get_api(slug, expected_publication, fresh=False, reread_source=False):
             )
         if refreshed and not os.environ.get("SUBSTACK_SESSION_TOKEN"):
             save_session(slug, cookies, probe, cf)
+        if not env_override_for(slug):
+            backfill_user_id(slug, rec, probe)
         from substack import Api  # noqa: PLC0415
 
         if not hasattr(Api, "create_draft_from_markdown"):
@@ -1462,7 +1517,7 @@ def post_traffic(raw):
 CLIENT_PROP = {
     "client": {
         "type": "string",
-        "description": "The client slug (tie-social brand identity.slug / brand.json substack.client). Required; there is no current client.",
+        "description": "The client slug (tie-social brand identity.slug / brand.json substack.client). Required; there is no current client. When more than one client is registered and the user's current request does not name one, ask which; never reuse a client from earlier in the chat for a write.",
     }
 }
 EXPECTED_PROP = {
@@ -1528,7 +1583,7 @@ TOOLS = [
     {
         "name": "bind_client",
         "scope": "probe",
-        "description": "Bind a client and pin its identity. Default: call it with no source (even when another client uses a browser profile); that is a dedicated window read through DevTools (`dedicated: true`): without a login there yet it opens the window, answers status=login_needed and stores nothing; relay its `tell_user` word for word and call again when the user replies done (logged in and closed that window; macOS: quit that Chrome with Cmd+Q). Only when the user explicitly asks for it: an existing dedicated browser (`user_data_dir`; read through DevTools on Windows), or, macOS only, a standard browser profile (`profile`, by directory name / display name / email) or a `cookie_file`; on macOS these read Chrome's Cookies database and macOS asks for Keychain access. The session is validated against the publication and stored; `act_as` is pinned to that login. Rebinding to a DIFFERENT identity needs confirm_switch=true, only on the user's explicit ask. Cookie values never surface.",
+        "description": "Bind a client and pin its identity. Default: call it with no source (even when another client uses a browser profile); that is a dedicated window read through DevTools (`dedicated: true`): without a login there yet it opens the window, answers status=login_needed and stores nothing; relay its `tell_user` word for word and call again when the user replies done (logged in and closed that window; macOS: quit that Chrome with Cmd+Q). Only when the user explicitly asks for it: an existing dedicated browser (`user_data_dir`; read through DevTools on Windows), or, macOS only, a standard browser profile (`profile`, by directory name / display name / email) or a `cookie_file`; on macOS these read Chrome's Cookies database and macOS asks for Keychain access. The session is validated against the publication and stored; `act_as` is pinned to that login. Rebinding to a DIFFERENT identity needs confirm_switch=true, only on the user's explicit ask. A Substack account already pinned to ANOTHER client is refused (two clients on one account share all drafts and Notes) unless confirm_shared_identity=true, only on the user's explicit ask. Cookie values never surface.",
         "inputSchema": _schema(dict(CLIENT_PROP, **{
             "profile": {"type": "string"},
             "user_data_dir": {"type": "string"},
@@ -1536,12 +1591,13 @@ TOOLS = [
             "dedicated": {"type": "boolean", "default": False},
             "browser": {"type": "string", "enum": ["chrome", "chromium", "brave"], "default": "chrome"},
             "confirm_switch": {"type": "boolean", "default": False},
+            "confirm_shared_identity": {"type": "boolean", "default": False},
         }), ["client"]),
     },
     {
         "name": "refresh_session",
         "scope": "probe",
-        "description": "Re-read the client's bound cookie source, validate the session against the publication and the pinned identity, store it. Routine after a Substack logout/expiry; refuses for an unbound client (bind_client first). Names only, never values.",
+        "description": "Re-read the client's bound cookie source, validate the session against the publication and the pinned identity, store it. Routine after a Substack logout/expiry; refuses for an unbound client (bind_client first). When the client's dedicated window has no login, it opens that window and answers status=login_needed: relay its `tell_user` word for word and call refresh_session again when the user replies done. Names only, never values.",
         "inputSchema": _schema(dict(CLIENT_PROP), ["client"]),
     },
     # ---- publication scope (full client, after the expected_publication check)
@@ -1928,8 +1984,19 @@ def tool_bind_client(args, facade):
         switched = {"from": current_pin, "to": handle}
     else:
         switched = None
-    facade.persist(cookies, probe, cf, cookie_source=source, act_as=handle,
-                   bound_at=datetime.now(timezone.utc).isoformat(timespec="seconds"))
+    with _bind_lock:
+        backfill_legacy_ids(slug)
+        shared = sorted(other for other, r in load_clients()["clients"].items()
+                        if other != slug and same_account(probe, r))
+        if shared and not args.get("confirm_shared_identity"):
+            raise ClientError(
+                "%s is already pinned to client %s; two clients on one Substack account share all its drafts "
+                "and Notes. Log in with this client's own account, or re-run bind_client with "
+                "confirm_shared_identity: true (only on the user's explicit ask); nothing was stored"
+                % (handle, ", ".join(repr(s) for s in shared)))
+        facade.persist(cookies, probe, cf, cookie_source=source, act_as=handle,
+                       act_as_user_id=probe.get("user_id"),
+                       bound_at=datetime.now(timezone.utc).isoformat(timespec="seconds"))
     result = {
         "client": slug, "publication": target, "cookie_source": describe_source(source),
         "act_as": handle, "logged_in_as": handle, "session": "valid",
@@ -1938,7 +2005,22 @@ def tool_bind_client(args, facade):
     }
     if switched:
         result["act_as_changed"] = switched
+    if shared:
+        result["shared_identity_with"] = shared
     return text_result(result)
+
+
+def _refresh_login_needed(facade, source):
+    """Open the window and ask for a login, as the first bind does; nothing is stored."""
+    target = facade.subdomain()
+    browser = source.get("browser") or "chrome"
+    window = facade.open_window(source)
+    return text_result({
+        "client": facade.slug, "publication": target, "status": "login_needed",
+        "cookie_source": describe_source(source), "window": window,
+        "tell_user": login_tell_user(target, browser),
+        "next": "relay tell_user to the user word for word; when they reply done, call refresh_session "
+                "again; nothing was stored"})
 
 
 def tool_refresh_session(args, facade):
@@ -1947,10 +2029,17 @@ def tool_refresh_session(args, facade):
     act_as = (rec.get("act_as") or "").strip()
     if not source or not act_as:
         raise ClientError("client %r is unbound; run bind_client first" % slug)
-    cookies, cf = facade.read_source(source)
+    # Only a DevTools-read window can be reopened for a login; a profile or cookie file keeps its error.
+    window =source.get("type") == "cdp" or (source.get("type") == "user_data_dir" and on_windows())
+    try:
+        cookies, cf = facade.read_source(source)
+    except NoLoginInWindow:
+        return _refresh_login_needed(facade, source)
     ok, probe = facade.identity(cookies)
     if not ok and probe.get("reason") == "rate_limited":
         raise rate_limited_error(slug, "the session check of %s" % describe_source(source), "refresh_session")
+    if not ok and window and probe.get("reason") in ("no_session", "session_invalid"):
+        return _refresh_login_needed(facade, source)
     if not ok:
         raise ClientError(
             "the session in %s is invalid or expired (%s); log in to Substack in that browser, "
@@ -1964,6 +2053,7 @@ def tool_refresh_session(args, facade):
             "%s is now logged in as %r, not the pinned act_as=%r; nothing stored. Log back in as the "
             "pinned account, or bind_client with confirm_switch to re-pin deliberately"
             % (describe_source(source), probe.get("handle"), act_as))
+    backfill_user_id(slug, rec, probe)
     facade.persist(cookies, probe, cf)
     return text_result({
         "client": slug, "publication": facade.subdomain(), "act_as": act_as,
