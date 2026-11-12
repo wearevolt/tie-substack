@@ -1,5 +1,5 @@
 #!/bin/bash
-# tie-substack installer (macOS), 0.9.0: ONE server entry for every client (0.6.0 adds Notes tools, 0.7.0 stats tools, 0.8.0 the dedicated window).
+# tie-substack installer (macOS), 0.9.1: ONE server entry for every client (0.6.0 adds Notes tools, 0.7.0 stats tools, 0.8.0 the dedicated window).
 # Since 0.9.0 the Claude Desktop extension (tie-substack.mcpb) replaces it; kept one release for --to-extension and rollback.
 #
 #   1. One-liner (no clone needed), server.py is fetched from GitHub:
@@ -12,7 +12,7 @@
 #   Flags:
 #     --rollback        restore the pre-migration 0.4 state from ~/.tie-substack/backup-original
 #     --rollback=last   restore only the latest per-run backup
-#     --to-extension    0.9.0: remove this installer's entry before installing tie-substack.mcpb
+#     --to-extension    since 0.9.0: remove this installer's entry before installing tie-substack.mcpb
 #                       (the registry and sessions stay; the extension reads them)
 #
 # What it does: creates a venv in ~/.tie-substack/, installs deps, migrates any 0.4 configs
@@ -43,7 +43,7 @@ warn() { printf '  \033[33m!\033[0m %s\n' "$*"; }
 fail() { printf '  \033[31m✗\033[0m %s\n' "$*"; }
 pause() { case "$0" in *.command) read -r -p "Press Enter to close..." _;; esac; }
 
-bold "tie-substack installer (0.9.0)"
+bold "tie-substack installer (0.9.1)"
 echo
 mkdir -p "$INSTALL_DIR"
 chmod 700 "$INSTALL_DIR"
